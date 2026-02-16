@@ -21,6 +21,7 @@ from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.complete import CompleteTaskTool
 from nanobot.agent.tools.message import MessageTool
+from nanobot.agent.tools.report import ReportToUserTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.memory import MemoryStore
@@ -59,18 +60,21 @@ class AgentLoop:
         "complete_task(final_answer=...)."
     )
     _ACTION_RETRY_REASON_NO_PROGRESS = (
-        "Retry reason: the previous attempt had no verified external progress for a tool-oriented request. "
-        "Your next step must be a relevant tool call (not plain text). "
-        "After at least one successful tool result, call complete_task(final_answer=...)."
-    )
-    _ACTION_RETRY_REASON_PREMATURE_COMPLETE = (
-        "Retry reason: complete_task was rejected because there is still no successful external tool progress. "
-        "Do not acknowledge this policy again. Execute a relevant tool now."
+        "Retry reason: external tool attempts have not produced verified progress yet. "
+        "Try another relevant tool call, or if blocked, call complete_task(final_answer=...) "
+        "with a concise failure reason and the exact user action required."
     )
     _COMPLETION_REJECT_NUDGE = (
         "Your complete_task call was rejected. "
         "Keep working and call complete_task(final_answer=...) only after verified progress."
     )
+    _MAX_NO_TOOL_TEXT_ROUNDS = 3
+    _MAX_NO_TOOL_EMPTY_ROUNDS = 4
+    _NO_TOOL_FALLBACK = (
+        "I couldn't make progress with tool execution or completion signaling. "
+        "Please provide a more specific next instruction."
+    )
+    _AGENT_BROWSER_AUTO_CLOSE_CMD = "agent-browser close >/dev/null 2>&1 || true"
 
     def __init__(
         self,
@@ -175,6 +179,10 @@ class AgentLoop:
             self.tools.register(WebSearchTool(api_key=self.brave_api_key))
         self.tools.register(WebFetchTool())
         self.tools.register(CompleteTaskTool())
+
+        # Progress-report tool (text updates to current chat)
+        report_tool = ReportToUserTool(send_callback=self.bus.publish_outbound)
+        self.tools.register(report_tool)
         
         # Message tool
         message_tool = MessageTool(send_callback=self.bus.publish_outbound)
@@ -207,6 +215,10 @@ class AgentLoop:
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.set_context(channel, chat_id)
+
+        if report_tool := self.tools.get("report_to_user"):
+            if isinstance(report_tool, ReportToUserTool):
+                report_tool.set_context(channel, chat_id)
 
         if spawn_tool := self.tools.get("spawn"):
             if isinstance(spawn_tool, SpawnTool):
@@ -447,6 +459,14 @@ class AgentLoop:
         return "\n".join(lines)
 
     @staticmethod
+    def _is_agent_browser_command(command: str) -> bool:
+        return bool(re.search(r"\bagent-browser\b", command))
+
+    @staticmethod
+    def _is_agent_browser_close_command(command: str) -> bool:
+        return bool(re.search(r"\bagent-browser\s+close\b", command))
+
+    @staticmethod
     def _merge_outbound_metadata(base: dict[str, Any] | None, llm_metadata: dict[str, Any]) -> dict[str, Any]:
         merged = dict(base or {})
         if not llm_metadata:
@@ -464,79 +484,6 @@ class AgentLoop:
 
         merged["_nanobot"] = nanobot_meta
         return merged
-
-    @staticmethod
-    def _extract_text_content(content: Any) -> str:
-        """Extract plain text from model/user message content."""
-        if isinstance(content, str):
-            return content
-        if not isinstance(content, list):
-            return ""
-        parts: list[str] = []
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            text = item.get("text")
-            if isinstance(text, str):
-                parts.append(text)
-        return "\n".join(parts)
-
-    @classmethod
-    def _latest_message_text(cls, messages: list[dict[str, Any]], role: str) -> str:
-        """Get the latest message text for a given role."""
-        for msg in reversed(messages):
-            if msg.get("role") == role:
-                return cls._extract_text_content(msg.get("content"))
-        return ""
-
-    @staticmethod
-    def _looks_like_action_offer(assistant_text: str) -> bool:
-        """Detect assistant text that offers to run a concrete next action."""
-        text = assistant_text.lower()
-        if not text:
-            return False
-        offer_hints = (
-            "원하면", "바로", "이어서", "진행", "실행", "전송", "보내",
-            "생성", "스크린샷", "파일 경로", "agent-browser", "playwright",
-            "i can", "if you want", "i can proceed", "next step",
-        )
-        if any(h in text for h in offer_hints):
-            return True
-        return bool(re.search(r"/[\w\-/\.]+\.(png|jpg|jpeg|pdf|txt|md)\b", text))
-
-    @classmethod
-    def _looks_like_tool_request(cls, initial_messages: list[dict[str, Any]]) -> bool:
-        """Best-effort heuristic for requests that likely need tool execution."""
-        user_text = cls._latest_message_text(initial_messages, "user")
-        prev_assistant_text = cls._latest_message_text(initial_messages, "assistant")
-        text = user_text.lower()
-        if not text:
-            return False
-
-        tool_hints = (
-            "run ", "execute", "open ", "browse", "search", "fetch", "scrape",
-            "screenshot", "install", "commit", "push", "clone", "build", "test",
-            "send", "upload", "attach",
-            "fix ", "update", "edit ", "write file", "modify",
-            "실행", "검색", "찾아", "열어", "가져와", "스크린샷", "설치",
-            "커밋", "푸시", "빌드", "테스트", "수정", "파일", "추가", "삭제",
-            "보내", "전송", "첨부", "업로드", "찍어", "촬영",
-        )
-        if any(hint in text for hint in tool_hints):
-            return True
-
-        # Continuation commands like "그걸로 가자/보내줘/진행해" are tool-oriented
-        # if the previous assistant turn clearly offered an executable next action.
-        continuation_phrases = {
-            "그걸로 가자", "그걸로", "그렇게 해", "진행해", "시작",
-            "해줘", "그걸로 해", "보내줘", "전송해줘",
-            "go ahead", "do it", "proceed", "send it",
-        }
-        compact = text.strip()
-        if compact in continuation_phrases and cls._looks_like_action_offer(prev_assistant_text):
-            return True
-
-        return False
 
     async def _run_agent_loop(
         self,
@@ -559,7 +506,12 @@ class AgentLoop:
         tools_used: list[str] = []
         web_search_trace: list[dict[str, Any]] = []
         successful_external_actions = 1 if initial_external_progress else 0
-        wants_tool_progress = self._looks_like_tool_request(initial_messages)
+        external_tool_attempted = False
+        no_tool_text_rounds = 0
+        no_tool_empty_rounds = 0
+        last_nonempty_no_tool_text = ""
+        agent_browser_used = False
+        agent_browser_closed = False
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -600,6 +552,14 @@ class AgentLoop:
                 pending_approval_notice: str | None = None
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
+                    if tool_call.name != self._COMPLETE_TOOL_NAME:
+                        external_tool_attempted = True
+                    if tool_call.name == "exec":
+                        cmd_text = str(tool_call.arguments.get("command", ""))
+                        if self._is_agent_browser_command(cmd_text):
+                            agent_browser_used = True
+                        if self._is_agent_browser_close_command(cmd_text):
+                            agent_browser_closed = True
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
@@ -630,13 +590,9 @@ class AgentLoop:
                     break
 
                 has_external_progress = successful_external_actions > 0 or bool(web_search_trace)
+                no_tool_text_rounds = 0
+                no_tool_empty_rounds = 0
                 if completion_answer:
-                    if wants_tool_progress and not has_external_progress:
-                        logger.warning(
-                            "complete_task rejected: tool-oriented request has no successful external progress"
-                        )
-                        messages.append({"role": "user", "content": self._ACTION_RETRY_REASON_PREMATURE_COMPLETE})
-                        continue
                     final_content = completion_answer
                     break
                 if completion_requested:
@@ -650,20 +606,56 @@ class AgentLoop:
                         ),
                     })
             else:
+                assistant_text = (response.content or "").strip()
+                if assistant_text:
+                    last_nonempty_no_tool_text = assistant_text
+                    no_tool_text_rounds += 1
+                    no_tool_empty_rounds = 0
+                else:
+                    no_tool_empty_rounds += 1
+
                 messages = self.context.add_assistant_message(
                     messages,
                     response.content,
                     reasoning_content=response.reasoning_content,
                 )
+
+                if no_tool_empty_rounds >= self._MAX_NO_TOOL_EMPTY_ROUNDS:
+                    logger.warning(
+                        "LLM returned empty/no-tool responses repeatedly; finalizing fallback response"
+                    )
+                    final_content = last_nonempty_no_tool_text or self._NO_TOOL_FALLBACK
+                    break
+
+                if no_tool_text_rounds >= self._MAX_NO_TOOL_TEXT_ROUNDS:
+                    logger.warning(
+                        "LLM returned no-tool text repeatedly; finalizing latest response fallback"
+                    )
+                    final_content = last_nonempty_no_tool_text or self._NO_TOOL_FALLBACK
+                    break
+
                 nudge = (
                     self._ACTION_RETRY_REASON_NO_PROGRESS
-                    if wants_tool_progress and not has_external_progress
+                    if external_tool_attempted and not has_external_progress
                     else self._NO_ACTION_NUDGE
                 )
                 messages.append({"role": "user", "content": nudge})
 
         if final_content is None:
             final_content = "I couldn't complete the task within the iteration limit."
+
+        # Safety cleanup: if agent-browser was used but not closed in this turn,
+        # close it best-effort to avoid leaked Chromium processes.
+        if agent_browser_used and not agent_browser_closed and self.tools.has("exec"):
+            cleanup_result = await self.tools.execute(
+                "exec",
+                {"command": self._AGENT_BROWSER_AUTO_CLOSE_CMD},
+            )
+            cleanup_ok = self._tool_result_success("exec", cleanup_result)
+            if cleanup_ok:
+                logger.info("Auto cleanup: agent-browser close executed")
+            else:
+                logger.warning(f"Auto cleanup: agent-browser close failed: {cleanup_result[:200]}")
 
         llm_metadata: dict[str, Any] = {}
         if web_search_trace:

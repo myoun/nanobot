@@ -6,6 +6,20 @@ metadata: {"nanobot":{"emoji":"🌐","requires":{"bins":["agent-browser"]},"inst
 
 # Browser Automation with agent-browser
 
+## Mandatory Teardown
+
+Always close agent-browser before finishing the task.
+
+```bash
+agent-browser close
+```
+
+If you're running multiple commands in one shell block, add a trap so close runs even on errors:
+
+```bash
+trap 'agent-browser close >/dev/null 2>&1 || true' EXIT
+```
+
 ## Core Workflow
 
 Every browser automation follows this pattern:

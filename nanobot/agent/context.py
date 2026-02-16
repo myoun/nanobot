@@ -102,8 +102,10 @@ Your workspace is at: {workspace_path}
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
 IMPORTANT (MANDATORY):
+- Use `report_to_user(content=...)` for intermediate progress updates, blockers, or clarification requests to the current chat.
 - Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).
 - To send images/files to users, use `message(content=..., media=[\"/path/to/file\"])`.
+- If you run `agent-browser`, always close it before finishing (`exec(command=\"agent-browser close\")`).
 - In the current active chat, do not use `message` for text-only replies; return final text via `complete_task(final_answer=...)`.
 - TURN CANNOT END WITHOUT `complete_task(final_answer=...)`.
 - Never treat plain assistant text as final completion; call `complete_task` exactly once when done.
