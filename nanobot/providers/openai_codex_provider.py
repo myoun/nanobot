@@ -46,7 +46,10 @@ class OpenAICodexProvider(LLMProvider):
             "instructions": system_prompt,
             "input": input_items,
             "text": {"verbosity": "medium"},
-            "include": ["reasoning.encrypted_content"],
+            "include": [
+                "reasoning.encrypted_content",
+                "web_search_call.action.sources",
+            ],
             "prompt_cache_key": _prompt_cache_key(messages),
             "tool_choice": "auto",
             "parallel_tool_calls": True,
