@@ -1,7 +1,7 @@
 ---
 name: agent-browser
 description: Browser automation CLI for AI agents. Use when the user needs to interact with websites, including navigating pages, filling forms, clicking buttons, taking screenshots, extracting data, testing web apps, or automating any browser task. Triggers include requests to "open a website", "fill out a form", "click a button", "take a screenshot", "scrape data from a page", "test this web app", "login to a site", "automate browser actions", or any task requiring programmatic web interaction.
-allowed-tools: Bash(agent-browser:*)
+metadata: {"nanobot":{"emoji":"🌐","requires":{"bins":["agent-browser"]},"install":[{"id":"npm","kind":"npm","package":"agent-browser","global":true,"bins":["agent-browser"],"label":"Install agent-browser CLI (npm)"},{"id":"brew","kind":"brew","formula":"agent-browser","bins":["agent-browser"],"label":"Install agent-browser CLI (brew)"},{"id":"chromium","kind":"command","command":"agent-browser install","label":"Download Chromium for agent-browser"}]}}
 ---
 
 # Browser Automation with agent-browser
