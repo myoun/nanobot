@@ -215,6 +215,10 @@ class WebToolsConfig(BaseModel):
 class ExecToolConfig(BaseModel):
     """Shell exec tool configuration."""
     timeout: int = 60
+    privileged_enabled: bool = False
+    privileged_socket: str = "/run/nanobot-privileged.sock"
+    approval_ttl_sec: int = 600
+    single_pending_per_chat: bool = True
 
 
 class MCPServerConfig(BaseModel):

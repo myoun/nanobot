@@ -1,15 +1,6 @@
 <div align="center">
   <img src="nanobot_logo.png" alt="nanobot" width="500">
   <h1>nanobot: Ultra-Lightweight Personal AI Assistant</h1>
-  <p>
-    <a href="https://pypi.org/project/nanobot-ai/"><img src="https://img.shields.io/pypi/v/nanobot-ai" alt="PyPI"></a>
-    <a href="https://pepy.tech/project/nanobot-ai"><img src="https://static.pepy.tech/badge/nanobot-ai" alt="Downloads"></a>
-    <img src="https://img.shields.io/badge/python-≥3.11-blue" alt="Python">
-    <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
-    <a href="./COMMUNICATION.md"><img src="https://img.shields.io/badge/Feishu-Group-E9DBFC?style=flat&logo=feishu&logoColor=white" alt="Feishu"></a>
-    <a href="./COMMUNICATION.md"><img src="https://img.shields.io/badge/WeChat-Group-C5EAB4?style=flat&logo=wechat&logoColor=white" alt="WeChat"></a>
-    <a href="https://discord.gg/MnCvHqpUGB"><img src="https://img.shields.io/badge/Discord-Community-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord"></a>
-  </p>
 </div>
 
 🐈 **nanobot** is an **ultra-lightweight** personal AI assistant inspired by [OpenClaw](https://github.com/openclaw/openclaw) 
@@ -17,22 +8,6 @@
 ⚡️ Delivers core agent functionality in just **~4,000** lines of code — **99% smaller** than Clawdbot's 430k+ lines.
 
 📏 Real-time line count: **3,668 lines** (run `bash core_agent_lines.sh` to verify anytime)
-
-## 📢 News
-
-- **2026-02-14** 🔌 nanobot now supports MCP! See [MCP section](#mcp-model-context-protocol) for details.
-- **2026-02-13** 🎉 Released v0.1.3.post7 — includes security hardening and multiple improvements. All users are recommended to upgrade to the latest version. See [release notes](https://github.com/HKUDS/nanobot/releases/tag/v0.1.3.post7) for more details.
-- **2026-02-12** 🧠 Redesigned memory system — Less code, more reliable. Join the [discussion](https://github.com/HKUDS/nanobot/discussions/566) about it!
-- **2026-02-11** ✨ Enhanced CLI experience and added MiniMax support!
-- **2026-02-10** 🎉 Released v0.1.3.post6 with improvements! Check the updates [notes](https://github.com/HKUDS/nanobot/releases/tag/v0.1.3.post6) and our [roadmap](https://github.com/HKUDS/nanobot/discussions/431).
-- **2026-02-09** 💬 Added Slack, Email, and QQ support — nanobot now supports multiple chat platforms!
-- **2026-02-08** 🔧 Refactored Providers—adding a new LLM provider now takes just 2 simple steps! Check [here](#providers).
-- **2026-02-07** 🚀 Released v0.1.3.post5 with Qwen support & several key improvements! Check [here](https://github.com/HKUDS/nanobot/releases/tag/v0.1.3.post5) for details.
-- **2026-02-06** ✨ Added Moonshot/Kimi provider, Discord integration, and enhanced security hardening!
-- **2026-02-05** ✨ Added Feishu channel, DeepSeek provider, and enhanced scheduled tasks support!
-- **2026-02-04** 🚀 Released v0.1.3.post4 with multi-provider & Docker support! Check [here](https://github.com/HKUDS/nanobot/releases/tag/v0.1.3.post4) for details.
-- **2026-02-03** ⚡ Integrated vLLM for local LLM support and improved natural language task scheduling!
-- **2026-02-02** 🎉 nanobot officially launched! Welcome to try 🐈 nanobot!
 
 ## Key Features of nanobot:
 
@@ -100,6 +75,14 @@ pip install nanobot-ai
 > [!TIP]
 > Set your API key in `~/.nanobot/config.json`.
 > Get API keys: [OpenRouter](https://openrouter.ai/keys) (Global) · [Brave Search](https://brave.com/search/api/) (optional, for web search)
+
+> [!WARNING]
+> `nanobot onboard` now initializes config/workspace only.
+> Privileged execution setup is **not** done during onboard. Use `nanobot privileged setup` separately (Unix/Linux only).
+
+> [!WARNING]
+> Agent turns are finalized only when the model calls `complete_task(final_answer=...)`.
+> Intermediate `DEBUG` logs (e.g., `LLM response ...`) can be internal loop attempts and may not be sent to end users.
 
 **1. Initialize**
 
@@ -763,6 +746,10 @@ MCP tools are automatically discovered and registered on startup. The LLM can us
 > [!TIP]
 > For production deployments, set `"restrictToWorkspace": true` in your config to sandbox the agent.
 
+> [!WARNING]
+> Privileged shell execution is Unix/Linux only and requires explicit user approval in chat (`/approve` or `/deny`).
+> Approved privileged commands are executed by the privileged runner process. Review this carefully for your environment.
+
 | Option | Default | Description |
 |--------|---------|-------------|
 | `tools.restrictToWorkspace` | `false` | When `true`, restricts **all** agent tools (shell, file read/write/edit, list) to the workspace directory. Prevents path traversal and out-of-scope access. |
@@ -780,6 +767,9 @@ MCP tools are automatically discovered and registered on startup. The LLM can us
 | `nanobot agent --logs` | Show runtime logs during chat |
 | `nanobot gateway` | Start the gateway |
 | `nanobot status` | Show status |
+| `nanobot privileged setup` | Enable privileged execution and optionally install privileged runner service (Unix/Linux) |
+| `nanobot privileged status` | Show privileged execution config and runner socket status |
+| `nanobot privileged disable` | Disable privileged execution in config |
 | `nanobot provider login openai-codex` | OAuth login for providers |
 | `nanobot channels login` | Link WhatsApp (scan QR) |
 | `nanobot channels status` | Show channel status |

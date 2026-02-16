@@ -1,12 +1,15 @@
 """Shell execution tool."""
 
 import asyncio
+import json
 import os
 import re
 from pathlib import Path
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
+from nanobot.security.approval_store import ApprovalStore
+from nanobot.security.privileged_actions import parse_privileged_command
 
 
 class ExecTool(Tool):
@@ -19,6 +22,8 @@ class ExecTool(Tool):
         deny_patterns: list[str] | None = None,
         allow_patterns: list[str] | None = None,
         restrict_to_workspace: bool = False,
+        privileged_enabled: bool = False,
+        approval_store: ApprovalStore | None = None,
     ):
         self.timeout = timeout
         self.working_dir = working_dir
@@ -34,6 +39,17 @@ class ExecTool(Tool):
         ]
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
+        self.privileged_enabled = privileged_enabled
+        self.approval_store = approval_store
+        self._default_channel = ""
+        self._default_chat_id = ""
+        self._default_sender_id = ""
+
+    def set_context(self, channel: str, chat_id: str, sender_id: str = "") -> None:
+        """Set current routing context for approval-gated privileged requests."""
+        self._default_channel = channel
+        self._default_chat_id = chat_id
+        self._default_sender_id = sender_id
     
     @property
     def name(self) -> str:
@@ -41,7 +57,10 @@ class ExecTool(Tool):
     
     @property
     def description(self) -> str:
-        return "Execute a shell command and return its output. Use with caution."
+        return (
+            "Execute a shell command and return its output. "
+            "Privileged commands require explicit user approval."
+        )
     
     @property
     def parameters(self) -> dict[str, Any]:
@@ -62,10 +81,24 @@ class ExecTool(Tool):
     
     async def execute(self, command: str, working_dir: str | None = None, **kwargs: Any) -> str:
         cwd = working_dir or self.working_dir or os.getcwd()
+        privileged = parse_privileged_command(command)
+        if privileged.requires_approval:
+            if privileged.error:
+                return f"Error: {privileged.error}"
+            return self._create_approval_request(
+                command=command,
+                working_dir=cwd,
+                action=privileged.action or "",
+                action_args=privileged.action_args,
+            )
+
         guard_error = self._guard_command(command, cwd)
         if guard_error:
             return guard_error
         
+        return await self._run_command(command, cwd)
+
+    async def _run_command(self, command: str, cwd: str) -> str:
         try:
             process = await asyncio.create_subprocess_shell(
                 command,
@@ -107,6 +140,68 @@ class ExecTool(Tool):
             
         except Exception as e:
             return f"Error executing command: {str(e)}"
+
+    def _create_approval_request(
+        self,
+        *,
+        command: str,
+        working_dir: str,
+        action: str,
+        action_args: dict[str, Any],
+    ) -> str:
+        if os.name != "posix":
+            return "Error: Privileged execution is supported only on Unix/Linux."
+
+        if not self.privileged_enabled or not self.approval_store:
+            return (
+                "Error: Privileged command detected but privileged execution is not set up. "
+                "Run `nanobot privileged setup` once, then retry."
+            )
+
+        if not self._default_channel or not self._default_chat_id:
+            return "Error: Missing chat context for approval-gated privileged execution."
+
+        session_key = f"{self._default_channel}:{self._default_chat_id}"
+        if pending := self.approval_store.get_pending(session_key):
+            return json.dumps(
+                {
+                    "approval_required": True,
+                    "pending": True,
+                    "request_id": pending.request_id,
+                    "action": pending.action,
+                    "message": (
+                        "A privileged request is already pending in this chat. "
+                        "Ask user to run /approve or /deny."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
+        req = self.approval_store.create_pending(
+            session_key=session_key,
+            channel=self._default_channel,
+            chat_id=self._default_chat_id,
+            requester_id=self._default_sender_id,
+            command=command,
+            working_dir=working_dir,
+            action=action,
+            action_args=action_args,
+        )
+
+        return json.dumps(
+            {
+                "approval_required": True,
+                "pending": True,
+                "request_id": req.request_id,
+                "action": req.action,
+                "action_args": req.action_args,
+                "message": (
+                    "Privileged execution requires explicit user approval. "
+                    "Ask user to run /approve or /deny in this chat."
+                ),
+            },
+            ensure_ascii=False,
+        )
 
     def _guard_command(self, command: str, cwd: str) -> str | None:
         """Best-effort safety guard for potentially destructive commands."""

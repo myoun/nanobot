@@ -4,6 +4,7 @@ import asyncio
 from contextlib import AsyncExitStack
 import json
 import json_repair
+import os
 from pathlib import Path
 import re
 from typing import Any, TYPE_CHECKING
@@ -24,7 +25,10 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
+from nanobot.security.approval_store import ApprovalStore
+from nanobot.security.privileged_client import PrivilegedClient
 from nanobot.session.manager import Session, SessionManager
+from nanobot.utils.helpers import get_data_path
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ExecToolConfig
@@ -53,6 +57,15 @@ class AgentLoop:
         "Do not claim completion before executing and verifying with at least one relevant tool successfully. "
         "Then call "
         "complete_task(final_answer=...)."
+    )
+    _ACTION_RETRY_REASON_NO_PROGRESS = (
+        "Retry reason: the previous attempt had no verified external progress for a tool-oriented request. "
+        "Your next step must be a relevant tool call (not plain text). "
+        "After at least one successful tool result, call complete_task(final_answer=...)."
+    )
+    _ACTION_RETRY_REASON_PREMATURE_COMPLETE = (
+        "Retry reason: complete_task was rejected because there is still no successful external tool progress. "
+        "Do not acknowledge this policy again. Execute a relevant tool now."
     )
     _COMPLETION_REJECT_NUDGE = (
         "Your complete_task call was rejected. "
@@ -109,6 +122,32 @@ class AgentLoop:
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
+        try:
+            approvals_path = get_data_path() / "approvals" / "requests.json"
+            self._approval_store = ApprovalStore(
+                approvals_path,
+                ttl_seconds=self.exec_config.approval_ttl_sec,
+                single_pending_per_chat=self.exec_config.single_pending_per_chat,
+            )
+        except OSError:
+            approvals_path = Path.home() / ".nanobot" / "approvals" / "requests.json"
+            fallback_path = self.workspace / ".nanobot" / "approvals" / "requests.json"
+            logger.warning(
+                f"Approval store path not writable ({approvals_path}); using workspace fallback: {fallback_path}"
+            )
+            self._approval_store = ApprovalStore(
+                fallback_path,
+                ttl_seconds=self.exec_config.approval_ttl_sec,
+                single_pending_per_chat=self.exec_config.single_pending_per_chat,
+            )
+        self._privileged_client: PrivilegedClient | None = None
+        if self.exec_config.privileged_enabled:
+            if os.name == "posix":
+                self._privileged_client = PrivilegedClient(self.exec_config.privileged_socket)
+            else:
+                logger.warning(
+                    "Privileged execution is enabled in config but unsupported on non-Unix runtime; ignoring."
+                )
         self._register_default_tools()
     
     def _register_default_tools(self) -> None:
@@ -125,6 +164,8 @@ class AgentLoop:
             working_dir=str(self.workspace),
             timeout=self.exec_config.timeout,
             restrict_to_workspace=self.restrict_to_workspace,
+            privileged_enabled=self.exec_config.privileged_enabled,
+            approval_store=self._approval_store,
         ))
         
         # Web tools
@@ -157,8 +198,12 @@ class AgentLoop:
         await self._mcp_stack.__aenter__()
         await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
 
-    def _set_tool_context(self, channel: str, chat_id: str) -> None:
+    def _set_tool_context(self, channel: str, chat_id: str, sender_id: str = "") -> None:
         """Update context for all tools that need routing info."""
+        if exec_tool := self.tools.get("exec"):
+            if isinstance(exec_tool, ExecTool):
+                exec_tool.set_context(channel, chat_id, sender_id)
+
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.set_context(channel, chat_id)
@@ -170,6 +215,149 @@ class AgentLoop:
         if cron_tool := self.tools.get("cron"):
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
+
+    @staticmethod
+    def _truncate_preview(text: str, max_len: int = 800) -> str:
+        clean = text.strip()
+        if len(clean) <= max_len:
+            return clean
+        return clean[:max_len] + f"\n... (truncated, {len(clean) - max_len} more chars)"
+
+    async def _handle_privileged_approval(
+        self,
+        *,
+        msg: InboundMessage,
+        session: Session,
+        approve: bool,
+    ) -> OutboundMessage:
+        session_key = msg.session_key
+        pending = self._approval_store.get_pending(session_key)
+        if not pending:
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="No pending privileged request in this chat.",
+            )
+
+        if pending.requester_id and pending.requester_id != msg.sender_id:
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="Only the original requester can approve or deny this privileged request.",
+            )
+
+        if not approve:
+            self._approval_store.resolve(
+                session_key,
+                status="denied",
+                resolver_id=msg.sender_id,
+                result_preview="Denied by user",
+            )
+            session.add_message("user", msg.content)
+            session.add_message("assistant", "Privileged request denied.")
+            self.sessions.save(session)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="Privileged request denied.",
+            )
+
+        if not self.exec_config.privileged_enabled or not self._privileged_client:
+            if os.name != "posix":
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Privileged execution is supported only on Unix/Linux.",
+                )
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    "Privileged execution is not set up. "
+                    "Run `nanobot privileged setup` once, then retry `/approve`."
+                ),
+            )
+
+        result = await self._privileged_client.execute(
+            request_id=pending.request_id,
+            action=pending.action,
+            action_args=pending.action_args,
+            timeout_s=max(self.exec_config.timeout, 120),
+        )
+        ok = bool(result.get("ok"))
+        stdout = str(result.get("stdout") or "").strip()
+        stderr = str(result.get("stderr") or "").strip()
+        error = str(result.get("error") or "").strip()
+
+        parts: list[str] = []
+        if ok:
+            parts.append(f"Privileged request executed: {pending.action}")
+        else:
+            parts.append(f"Privileged request failed: {pending.action}")
+        if stdout:
+            parts.append("STDOUT:\n" + self._truncate_preview(stdout))
+        if stderr:
+            parts.append("STDERR:\n" + self._truncate_preview(stderr))
+        if error:
+            parts.append("Error: " + error)
+
+        preview = self._truncate_preview("\n\n".join(parts), max_len=1200)
+        self._approval_store.resolve(
+            session_key,
+            status="executed" if ok else "failed",
+            resolver_id=msg.sender_id,
+            result_preview=preview,
+        )
+        if not ok:
+            session.add_message("user", msg.content)
+            session.add_message("assistant", preview)
+            self.sessions.save(session)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=preview,
+            )
+
+        # Continue the original task after successful privileged execution.
+        # Keep this as an explicit system event so the model can decide next steps
+        # and then end with complete_task.
+        followup_event = (
+            "System event: pending privileged request approved and executed.\n"
+            f"Action: {pending.action}\n"
+            f"Command: {pending.command}\n"
+            "Execution summary:\n"
+            f"{preview}\n\n"
+            "Continue the original user request in this chat using these results. "
+            "If the task is complete, call complete_task(final_answer=...)."
+        )
+        self._set_tool_context(msg.channel, msg.chat_id, msg.sender_id)
+        initial_messages = self.context.build_messages(
+            history=session.get_history(max_messages=self.memory_window),
+            current_message=followup_event,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+        )
+        final_content, tools_used, llm_metadata = await self._run_agent_loop(
+            initial_messages,
+            initial_external_progress=True,
+        )
+        if not final_content:
+            final_content = preview
+
+        session.add_message("user", msg.content)
+        session.add_message(
+            "assistant",
+            final_content,
+            tools_used=tools_used if tools_used else None,
+        )
+        self.sessions.save(session)
+
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=final_content,
+            metadata=self._merge_outbound_metadata(msg.metadata, llm_metadata),
+        )
 
     @staticmethod
     def _extract_web_search_trace(metadata: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -204,6 +392,10 @@ class AgentLoop:
         try:
             parsed = json.loads(text)
             if isinstance(parsed, dict):
+                if parsed.get("approval_required") is True:
+                    return False
+                if parsed.get("pending") is True:
+                    return False
                 status = parsed.get("status")
                 if isinstance(status, str) and status.lower() in {"error", "failed"}:
                     return False
@@ -224,6 +416,35 @@ class AgentLoop:
             if marker in lower:
                 return False
         return True
+
+    @staticmethod
+    def _pending_approval_message(tool_name: str, result: str) -> str | None:
+        """Extract user-facing pending-approval notice from a tool result payload."""
+        if tool_name != "exec":
+            return None
+        try:
+            parsed = json.loads(result.strip())
+        except Exception:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        if parsed.get("approval_required") is not True or parsed.get("pending") is not True:
+            return None
+
+        request_id = parsed.get("request_id")
+        action = parsed.get("action")
+        msg = parsed.get("message")
+        lines = [
+            "Privileged execution is pending user approval.",
+            "Reply with /approve to continue or /deny to cancel.",
+        ]
+        if isinstance(request_id, str) and request_id:
+            lines.insert(1, f"Request ID: {request_id}")
+        if isinstance(action, str) and action:
+            lines.insert(2 if len(lines) > 2 else 1, f"Action: {action}")
+        if isinstance(msg, str) and msg.strip():
+            lines.append(msg.strip())
+        return "\n".join(lines)
 
     @staticmethod
     def _merge_outbound_metadata(base: dict[str, Any] | None, llm_metadata: dict[str, Any]) -> dict[str, Any]:
@@ -317,7 +538,12 @@ class AgentLoop:
 
         return False
 
-    async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str], dict[str, Any]]:
+    async def _run_agent_loop(
+        self,
+        initial_messages: list[dict],
+        *,
+        initial_external_progress: bool = False,
+    ) -> tuple[str | None, list[str], dict[str, Any]]:
         """
         Run the agent iteration loop.
 
@@ -332,7 +558,7 @@ class AgentLoop:
         final_content = None
         tools_used: list[str] = []
         web_search_trace: list[dict[str, Any]] = []
-        successful_external_actions = 0
+        successful_external_actions = 1 if initial_external_progress else 0
         wants_tool_progress = self._looks_like_tool_request(initial_messages)
 
         while iteration < self.max_iterations:
@@ -371,6 +597,7 @@ class AgentLoop:
 
                 completion_answer: str | None = None
                 completion_requested = False
+                pending_approval_notice: str | None = None
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
@@ -379,6 +606,10 @@ class AgentLoop:
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+                    pending_approval_notice = self._pending_approval_message(tool_call.name, result)
+                    if pending_approval_notice:
+                        logger.info(f"Tool result: {tool_call.name} -> pending_approval")
+                        break
                     if tool_call.name == self._COMPLETE_TOOL_NAME:
                         completion_requested = True
                         completion_answer = self._extract_completion_answer(tool_call.arguments)
@@ -394,13 +625,17 @@ class AgentLoop:
                     if is_success:
                         successful_external_actions += 1
 
+                if pending_approval_notice:
+                    final_content = pending_approval_notice
+                    break
+
                 has_external_progress = successful_external_actions > 0 or bool(web_search_trace)
                 if completion_answer:
                     if wants_tool_progress and not has_external_progress:
                         logger.warning(
                             "complete_task rejected: tool-oriented request has no successful external progress"
                         )
-                        messages.append({"role": "user", "content": self._ACTION_REQUEST_NUDGE})
+                        messages.append({"role": "user", "content": self._ACTION_RETRY_REASON_PREMATURE_COMPLETE})
                         continue
                     final_content = completion_answer
                     break
@@ -421,7 +656,7 @@ class AgentLoop:
                     reasoning_content=response.reasoning_content,
                 )
                 nudge = (
-                    self._ACTION_REQUEST_NUDGE
+                    self._ACTION_RETRY_REASON_NO_PROGRESS
                     if wants_tool_progress and not has_external_progress
                     else self._NO_ACTION_NUDGE
                 )
@@ -499,7 +734,9 @@ class AgentLoop:
         
         # Handle slash commands
         cmd = msg.content.strip().lower()
-        if cmd == "/new":
+        cmd_token = cmd.split()[0] if cmd else ""
+        cmd_name = cmd_token.split("@", 1)[0]
+        if cmd_name == "/new":
             # Capture messages before clearing (avoid race condition with background task)
             messages_to_archive = session.messages.copy()
             session.clear()
@@ -514,14 +751,24 @@ class AgentLoop:
             asyncio.create_task(_consolidate_and_cleanup())
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started. Memory consolidation in progress.")
-        if cmd == "/help":
+        if cmd_name == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
+                                  content=(
+                                      "🐈 nanobot commands:\n"
+                                      "/new — Start a new conversation\n"
+                                      "/help — Show available commands\n"
+                                      "/approve — Approve pending privileged request\n"
+                                      "/deny — Deny pending privileged request"
+                                  ))
+        if cmd_name == "/approve":
+            return await self._handle_privileged_approval(msg=msg, session=session, approve=True)
+        if cmd_name == "/deny":
+            return await self._handle_privileged_approval(msg=msg, session=session, approve=False)
         
         if len(session.messages) > self.memory_window:
             asyncio.create_task(self._consolidate_memory(session))
 
-        self._set_tool_context(msg.channel, msg.chat_id)
+        self._set_tool_context(msg.channel, msg.chat_id, msg.sender_id)
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
             current_message=msg.content,
@@ -572,7 +819,7 @@ class AgentLoop:
         
         session_key = f"{origin_channel}:{origin_chat_id}"
         session = self.sessions.get_or_create(session_key)
-        self._set_tool_context(origin_channel, origin_chat_id)
+        self._set_tool_context(origin_channel, origin_chat_id, msg.sender_id)
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
             current_message=msg.content,
