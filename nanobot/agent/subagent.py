@@ -49,6 +49,8 @@ class SubagentManager:
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
+        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+        self._use_native_web_search = not isinstance(provider, OpenAICodexProvider)
     
     async def spawn(
         self,
@@ -112,7 +114,8 @@ class SubagentManager:
                 timeout=self.exec_config.timeout,
                 restrict_to_workspace=self.restrict_to_workspace,
             ))
-            tools.register(WebSearchTool(api_key=self.brave_api_key))
+            if self._use_native_web_search:
+                tools.register(WebSearchTool(api_key=self.brave_api_key))
             tools.register(WebFetchTool())
             
             # Build messages with subagent-specific prompt

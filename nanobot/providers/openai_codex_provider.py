@@ -15,6 +15,7 @@ from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "nanobot"
+BUILTIN_WEB_SEARCH_TOOL = {"type": "web_search"}
 
 
 class OpenAICodexProvider(LLMProvider):
@@ -51,23 +52,25 @@ class OpenAICodexProvider(LLMProvider):
             "parallel_tool_calls": True,
         }
 
-        if tools:
-            body["tools"] = _convert_tools(tools)
+        # Always expose Codex built-in web search and filter out legacy function
+        # tools named "web_search" to avoid ambiguous tool selection.
+        body["tools"] = _build_response_tools(tools)
 
         url = DEFAULT_CODEX_URL
 
         try:
             try:
-                content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=True)
+                content, tool_calls, finish_reason, metadata = await _request_codex(url, headers, body, verify=True)
             except Exception as e:
                 if "CERTIFICATE_VERIFY_FAILED" not in str(e):
                     raise
                 logger.warning("SSL certificate verification failed for Codex API; retrying with verify=False")
-                content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=False)
+                content, tool_calls, finish_reason, metadata = await _request_codex(url, headers, body, verify=False)
             return LLMResponse(
                 content=content,
                 tool_calls=tool_calls,
                 finish_reason=finish_reason,
+                metadata=metadata,
             )
         except Exception as e:
             return LLMResponse(
@@ -102,7 +105,7 @@ async def _request_codex(
     headers: dict[str, str],
     body: dict[str, Any],
     verify: bool,
-) -> tuple[str, list[ToolCallRequest], str]:
+) -> tuple[str, list[ToolCallRequest], str, dict[str, Any]]:
     async with httpx.AsyncClient(timeout=60.0, verify=verify) as client:
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code != 200:
@@ -127,6 +130,17 @@ def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "parameters": params if isinstance(params, dict) else {},
         })
     return converted
+
+
+def _build_response_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Build Responses API tools with built-in web search enabled."""
+    converted = _convert_tools(tools or [])
+    filtered = [
+        tool for tool in converted
+        if not (tool.get("type") == "function" and tool.get("name") == "web_search")
+    ]
+    filtered.append(BUILTIN_WEB_SEARCH_TOOL.copy())
+    return filtered
 
 
 def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
@@ -242,10 +256,12 @@ async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], 
         buffer.append(line)
 
 
-async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequest], str]:
+async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequest], str, dict[str, Any]]:
     content = ""
     tool_calls: list[ToolCallRequest] = []
     tool_call_buffers: dict[str, dict[str, Any]] = {}
+    web_search_trace: list[dict[str, Any]] = []
+    seen_web_actions: set[str] = set()
     finish_reason = "stop"
 
     async for event in _iter_sse(response):
@@ -290,13 +306,29 @@ async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequ
                         arguments=args,
                     )
                 )
+            elif item.get("type") == "web_search_call":
+                _append_web_search_action(
+                    web_search_trace,
+                    seen_web_actions,
+                    _normalize_web_search_action(item.get("action")),
+                )
+        elif event_type.startswith("response.web_search_call."):
+            web_item = event.get("web_search_call") or {}
+            _append_web_search_action(
+                web_search_trace,
+                seen_web_actions,
+                _normalize_web_search_action(web_item.get("action") or event.get("action")),
+            )
         elif event_type == "response.completed":
             status = (event.get("response") or {}).get("status")
             finish_reason = _map_finish_reason(status)
         elif event_type in {"error", "response.failed"}:
             raise RuntimeError("Codex response failed")
 
-    return content, tool_calls, finish_reason
+    metadata: dict[str, Any] = {}
+    if web_search_trace:
+        metadata["web_search_trace"] = web_search_trace
+    return content, tool_calls, finish_reason, metadata
 
 
 _FINISH_REASON_MAP = {"completed": "stop", "incomplete": "length", "failed": "error", "cancelled": "error"}
@@ -304,6 +336,56 @@ _FINISH_REASON_MAP = {"completed": "stop", "incomplete": "length", "failed": "er
 
 def _map_finish_reason(status: str | None) -> str:
     return _FINISH_REASON_MAP.get(status or "completed", "stop")
+
+
+def _append_web_search_action(
+    trace: list[dict[str, Any]],
+    seen: set[str],
+    action: dict[str, Any] | None,
+) -> None:
+    if not action:
+        return
+    key = json.dumps(action, ensure_ascii=True, sort_keys=True)
+    if key in seen:
+        return
+    seen.add(key)
+    trace.append(action)
+
+
+def _normalize_web_search_action(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    action_type = raw.get("type")
+    if not isinstance(action_type, str) or not action_type:
+        return None
+
+    normalized: dict[str, Any] = {"type": action_type}
+
+    query = raw.get("query")
+    if isinstance(query, str) and query:
+        normalized["query"] = query
+
+    queries = raw.get("queries")
+    if isinstance(queries, list):
+        cleaned_queries = [q for q in queries if isinstance(q, str) and q]
+        if cleaned_queries:
+            normalized["queries"] = cleaned_queries
+
+    url = raw.get("url")
+    if isinstance(url, str) and url:
+        normalized["url"] = url
+
+    pattern = raw.get("pattern")
+    if isinstance(pattern, str) and pattern:
+        normalized["pattern"] = pattern
+
+    sources = raw.get("sources")
+    if isinstance(sources, list):
+        cleaned_sources = [s for s in sources if isinstance(s, dict)]
+        if cleaned_sources:
+            normalized["sources"] = cleaned_sources
+
+    return normalized
 
 
 def _friendly_error(status_code: int, raw: str) -> str:

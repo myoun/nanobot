@@ -6,6 +6,7 @@ import signal
 from pathlib import Path
 import select
 import sys
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -97,12 +98,61 @@ def _init_prompt_session() -> None:
     )
 
 
-def _print_agent_response(response: str, render_markdown: bool) -> None:
+def _extract_web_search_trace(metadata: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(metadata, dict):
+        return []
+    nanobot_meta = metadata.get("_nanobot")
+    if not isinstance(nanobot_meta, dict):
+        return []
+    trace = nanobot_meta.get("web_search_trace")
+    if not isinstance(trace, list):
+        return []
+    return [item for item in trace if isinstance(item, dict)]
+
+
+def _render_web_search_trace(trace: list[dict[str, Any]]) -> None:
+    if not trace:
+        return
+
+    console.print("[dim]web search trace[/dim]")
+    for idx, item in enumerate(trace, start=1):
+        action_type = item.get("type")
+        if action_type == "search":
+            query = item.get("query")
+            if not isinstance(query, str) or not query:
+                queries = item.get("queries")
+                if isinstance(queries, list):
+                    query = " | ".join(q for q in queries if isinstance(q, str) and q)
+            label = f"search: {query}" if query else "search"
+        elif action_type == "open_page":
+            url = item.get("url")
+            label = f"open_page: {url}" if isinstance(url, str) and url else "open_page"
+        elif action_type == "find_in_page":
+            url = item.get("url")
+            pattern = item.get("pattern")
+            if isinstance(url, str) and url and isinstance(pattern, str) and pattern:
+                label = f"find_in_page: {pattern} @ {url}"
+            elif isinstance(url, str) and url:
+                label = f"find_in_page: {url}"
+            else:
+                label = "find_in_page"
+        else:
+            label = action_type if isinstance(action_type, str) else "web_action"
+        console.print(f"[dim]{idx}. {label}[/dim]")
+
+
+def _print_agent_response(
+    response: str,
+    render_markdown: bool,
+    metadata: dict[str, Any] | None = None,
+) -> None:
     """Render assistant response with consistent terminal styling."""
     content = response or ""
     body = Markdown(content) if render_markdown else Text(content)
+    web_trace = _extract_web_search_trace(metadata)
     console.print()
     console.print(f"[cyan]{__logo__} nanobot[/cyan]")
+    _render_web_search_trace(web_trace)
     console.print(body)
     console.print()
 
@@ -481,8 +531,12 @@ def agent(
         # Single message mode
         async def run_once():
             with _thinking_ctx():
-                response = await agent_loop.process_direct(message, session_id)
-            _print_agent_response(response, render_markdown=markdown)
+                outbound = await agent_loop.process_direct_message(message, session_id)
+            _print_agent_response(
+                outbound.content if outbound else "",
+                render_markdown=markdown,
+                metadata=outbound.metadata if outbound else None,
+            )
             await agent_loop.close_mcp()
         
         asyncio.run(run_once())
@@ -514,8 +568,12 @@ def agent(
                             break
                         
                         with _thinking_ctx():
-                            response = await agent_loop.process_direct(user_input, session_id)
-                        _print_agent_response(response, render_markdown=markdown)
+                            outbound = await agent_loop.process_direct_message(user_input, session_id)
+                        _print_agent_response(
+                            outbound.content if outbound else "",
+                            render_markdown=markdown,
+                            metadata=outbound.metadata if outbound else None,
+                        )
                     except KeyboardInterrupt:
                         _restore_terminal()
                         console.print("\nGoodbye!")

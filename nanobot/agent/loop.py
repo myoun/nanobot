@@ -107,7 +107,10 @@ class AgentLoop:
         ))
         
         # Web tools
-        self.tools.register(WebSearchTool(api_key=self.brave_api_key))
+        # OpenAI Codex provider has native web search via Responses API tools.
+        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+        if not isinstance(self.provider, OpenAICodexProvider):
+            self.tools.register(WebSearchTool(api_key=self.brave_api_key))
         self.tools.register(WebFetchTool())
         
         # Message tool
@@ -146,7 +149,35 @@ class AgentLoop:
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
 
-    async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
+    @staticmethod
+    def _extract_web_search_trace(metadata: dict[str, Any] | None) -> list[dict[str, Any]]:
+        if not isinstance(metadata, dict):
+            return []
+        trace = metadata.get("web_search_trace")
+        if not isinstance(trace, list):
+            return []
+        return [item for item in trace if isinstance(item, dict)]
+
+    @staticmethod
+    def _merge_outbound_metadata(base: dict[str, Any] | None, llm_metadata: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(base or {})
+        if not llm_metadata:
+            return merged
+
+        nanobot_meta = merged.get("_nanobot")
+        if not isinstance(nanobot_meta, dict):
+            nanobot_meta = {}
+
+        for key, value in llm_metadata.items():
+            if isinstance(value, list) and isinstance(nanobot_meta.get(key), list):
+                nanobot_meta[key] = [*nanobot_meta[key], *value]
+            else:
+                nanobot_meta[key] = value
+
+        merged["_nanobot"] = nanobot_meta
+        return merged
+
+    async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str], dict[str, Any]]:
         """
         Run the agent iteration loop.
 
@@ -154,12 +185,13 @@ class AgentLoop:
             initial_messages: Starting messages for the LLM conversation.
 
         Returns:
-            Tuple of (final_content, list_of_tools_used).
+            Tuple of (final_content, list_of_tools_used, llm_metadata).
         """
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        web_search_trace: list[dict[str, Any]] = []
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -171,6 +203,7 @@ class AgentLoop:
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
             )
+            web_search_trace.extend(self._extract_web_search_trace(response.metadata))
 
             if response.has_tool_calls:
                 tool_call_dicts = [
@@ -202,7 +235,11 @@ class AgentLoop:
                 final_content = response.content
                 break
 
-        return final_content, tools_used
+        llm_metadata: dict[str, Any] = {}
+        if web_search_trace:
+            llm_metadata["web_search_trace"] = web_search_trace
+
+        return final_content, tools_used, llm_metadata
 
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
@@ -297,7 +334,7 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
         )
-        final_content, tools_used = await self._run_agent_loop(initial_messages)
+        final_content, tools_used, llm_metadata = await self._run_agent_loop(initial_messages)
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
@@ -310,11 +347,13 @@ class AgentLoop:
                             tools_used=tools_used if tools_used else None)
         self.sessions.save(session)
         
+        outbound_metadata = self._merge_outbound_metadata(msg.metadata, llm_metadata)
+
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content,
-            metadata=msg.metadata or {},  # Pass through for channel-specific needs (e.g. Slack thread_ts)
+            metadata=outbound_metadata,  # Pass through for channels and include LLM traces.
         )
     
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
@@ -345,7 +384,7 @@ class AgentLoop:
             channel=origin_channel,
             chat_id=origin_chat_id,
         )
-        final_content, _ = await self._run_agent_loop(initial_messages)
+        final_content, _, llm_metadata = await self._run_agent_loop(initial_messages)
 
         if final_content is None:
             final_content = "Background task completed."
@@ -357,7 +396,8 @@ class AgentLoop:
         return OutboundMessage(
             channel=origin_channel,
             chat_id=origin_chat_id,
-            content=final_content
+            content=final_content,
+            metadata=self._merge_outbound_metadata(msg.metadata, llm_metadata),
         )
     
     async def _consolidate_memory(self, session, archive_all: bool = False) -> None:
@@ -464,6 +504,22 @@ Respond with ONLY valid JSON, no markdown fences."""
         Returns:
             The agent's response.
         """
+        response = await self.process_direct_message(
+            content=content,
+            session_key=session_key,
+            channel=channel,
+            chat_id=chat_id,
+        )
+        return response.content if response else ""
+
+    async def process_direct_message(
+        self,
+        content: str,
+        session_key: str = "cli:direct",
+        channel: str = "cli",
+        chat_id: str = "direct",
+    ) -> OutboundMessage | None:
+        """Process a message directly and return the full outbound payload."""
         await self._connect_mcp()
         msg = InboundMessage(
             channel=channel,
@@ -471,6 +527,4 @@ Respond with ONLY valid JSON, no markdown fences."""
             chat_id=chat_id,
             content=content
         )
-        
-        response = await self._process_message(msg, session_key=session_key)
-        return response.content if response else ""
+        return await self._process_message(msg, session_key=session_key)
