@@ -36,7 +36,7 @@ class MessageTool(Tool):
     def description(self) -> str:
         return (
             "Send a message to the user. Supports text content and optional media file paths/URLs "
-            "(channel-dependent)."
+            "(channel-dependent). For the current active chat, use this primarily for media delivery."
         )
     
     @property
@@ -86,6 +86,15 @@ class MessageTool(Tool):
         cleaned_media = [m.strip() for m in (media or []) if isinstance(m, str) and m.strip()]
         if not content and not cleaned_media:
             return "Error: Provide at least one of 'content' or 'media'"
+
+        is_current_chat = (
+            channel == self._default_channel and chat_id == self._default_chat_id
+        )
+        if is_current_chat and not cleaned_media:
+            return (
+                "Error: Text-only message to the current chat is blocked. "
+                "Use complete_task(final_answer=...) for normal replies."
+            )
         
         msg = OutboundMessage(
             channel=channel,

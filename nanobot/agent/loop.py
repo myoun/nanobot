@@ -5,6 +5,7 @@ from contextlib import AsyncExitStack
 import json
 import json_repair
 from pathlib import Path
+import re
 from typing import Any, TYPE_CHECKING
 
 from loguru import logger
@@ -43,15 +44,19 @@ class AgentLoop:
     """
 
     _COMPLETE_TOOL_NAME = "complete_task"
-    _NO_ACTION_MAX_ROUNDS = 3
     _NO_ACTION_NUDGE = (
         "Continue working on this request. "
-        "Use tools if needed, and call complete_task(final_answer=...) only when fully done."
+        "Use tools if needed. Call complete_task(final_answer=...) only when fully done."
     )
     _ACTION_REQUEST_NUDGE = (
         "This request appears to require tool execution. "
-        "Use at least one relevant tool before finalizing, then call "
+        "Do not claim completion before executing and verifying with at least one relevant tool successfully. "
+        "Then call "
         "complete_task(final_answer=...)."
+    )
+    _COMPLETION_REJECT_NUDGE = (
+        "Your complete_task call was rejected. "
+        "Keep working and call complete_task(final_answer=...) only after verified progress."
     )
 
     def __init__(
@@ -187,6 +192,40 @@ class AgentLoop:
         return None
 
     @staticmethod
+    def _tool_result_success(tool_name: str, result: str) -> bool:
+        """Best-effort tool success detection for completion gating."""
+        if tool_name == AgentLoop._COMPLETE_TOOL_NAME:
+            return True
+
+        text = result.strip()
+        if not text:
+            return True
+
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                status = parsed.get("status")
+                if isinstance(status, str) and status.lower() in {"error", "failed"}:
+                    return False
+                err = parsed.get("error")
+                if isinstance(err, str) and err.strip():
+                    return False
+                if parsed.get("ok") is False:
+                    return False
+        except Exception:
+            pass
+
+        lower = text.lower()
+        if re.search(r"\bexit code:\s*(?!0\b)\d+", lower):
+            return False
+        if lower.startswith("error"):
+            return False
+        for marker in ("error:", "traceback", "exception", "module not found", "failed to"):
+            if marker in lower:
+                return False
+        return True
+
+    @staticmethod
     def _merge_outbound_metadata(base: dict[str, Any] | None, llm_metadata: dict[str, Any]) -> dict[str, Any]:
         merged = dict(base or {})
         if not llm_metadata:
@@ -222,13 +261,33 @@ class AgentLoop:
         return "\n".join(parts)
 
     @classmethod
+    def _latest_message_text(cls, messages: list[dict[str, Any]], role: str) -> str:
+        """Get the latest message text for a given role."""
+        for msg in reversed(messages):
+            if msg.get("role") == role:
+                return cls._extract_text_content(msg.get("content"))
+        return ""
+
+    @staticmethod
+    def _looks_like_action_offer(assistant_text: str) -> bool:
+        """Detect assistant text that offers to run a concrete next action."""
+        text = assistant_text.lower()
+        if not text:
+            return False
+        offer_hints = (
+            "원하면", "바로", "이어서", "진행", "실행", "전송", "보내",
+            "생성", "스크린샷", "파일 경로", "agent-browser", "playwright",
+            "i can", "if you want", "i can proceed", "next step",
+        )
+        if any(h in text for h in offer_hints):
+            return True
+        return bool(re.search(r"/[\w\-/\.]+\.(png|jpg|jpeg|pdf|txt|md)\b", text))
+
+    @classmethod
     def _looks_like_tool_request(cls, initial_messages: list[dict[str, Any]]) -> bool:
         """Best-effort heuristic for requests that likely need tool execution."""
-        user_text = ""
-        for msg in reversed(initial_messages):
-            if msg.get("role") == "user":
-                user_text = cls._extract_text_content(msg.get("content"))
-                break
+        user_text = cls._latest_message_text(initial_messages, "user")
+        prev_assistant_text = cls._latest_message_text(initial_messages, "assistant")
         text = user_text.lower()
         if not text:
             return False
@@ -236,11 +295,27 @@ class AgentLoop:
         tool_hints = (
             "run ", "execute", "open ", "browse", "search", "fetch", "scrape",
             "screenshot", "install", "commit", "push", "clone", "build", "test",
+            "send", "upload", "attach",
             "fix ", "update", "edit ", "write file", "modify",
             "실행", "검색", "찾아", "열어", "가져와", "스크린샷", "설치",
             "커밋", "푸시", "빌드", "테스트", "수정", "파일", "추가", "삭제",
+            "보내", "전송", "첨부", "업로드", "찍어", "촬영",
         )
-        return any(hint in text for hint in tool_hints)
+        if any(hint in text for hint in tool_hints):
+            return True
+
+        # Continuation commands like "그걸로 가자/보내줘/진행해" are tool-oriented
+        # if the previous assistant turn clearly offered an executable next action.
+        continuation_phrases = {
+            "그걸로 가자", "그걸로", "그렇게 해", "진행해", "시작",
+            "해줘", "그걸로 해", "보내줘", "전송해줘",
+            "go ahead", "do it", "proceed", "send it",
+        }
+        compact = text.strip()
+        if compact in continuation_phrases and cls._looks_like_action_offer(prev_assistant_text):
+            return True
+
+        return False
 
     async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str], dict[str, Any]]:
         """
@@ -257,7 +332,7 @@ class AgentLoop:
         final_content = None
         tools_used: list[str] = []
         web_search_trace: list[dict[str, Any]] = []
-        no_action_rounds = 0
+        successful_external_actions = 0
         wants_tool_progress = self._looks_like_tool_request(initial_messages)
 
         while iteration < self.max_iterations:
@@ -270,13 +345,14 @@ class AgentLoop:
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
             )
-            web_search_trace.extend(self._extract_web_search_trace(response.metadata))
+            round_web_search_trace = self._extract_web_search_trace(response.metadata)
+            web_search_trace.extend(round_web_search_trace)
+            has_external_progress = successful_external_actions > 0 or bool(web_search_trace)
             if response.finish_reason == "error":
                 final_content = response.content
                 break
 
             if response.has_tool_calls:
-                no_action_rounds = 0
                 tool_call_dicts = [
                     {
                         "id": tc.id,
@@ -294,6 +370,7 @@ class AgentLoop:
                 )
 
                 completion_answer: str | None = None
+                completion_requested = False
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
@@ -303,36 +380,51 @@ class AgentLoop:
                         messages, tool_call.id, tool_call.name, result
                     )
                     if tool_call.name == self._COMPLETE_TOOL_NAME:
+                        completion_requested = True
                         completion_answer = self._extract_completion_answer(tool_call.arguments)
                         if not completion_answer:
                             logger.warning(
                                 "complete_task called without final_answer; continuing loop"
                             )
+                        continue
+
+                    is_success = self._tool_result_success(tool_call.name, result)
+                    status = "ok" if is_success else "failed"
+                    logger.info(f"Tool result: {tool_call.name} -> {status}")
+                    if is_success:
+                        successful_external_actions += 1
+
+                has_external_progress = successful_external_actions > 0 or bool(web_search_trace)
                 if completion_answer:
+                    if wants_tool_progress and not has_external_progress:
+                        logger.warning(
+                            "complete_task rejected: tool-oriented request has no successful external progress"
+                        )
+                        messages.append({"role": "user", "content": self._ACTION_REQUEST_NUDGE})
+                        continue
                     final_content = completion_answer
                     break
-                messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
+                if completion_requested:
+                    messages.append({"role": "user", "content": self._COMPLETION_REJECT_NUDGE})
+                else:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Reflect on the tool results and continue. "
+                            "Call complete_task(final_answer=...) only when fully done."
+                        ),
+                    })
             else:
-                no_action_rounds += 1
                 messages = self.context.add_assistant_message(
                     messages,
                     response.content,
                     reasoning_content=response.reasoning_content,
                 )
-                if no_action_rounds > self._NO_ACTION_MAX_ROUNDS:
-                    if wants_tool_progress and not tools_used:
-                        logger.warning(
-                            "LLM returned no tool calls repeatedly on tool-oriented request; "
-                            "continuing and requiring tool progress before fallback"
-                        )
-                        messages.append({"role": "user", "content": self._ACTION_REQUEST_NUDGE})
-                        continue
-                    logger.warning(
-                        "LLM returned no tool calls repeatedly; accepting direct response fallback"
-                    )
-                    final_content = response.content
-                    break
-                nudge = self._ACTION_REQUEST_NUDGE if wants_tool_progress and not tools_used else self._NO_ACTION_NUDGE
+                nudge = (
+                    self._ACTION_REQUEST_NUDGE
+                    if wants_tool_progress and not has_external_progress
+                    else self._NO_ACTION_NUDGE
+                )
                 messages.append({"role": "user", "content": nudge})
 
         if final_content is None:

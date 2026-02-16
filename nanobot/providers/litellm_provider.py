@@ -158,13 +158,17 @@ class LiteLLMProvider(LLMProvider):
         
         try:
             response = await acompletion(**kwargs)
-            return self._parse_response(response)
+            parsed = self._parse_response(response)
+            self._log_response_debug(parsed, model=model)
+            return parsed
         except Exception as e:
             # Return error as content for graceful handling
-            return LLMResponse(
+            error_response = LLMResponse(
                 content=f"Error calling LLM: {str(e)}",
                 finish_reason="error",
             )
+            self._log_response_debug(error_response, model=model)
+            return error_response
     
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""

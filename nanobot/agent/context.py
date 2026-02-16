@@ -104,6 +104,7 @@ Your workspace is at: {workspace_path}
 IMPORTANT:
 - Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).
 - To send images/files to users, use `message(content=..., media=[\"/path/to/file\"])`.
+- In the current active chat, do not use `message` for text-only replies; return final text via `complete_task(final_answer=...)`.
 - To finish the current turn, call the `complete_task` tool with your final user-facing answer in `final_answer`.
 - Keep working (and use tools) until the task is complete; do not stop at partial progress.
 

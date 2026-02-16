@@ -2,7 +2,10 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+import json
 from typing import Any
+
+from loguru import logger
 
 
 @dataclass
@@ -28,6 +31,24 @@ class LLMResponse:
         """Check if response contains tool calls."""
         return len(self.tool_calls) > 0
 
+    def to_debug_dict(self) -> dict[str, Any]:
+        """Serialize response for debug logging."""
+        return {
+            "content": self.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "name": tc.name,
+                    "arguments": tc.arguments,
+                }
+                for tc in self.tool_calls
+            ],
+            "finish_reason": self.finish_reason,
+            "usage": self.usage,
+            "reasoning_content": self.reasoning_content,
+            "metadata": self.metadata,
+        }
+
 
 class LLMProvider(ABC):
     """
@@ -40,6 +61,16 @@ class LLMProvider(ABC):
     def __init__(self, api_key: str | None = None, api_base: str | None = None):
         self.api_key = api_key
         self.api_base = api_base
+
+    @staticmethod
+    def _log_response_debug(response: LLMResponse, model: str | None = None) -> None:
+        """Emit full LLM response payload for debugging."""
+        model_tag = f" [{model}]" if model else ""
+        try:
+            payload = json.dumps(response.to_debug_dict(), ensure_ascii=False)
+        except Exception:
+            payload = str(response)
+        logger.debug(f"LLM response{model_tag}: {payload}")
     
     @abstractmethod
     async def chat(

@@ -69,17 +69,21 @@ class OpenAICodexProvider(LLMProvider):
                     raise
                 logger.warning("SSL certificate verification failed for Codex API; retrying with verify=False")
                 content, tool_calls, finish_reason, metadata = await _request_codex(url, headers, body, verify=False)
-            return LLMResponse(
+            response = LLMResponse(
                 content=content,
                 tool_calls=tool_calls,
                 finish_reason=finish_reason,
                 metadata=metadata,
             )
+            self._log_response_debug(response, model=model)
+            return response
         except Exception as e:
-            return LLMResponse(
+            error_response = LLMResponse(
                 content=f"Error calling Codex: {str(e)}",
                 finish_reason="error",
             )
+            self._log_response_debug(error_response, model=model)
+            return error_response
 
     def get_default_model(self) -> str:
         return self.default_model
