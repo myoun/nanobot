@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import mimetypes
 from pathlib import Path
 from typing import Any
 
@@ -79,20 +80,58 @@ class DiscordChannel(BaseChannel):
             return
 
         url = f"{DISCORD_API_BASE}/channels/{msg.chat_id}/messages"
-        payload: dict[str, Any] = {"content": msg.content}
+        text_content = (msg.content or "").strip()
+        media_refs = [m.strip() for m in msg.media if isinstance(m, str) and m.strip()]
+        file_media: list[Path] = []
+        url_media: list[str] = []
+        failed_media: list[str] = []
+        skipped_media: list[str] = []
+
+        for ref in media_refs:
+            if ref.startswith(("http://", "https://")):
+                url_media.append(ref)
+                continue
+            p = Path(ref).expanduser()
+            if p.is_file():
+                file_media.append(p)
+            else:
+                failed_media.append(ref)
+
+        if len(file_media) > 10:
+            dropped = file_media[10:]
+            file_media = file_media[:10]
+            skipped_media.extend(str(p) for p in dropped)
+
+        if url_media:
+            text_content = "\n".join(part for part in [text_content, *url_media] if part)
+        if failed_media:
+            failed_lines = [f"[media not found: {m}]" for m in failed_media]
+            text_content = "\n".join(part for part in [text_content, *failed_lines] if part)
+        if skipped_media:
+            skipped_lines = [f"[media skipped: attachment limit exceeded: {m}]" for m in skipped_media]
+            text_content = "\n".join(part for part in [text_content, *skipped_lines] if part)
+
+        payload: dict[str, Any] = {}
+        if text_content:
+            payload["content"] = text_content
 
         if msg.reply_to:
             payload["message_reference"] = {"message_id": msg.reply_to}
             payload["allowed_mentions"] = {"replied_user": False}
 
         headers = {"Authorization": f"Bot {self.config.token}"}
+        if not payload and not file_media:
+            return
 
         try:
             for attempt in range(3):
                 try:
-                    response = await self._http.post(url, headers=headers, json=payload)
+                    response = await self._post_message(url, headers, payload, file_media)
                     if response.status_code == 429:
-                        data = response.json()
+                        try:
+                            data = response.json()
+                        except Exception:
+                            data = {}
                         retry_after = float(data.get("retry_after", 1.0))
                         logger.warning(f"Discord rate limited, retrying in {retry_after}s")
                         await asyncio.sleep(retry_after)
@@ -106,6 +145,40 @@ class DiscordChannel(BaseChannel):
                         await asyncio.sleep(1)
         finally:
             await self._stop_typing(msg.chat_id)
+
+    async def _post_message(
+        self,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        files: list[Path],
+    ) -> httpx.Response:
+        """Send Discord message using JSON or multipart/form-data for attachments."""
+        if not files:
+            return await self._http.post(url, headers=headers, json=payload)
+
+        open_files = []
+        try:
+            multipart_files = []
+            for idx, path in enumerate(files):
+                f = path.open("rb")
+                open_files.append(f)
+                mime, _ = mimetypes.guess_type(path.name)
+                multipart_files.append(
+                    (f"files[{idx}]", (path.name, f, mime or "application/octet-stream"))
+                )
+            return await self._http.post(
+                url,
+                headers=headers,
+                data={"payload_json": json.dumps(payload)},
+                files=multipart_files,
+            )
+        finally:
+            for f in open_files:
+                try:
+                    f.close()
+                except Exception:
+                    pass
 
     async def _gateway_loop(self) -> None:
         """Main gateway loop: identify, heartbeat, dispatch events."""

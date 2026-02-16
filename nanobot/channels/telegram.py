@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import mimetypes
+from pathlib import Path
 import re
 from loguru import logger
 from telegram import BotCommand, Update
@@ -212,16 +214,80 @@ class TelegramChannel(BaseChannel):
             logger.error(f"Invalid chat_id: {msg.chat_id}")
             return
 
-        for chunk in _split_message(msg.content):
-            try:
-                html = _markdown_to_telegram_html(chunk)
-                await self._app.bot.send_message(chat_id=chat_id, text=html, parse_mode="HTML")
-            except Exception as e:
-                logger.warning(f"HTML parse failed, falling back to plain text: {e}")
+        text_content = (msg.content or "").strip()
+        media_items = [m.strip() for m in msg.media if isinstance(m, str) and m.strip()]
+
+        caption_used = False
+        fallback_notes: list[str] = []
+        if media_items:
+            first_caption = text_content[:1024] if text_content else None
+            for idx, media_ref in enumerate(media_items):
+                caption = first_caption if idx == 0 and first_caption else None
+                sent = await self._send_media(chat_id, media_ref, caption=caption)
+                if sent and caption:
+                    caption_used = True
+                if not sent:
+                    fallback_notes.append(f"[media send failed: {media_ref}]")
+
+        if caption_used:
+            text_content = text_content[1024:].lstrip()
+        if fallback_notes:
+            text_content = "\n".join(p for p in [text_content, *fallback_notes] if p)
+
+        if text_content:
+            for chunk in _split_message(text_content):
                 try:
-                    await self._app.bot.send_message(chat_id=chat_id, text=chunk)
-                except Exception as e2:
-                    logger.error(f"Error sending Telegram message: {e2}")
+                    html = _markdown_to_telegram_html(chunk)
+                    await self._app.bot.send_message(chat_id=chat_id, text=html, parse_mode="HTML")
+                except Exception as e:
+                    logger.warning(f"HTML parse failed, falling back to plain text: {e}")
+                    try:
+                        await self._app.bot.send_message(chat_id=chat_id, text=chunk)
+                    except Exception as e2:
+                        logger.error(f"Error sending Telegram message: {e2}")
+
+    async def _send_media(self, chat_id: int, media_ref: str, caption: str | None = None) -> bool:
+        """Send one media item as photo/document. Supports local path and URL."""
+        if not self._app:
+            return False
+
+        is_image = self._is_image_ref(media_ref)
+        try:
+            if media_ref.startswith(("http://", "https://")):
+                if is_image:
+                    await self._app.bot.send_photo(chat_id=chat_id, photo=media_ref, caption=caption)
+                else:
+                    await self._app.bot.send_document(chat_id=chat_id, document=media_ref, caption=caption)
+                return True
+
+            path = Path(media_ref).expanduser()
+            if not path.is_file():
+                logger.warning(f"Media file not found: {media_ref}")
+                return False
+
+            with path.open("rb") as f:
+                if is_image:
+                    await self._app.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
+                else:
+                    await self._app.bot.send_document(chat_id=chat_id, document=f, caption=caption)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send Telegram media '{media_ref}': {e}")
+            return False
+
+    @staticmethod
+    def _is_image_ref(media_ref: str) -> bool:
+        """Detect whether a media reference looks like an image."""
+        lower = media_ref.lower()
+        image_exts = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+        if any(lower.endswith(ext) for ext in image_exts):
+            return True
+
+        if media_ref.startswith(("http://", "https://")):
+            return False
+
+        mime, _ = mimetypes.guess_type(media_ref)
+        return bool(mime and mime.startswith("image/"))
     
     async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""
@@ -298,7 +364,6 @@ class TelegramChannel(BaseChannel):
                 ext = self._get_extension(media_type, getattr(media_file, 'mime_type', None))
                 
                 # Save to workspace/media/
-                from pathlib import Path
                 media_dir = Path.home() / ".nanobot" / "media"
                 media_dir.mkdir(parents=True, exist_ok=True)
                 
