@@ -95,6 +95,7 @@ class AgentLoop:
     )
     _MAX_NO_TOOL_TEXT_ROUNDS = 3
     _MAX_NO_TOOL_EMPTY_ROUNDS = 4
+    _PREFILL_FILE_CANDIDATES = ("workspace/PREFILL.md", "PREFILL.md")
     _NO_TOOL_FALLBACK = (
         "I couldn't make progress with tool execution or completion signaling. "
         "Please provide a more specific next instruction."
@@ -613,6 +614,29 @@ class AgentLoop:
     def _is_agent_browser_close_command(command: str) -> bool:
         return bool(re.search(r"\bagent-browser\s+close\b", command))
 
+    def _load_prefill_prompt(self) -> str:
+        """Load optional response prefill guidance from workspace files."""
+        for rel_path in self._PREFILL_FILE_CANDIDATES:
+            prefill_path = self.workspace / rel_path
+            if not prefill_path.exists():
+                continue
+            try:
+                return prefill_path.read_text(encoding="utf-8").strip()
+            except OSError as e:
+                logger.warning(f"Failed to read prefill file {prefill_path}: {e}")
+                return ""
+        return ""
+
+    @staticmethod
+    def _append_prefill_tail(
+        messages: list[dict[str, Any]],
+        prefill_prompt: str,
+    ) -> list[dict[str, Any]]:
+        """Append assistant-style prefill as the final request item."""
+        if not prefill_prompt:
+            return messages
+        return [*messages, {"role": "assistant", "content": prefill_prompt}]
+
     @staticmethod
     def _merge_outbound_metadata(base: dict[str, Any] | None, llm_metadata: dict[str, Any]) -> dict[str, Any]:
         merged = dict(base or {})
@@ -663,12 +687,14 @@ class AgentLoop:
         last_nonempty_no_tool_text = ""
         agent_browser_used = False
         agent_browser_closed = False
+        prefill_prompt = self._load_prefill_prompt()
 
         while iteration < self.max_iterations:
             iteration += 1
 
+            request_messages = self._append_prefill_tail(messages, prefill_prompt)
             response = await self.provider.chat(
-                messages=messages,
+                messages=request_messages,
                 tools=self.tools.get_definitions(),
                 model=self.model,
                 temperature=self.temperature,
