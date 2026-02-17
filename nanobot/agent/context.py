@@ -19,6 +19,8 @@ class ContextBuilder:
     """
     
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
+    MODE_CONTEXT_RECENT_USER_MAX = 6
+    MODE_CONTEXT_ITEM_MAX_CHARS = 220
     
     def __init__(self, workspace: Path):
         self.workspace = workspace
@@ -103,12 +105,20 @@ Your workspace is at: {workspace_path}
 
 IMPORTANT (MANDATORY):
 - Use `report_to_user(content=...)` for intermediate progress updates, blockers, or clarification requests to the current chat.
+- `report_to_user` is NOT completion evidence. Do not call `complete_task` after only `report_to_user`; execute real task tools first.
+- `report_to_user` content must describe observed facts only (what was executed/changed/failed). Do not send "I will do X next" planning-only updates.
 - Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).
 - To send images/files to users, use `message(content=..., media=[\"/path/to/file\"])`.
 - If you run `agent-browser`, always close it before finishing (`exec(command=\"agent-browser close\")`).
+- First classify each turn as either `TASK_REQUEST` or `CONTROL_COMMAND` using recent user conversation context.
+- `CONTROL_COMMAND` means style/behavior directives (e.g., "결과만", "진행안내 하지마", "짧게"), approvals, retries, or meta feedback.
+- `TASK_REQUEST` means the user asks you to perform/verify/build/fix/search/run/implement a concrete task.
+- For `CONTROL_COMMAND`-only turns, do not fabricate task completion; apply the control instruction and then continue the active task or ask a short clarification.
 - In the current active chat, do not use `message` for text-only replies; return final text via `complete_task(final_answer=...)`.
 - TURN CANNOT END WITHOUT `complete_task(final_answer=...)`.
 - Never treat plain assistant text as final completion; call `complete_task` exactly once when done.
+- Every `complete_task` call must include: `final_answer`, `artifacts`, `evidence`, `actions_taken` (use empty arrays when truly none).
+- In `TASK_REQUEST` turns, `complete_task` must include non-empty evidence of execution in `evidence` and concrete tool usage in `actions_taken`.
 - Assistant `content` emitted during the loop is internal working text by default and is not sent to users directly.
 - Use internal `content` freely for planning/thinking notes when useful, but keep it concise to avoid token waste.
 - Keep working (and use tools) until the task is complete; do not stop at partial progress.
@@ -165,7 +175,8 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
         messages.extend(history)
 
         # Current message (with optional image attachments)
-        user_content = self._build_user_content(current_message, media)
+        mode_aware_message = self._inject_request_mode_context(history, current_message)
+        user_content = self._build_user_content(mode_aware_message, media)
         messages.append({"role": "user", "content": user_content})
 
         return messages
@@ -187,6 +198,75 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
         if not images:
             return text
         return images + [{"type": "text", "text": text}]
+
+    @classmethod
+    def _as_text(cls, content: Any) -> str:
+        """Best-effort conversion of message content to plain text."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text.strip())
+            return "\n".join(parts)
+        return ""
+
+    @classmethod
+    def _compact_line(cls, text: str) -> str:
+        collapsed = " ".join(text.strip().split())
+        if len(collapsed) > cls.MODE_CONTEXT_ITEM_MAX_CHARS:
+            return collapsed[: cls.MODE_CONTEXT_ITEM_MAX_CHARS - 3] + "..."
+        return collapsed
+
+    @classmethod
+    def _inject_request_mode_context(
+        cls,
+        history: list[dict[str, Any]],
+        current_message: str,
+    ) -> str:
+        """Append explicit mode-classification context for the model."""
+        recent_users: list[str] = []
+        for msg in reversed(history):
+            if msg.get("role") != "user":
+                continue
+            text = cls._as_text(msg.get("content"))
+            if not text.strip():
+                continue
+            recent_users.append(cls._compact_line(text))
+            if len(recent_users) >= cls.MODE_CONTEXT_RECENT_USER_MAX:
+                break
+        recent_users.reverse()
+
+        lines = [
+            "[REQUEST_MODE_CONTEXT]",
+            "Classify the current turn internally as one of:",
+            "- TASK_REQUEST: concrete work to execute/implement/verify.",
+            "- CONTROL_COMMAND: behavioral/style/process directive about how to respond or continue.",
+            "Use both current message and recent user messages below.",
+            "",
+            "Recent user messages (oldest -> newest):",
+        ]
+        if recent_users:
+            for item in recent_users:
+                lines.append(f"- {item}")
+        else:
+            lines.append("- (none)")
+
+        lines.extend([
+            "",
+            f"Current user message: {cls._compact_line(current_message)}",
+            "",
+            "Decision policy:",
+            "- If CONTROL_COMMAND-only, apply it and continue active work (or ask one short clarification).",
+            "- If TASK_REQUEST, execute necessary tools and finish with complete_task.",
+            "[/REQUEST_MODE_CONTEXT]",
+            "",
+            current_message,
+        ])
+        return "\n".join(lines)
     
     def add_tool_result(
         self,

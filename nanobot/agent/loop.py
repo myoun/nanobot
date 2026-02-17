@@ -49,24 +49,49 @@ class AgentLoop:
     """
 
     _COMPLETE_TOOL_NAME = "complete_task"
+    _REPORT_TOOL_NAME = "report_to_user"
+    _REQUEST_MODE_DO = "DO"
+    _REQUEST_MODE_CHAT = "CHAT"
+    _NON_PROGRESS_TOOLS = {_COMPLETE_TOOL_NAME, _REPORT_TOOL_NAME}
+    _MODE_CLASSIFIER_MAX_HISTORY = 10
+    _MODE_CLASSIFIER_ITEM_MAX_CHARS = 220
+    _DO_MODE_NO_TOOL_RESPONSE = (
+        "This request requires real tool execution, but no task-execution tools are currently available. "
+        "I can provide a patch/command plan only; runtime execution must be enabled first."
+    )
     _NO_ACTION_NUDGE = (
         "Continue working on this request. "
-        "Use tools if needed. Call complete_task(final_answer=...) only when fully done."
+        "Use tools if needed. Call complete_task only when fully done, "
+        "including required fields: final_answer/artifacts/evidence/actions_taken."
     )
     _ACTION_REQUEST_NUDGE = (
         "This request appears to require tool execution. "
         "Do not claim completion before executing and verifying with at least one relevant tool successfully. "
-        "Then call "
-        "complete_task(final_answer=...)."
+        "Then call complete_task with required fields "
+        "(final_answer, artifacts, evidence, actions_taken)."
     )
     _ACTION_RETRY_REASON_NO_PROGRESS = (
         "Retry reason: external tool attempts have not produced verified progress yet. "
         "Try another relevant tool call, or if blocked, call complete_task(final_answer=...) "
         "with a concise failure reason and the exact user action required."
     )
+    _ACTION_RETRY_REASON_REPORT_ONLY = (
+        "Retry reason: report_to_user is for intermediate updates only and does not count as task execution. "
+        "Run at least one task-executing tool (e.g., read_file/write_file/edit_file/list_dir/exec/web_fetch/web_search/message with real delivery), "
+        "then call complete_task with required fields final_answer/artifacts/evidence/actions_taken."
+    )
+    _ACTION_RETRY_REASON_MISSING_EVIDENCE = (
+        "Retry reason: complete_task in TASK_REQUEST mode requires non-empty `evidence` and `actions_taken`. "
+        "Include concrete execution evidence (command/tool outputs) and real actions performed."
+    )
+    _ACTION_RETRY_REASON_INVALID_COMPLETE_PAYLOAD = (
+        "Retry reason: complete_task payload is invalid. "
+        "Provide required fields: `final_answer`, `artifacts`, `evidence`, `actions_taken`."
+    )
     _COMPLETION_REJECT_NUDGE = (
         "Your complete_task call was rejected. "
-        "Keep working and call complete_task(final_answer=...) only after verified progress."
+        "Keep working and call complete_task only after verified progress "
+        "with required fields final_answer/artifacts/evidence/actions_taken."
     )
     _MAX_NO_TOOL_TEXT_ROUNDS = 3
     _MAX_NO_TOOL_EMPTY_ROUNDS = 4
@@ -352,6 +377,7 @@ class AgentLoop:
         final_content, tools_used, llm_metadata = await self._run_agent_loop(
             initial_messages,
             initial_external_progress=True,
+            request_mode=self._REQUEST_MODE_DO,
         )
         if not final_content:
             final_content = preview
@@ -381,22 +407,69 @@ class AgentLoop:
         return [item for item in trace if isinstance(item, dict)]
 
     @staticmethod
-    def _extract_completion_answer(arguments: dict[str, Any] | None) -> str | None:
+    def _extract_completion_answer_from_text(text: str) -> str | None:
+        """Recover final_answer when model emits completion payload as plain text JSON."""
+        raw = text.strip()
+        if not raw:
+            return None
+
+        candidates = [raw]
+        fenced = re.match(r"^```(?:json)?\s*([\s\S]*?)\s*```$", raw, flags=re.IGNORECASE)
+        if fenced:
+            candidates.insert(0, fenced.group(1).strip())
+
+        for candidate in candidates:
+            if not candidate.startswith("{"):
+                continue
+            try:
+                parsed = json.loads(candidate)
+            except Exception:
+                try:
+                    parsed = json_repair.loads(candidate)
+                except Exception:
+                    continue
+            if not isinstance(parsed, dict):
+                continue
+            final_answer = parsed.get("final_answer")
+            if isinstance(final_answer, str):
+                answer = final_answer.strip()
+                if answer:
+                    return answer
+        return None
+
+    @staticmethod
+    def _extract_completion_payload(arguments: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Extract completion payload fields from complete_task arguments."""
         if not isinstance(arguments, dict):
             return None
+
         final_answer = arguments.get("final_answer")
-        if isinstance(final_answer, str):
-            answer = final_answer.strip()
-            if answer:
-                return answer
-        return None
+        if not isinstance(final_answer, str) or not final_answer.strip():
+            return None
+
+        artifacts = arguments.get("artifacts")
+        evidence = arguments.get("evidence")
+        actions_taken = arguments.get("actions_taken")
+        return {
+            "final_answer": final_answer.strip(),
+            "artifacts": artifacts if isinstance(artifacts, list) else [],
+            "evidence": evidence if isinstance(evidence, list) else [],
+            "actions_taken": actions_taken if isinstance(actions_taken, list) else [],
+        }
+
+    @staticmethod
+    def _completion_has_required_evidence(payload: dict[str, Any] | None) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        evidence = payload.get("evidence")
+        actions_taken = payload.get("actions_taken")
+        return bool(isinstance(evidence, list) and evidence) and bool(
+            isinstance(actions_taken, list) and actions_taken
+        )
 
     @staticmethod
     def _tool_result_success(tool_name: str, result: str) -> bool:
         """Best-effort tool success detection for completion gating."""
-        if tool_name == AgentLoop._COMPLETE_TOOL_NAME:
-            return True
-
         text = result.strip()
         if not text:
             return True
@@ -428,6 +501,80 @@ class AgentLoop:
             if marker in lower:
                 return False
         return True
+
+    @classmethod
+    def _compact_mode_line(cls, text: str) -> str:
+        collapsed = " ".join(text.strip().split())
+        if len(collapsed) > cls._MODE_CLASSIFIER_ITEM_MAX_CHARS:
+            return collapsed[: cls._MODE_CLASSIFIER_ITEM_MAX_CHARS - 3] + "..."
+        return collapsed
+
+    async def _classify_request_mode(self, session: Session, user_text: str) -> tuple[str, str]:
+        recent_lines: list[str] = []
+        for msg in session.messages[-self._MODE_CLASSIFIER_MAX_HISTORY:]:
+            role = str(msg.get("role") or "").upper()
+            content = str(msg.get("content") or "").strip()
+            if not content:
+                continue
+            recent_lines.append(f"{role}: {self._compact_mode_line(content)}")
+
+        conversation = "\n".join(recent_lines) if recent_lines else "(none)"
+        classifier_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Classify the current turn for orchestration. "
+                    "Return JSON only with keys: mode, reason. "
+                    "mode must be DO or CHAT.\n"
+                    "- DO: user requests concrete execution/build/fix/search/run/verification work, "
+                    "or gives a follow-up control command that should continue an active task.\n"
+                    "- CHAT: user asks conceptual questions, policy discussion, meta feedback, or casual conversation."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Recent conversation:\n{conversation}\n\n"
+                    f"Current user message:\n{user_text}\n\n"
+                    "Respond with JSON only."
+                ),
+            },
+        ]
+
+        try:
+            response = await self.provider.chat(
+                messages=classifier_messages,
+                tools=[],
+                model=self.model,
+                max_tokens=120,
+                temperature=0.0,
+            )
+            raw = (response.content or "").strip()
+            if not raw:
+                raise ValueError("empty classifier response")
+            if response.has_tool_calls:
+                raise ValueError("classifier returned tool call")
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
+            parsed = json_repair.loads(raw)
+            if not isinstance(parsed, dict):
+                raise ValueError("classifier response is not a JSON object")
+
+            mode_value = str(parsed.get("mode") or "").strip().upper()
+            if mode_value not in {self._REQUEST_MODE_DO, self._REQUEST_MODE_CHAT}:
+                raise ValueError(f"unknown mode: {mode_value}")
+
+            reason = str(parsed.get("reason") or "").strip() or "classifier decision"
+            return mode_value, reason
+        except Exception as e:
+            previous = str(session.metadata.get("last_request_mode") or "").strip().upper()
+            fallback = previous if previous in {self._REQUEST_MODE_DO, self._REQUEST_MODE_CHAT} else self._REQUEST_MODE_CHAT
+            return fallback, f"classifier fallback ({type(e).__name__})"
+
+    def _has_task_execution_tools(self) -> bool:
+        task_tools = [name for name in self.tools.tool_names if name not in self._NON_PROGRESS_TOOLS]
+        return bool(task_tools)
 
     @staticmethod
     def _pending_approval_message(tool_name: str, result: str) -> str | None:
@@ -490,6 +637,7 @@ class AgentLoop:
         initial_messages: list[dict],
         *,
         initial_external_progress: bool = False,
+        request_mode: str = _REQUEST_MODE_CHAT,
     ) -> tuple[str | None, list[str], dict[str, Any]]:
         """
         Run the agent iteration loop.
@@ -501,12 +649,15 @@ class AgentLoop:
             Tuple of (final_content, list_of_tools_used, llm_metadata).
         """
         messages = initial_messages
+        do_mode = request_mode == self._REQUEST_MODE_DO
         iteration = 0
         final_content = None
         tools_used: list[str] = []
         web_search_trace: list[dict[str, Any]] = []
         successful_external_actions = 1 if initial_external_progress else 0
         external_tool_attempted = False
+        meaningful_tool_attempted = False
+        meaningful_tool_succeeded = bool(initial_external_progress)
         no_tool_text_rounds = 0
         no_tool_empty_rounds = 0
         last_nonempty_no_tool_text = ""
@@ -549,11 +700,15 @@ class AgentLoop:
 
                 completion_answer: str | None = None
                 completion_requested = False
+                completion_payload: dict[str, Any] | None = None
+                completion_schema_ok = True
                 pending_approval_notice: str | None = None
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
                     if tool_call.name != self._COMPLETE_TOOL_NAME:
                         external_tool_attempted = True
+                    if tool_call.name not in self._NON_PROGRESS_TOOLS:
+                        meaningful_tool_attempted = True
                     if tool_call.name == "exec":
                         cmd_text = str(tool_call.arguments.get("command", ""))
                         if self._is_agent_browser_command(cmd_text):
@@ -572,7 +727,13 @@ class AgentLoop:
                         break
                     if tool_call.name == self._COMPLETE_TOOL_NAME:
                         completion_requested = True
-                        completion_answer = self._extract_completion_answer(tool_call.arguments)
+                        completion_payload = self._extract_completion_payload(tool_call.arguments)
+                        completion_answer = (
+                            completion_payload["final_answer"]
+                            if completion_payload
+                            else None
+                        )
+                        completion_schema_ok = self._tool_result_success(tool_call.name, result)
                         if not completion_answer:
                             logger.warning(
                                 "complete_task called without final_answer; continuing loop"
@@ -584,6 +745,8 @@ class AgentLoop:
                     logger.info(f"Tool result: {tool_call.name} -> {status}")
                     if is_success:
                         successful_external_actions += 1
+                        if tool_call.name not in self._NON_PROGRESS_TOOLS:
+                            meaningful_tool_succeeded = True
 
                 if pending_approval_notice:
                     final_content = pending_approval_notice
@@ -593,17 +756,41 @@ class AgentLoop:
                 no_tool_text_rounds = 0
                 no_tool_empty_rounds = 0
                 if completion_answer:
+                    if not completion_schema_ok:
+                        logger.warning("complete_task rejected: invalid payload schema")
+                        messages.append({"role": "user", "content": self._ACTION_RETRY_REASON_INVALID_COMPLETE_PAYLOAD})
+                        continue
+                    if do_mode and not self._completion_has_required_evidence(completion_payload):
+                        logger.warning("complete_task rejected: missing required evidence/actions in DO mode")
+                        messages.append({"role": "user", "content": self._ACTION_RETRY_REASON_MISSING_EVIDENCE})
+                        continue
+                    if do_mode and not (meaningful_tool_succeeded or has_external_progress):
+                        logger.warning("complete_task rejected: DO mode completion without verified external progress")
+                        messages.append({"role": "user", "content": self._ACTION_RETRY_REASON_NO_PROGRESS})
+                        continue
+                    if external_tool_attempted and not meaningful_tool_attempted:
+                        logger.warning(
+                            "complete_task rejected: only report_to_user/non-meaningful tools observed"
+                        )
+                        messages.append({"role": "user", "content": self._ACTION_RETRY_REASON_REPORT_ONLY})
+                        continue
                     final_content = completion_answer
                     break
                 if completion_requested:
-                    messages.append({"role": "user", "content": self._COMPLETION_REJECT_NUDGE})
+                    followup_nudge = self._COMPLETION_REJECT_NUDGE
+                    if do_mode:
+                        followup_nudge += " In TASK_REQUEST mode include non-empty evidence/actions_taken."
+                    messages.append({"role": "user", "content": followup_nudge})
                 else:
+                    continue_nudge = (
+                        "Reflect on the tool results and continue. "
+                        "Call complete_task(final_answer=...) only when fully done."
+                    )
+                    if do_mode:
+                        continue_nudge += " Keep executing tools and gather concrete evidence before completion."
                     messages.append({
                         "role": "user",
-                        "content": (
-                            "Reflect on the tool results and continue. "
-                            "Call complete_task(final_answer=...) only when fully done."
-                        ),
+                        "content": continue_nudge,
                     })
             else:
                 assistant_text = (response.content or "").strip()
@@ -620,6 +807,24 @@ class AgentLoop:
                     reasoning_content=response.reasoning_content,
                 )
 
+                completion_from_text = (
+                    self._extract_completion_answer_from_text(assistant_text)
+                    if assistant_text
+                    else None
+                )
+                if completion_from_text:
+                    if do_mode:
+                        logger.warning(
+                            "Rejected text-only completion payload in DO mode; evidence-bearing complete_task required"
+                        )
+                        messages.append({"role": "user", "content": self._ACTION_RETRY_REASON_MISSING_EVIDENCE})
+                    else:
+                        logger.warning(
+                            "Recovered final_answer from no-tool text payload; finalizing turn"
+                        )
+                        final_content = completion_from_text
+                        break
+
                 if no_tool_empty_rounds >= self._MAX_NO_TOOL_EMPTY_ROUNDS:
                     logger.warning(
                         "LLM returned empty/no-tool responses repeatedly; finalizing fallback response"
@@ -631,14 +836,20 @@ class AgentLoop:
                     logger.warning(
                         "LLM returned no-tool text repeatedly; finalizing latest response fallback"
                     )
-                    final_content = last_nonempty_no_tool_text or self._NO_TOOL_FALLBACK
+                    if do_mode:
+                        final_content = self._NO_TOOL_FALLBACK
+                    else:
+                        final_content = last_nonempty_no_tool_text or self._NO_TOOL_FALLBACK
                     break
 
-                nudge = (
-                    self._ACTION_RETRY_REASON_NO_PROGRESS
-                    if external_tool_attempted and not has_external_progress
-                    else self._NO_ACTION_NUDGE
-                )
+                if do_mode:
+                    nudge = (
+                        self._ACTION_RETRY_REASON_NO_PROGRESS
+                        if external_tool_attempted and not has_external_progress
+                        else self._ACTION_REQUEST_NUDGE
+                    )
+                else:
+                    nudge = self._NO_ACTION_NUDGE
                 messages.append({"role": "user", "content": nudge})
 
         if final_content is None:
@@ -660,6 +871,7 @@ class AgentLoop:
         llm_metadata: dict[str, Any] = {}
         if web_search_trace:
             llm_metadata["web_search_trace"] = web_search_trace
+        llm_metadata["request_mode"] = request_mode
 
         return final_content, tools_used, llm_metadata
 
@@ -760,6 +972,23 @@ class AgentLoop:
         if len(session.messages) > self.memory_window:
             asyncio.create_task(self._consolidate_memory(session))
 
+        request_mode, mode_reason = await self._classify_request_mode(session, msg.content)
+        logger.info(
+            f"Request mode for {msg.channel}:{msg.chat_id}: {request_mode} ({mode_reason})"
+        )
+        if request_mode == self._REQUEST_MODE_DO and not self._has_task_execution_tools():
+            final_content = self._DO_MODE_NO_TOOL_RESPONSE
+            session.add_message("user", msg.content)
+            session.add_message("assistant", final_content)
+            session.metadata["last_request_mode"] = request_mode
+            session.metadata["last_request_mode_reason"] = mode_reason
+            self.sessions.save(session)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=final_content,
+            )
+
         self._set_tool_context(msg.channel, msg.chat_id, msg.sender_id)
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
@@ -768,7 +997,10 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
         )
-        final_content, tools_used, llm_metadata = await self._run_agent_loop(initial_messages)
+        final_content, tools_used, llm_metadata = await self._run_agent_loop(
+            initial_messages,
+            request_mode=request_mode,
+        )
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
@@ -779,6 +1011,8 @@ class AgentLoop:
         session.add_message("user", msg.content)
         session.add_message("assistant", final_content,
                             tools_used=tools_used if tools_used else None)
+        session.metadata["last_request_mode"] = request_mode
+        session.metadata["last_request_mode_reason"] = mode_reason
         self.sessions.save(session)
         
         outbound_metadata = self._merge_outbound_metadata(msg.metadata, llm_metadata)

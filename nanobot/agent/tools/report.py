@@ -60,6 +60,13 @@ class ReportToUserTool(Tool):
                     "type": "string",
                     "description": "Optional override for target chat ID.",
                 },
+                "keep_typing": {
+                    "type": "boolean",
+                    "description": (
+                        "Whether channels that support typing indicators should keep "
+                        "showing typing after this progress update. Defaults to true."
+                    ),
+                },
             },
             "required": ["content"],
         }
@@ -69,6 +76,7 @@ class ReportToUserTool(Tool):
         content: str,
         channel: str | None = None,
         chat_id: str | None = None,
+        keep_typing: bool = True,
         **kwargs: Any,
     ) -> str:
         target_channel = (channel or self._default_channel).strip()
@@ -88,6 +96,10 @@ class ReportToUserTool(Tool):
             channel=target_channel,
             chat_id=target_chat_id,
             content=text,
+            metadata={
+                "is_progress_update": True,
+                "keep_typing": bool(keep_typing),
+            },
         )
 
         try:

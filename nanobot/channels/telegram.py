@@ -210,7 +210,11 @@ class TelegramChannel(BaseChannel):
             logger.warning("Telegram bot not running")
             return
 
-        self._stop_typing(msg.chat_id)
+        keep_typing = bool(msg.metadata.get("keep_typing")) or bool(
+            msg.metadata.get("is_progress_update")
+        )
+        if not keep_typing:
+            self._stop_typing(msg.chat_id)
 
         try:
             chat_id = int(msg.chat_id)
