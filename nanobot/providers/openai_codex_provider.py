@@ -248,23 +248,23 @@ async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], 
     async for line in response.aiter_lines():
         if line == "":
             if buffer:
-                data_lines = [l[5:].strip() for l in buffer if l.startswith("data:")]
+                parsed = _parse_sse_buffer(buffer)
                 buffer = []
-                if not data_lines:
-                    continue
-                data = "\n".join(data_lines).strip()
-                if not data or data == "[DONE]":
-                    continue
-                try:
-                    yield json.loads(data)
-                except Exception:
-                    continue
+                if parsed is not None:
+                    yield parsed
             continue
         buffer.append(line)
+    # Some servers terminate the stream without a trailing blank line.
+    if buffer:
+        parsed = _parse_sse_buffer(buffer)
+        if parsed is not None:
+            yield parsed
 
 
 async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequest], str, dict[str, Any]]:
-    content = ""
+    text_segments: dict[str, str] = {}
+    text_segment_order: list[str] = []
+    message_text_fallback_parts: list[str] = []
     tool_calls: list[ToolCallRequest] = []
     tool_call_buffers: dict[str, dict[str, Any]] = {}
     web_search_trace: list[dict[str, Any]] = []
@@ -285,7 +285,19 @@ async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequ
                     "arguments": item.get("arguments") or "",
                 }
         elif event_type == "response.output_text.delta":
-            content += event.get("delta") or ""
+            _append_text_segment(
+                text_segments,
+                text_segment_order,
+                _text_segment_key(event),
+                event.get("delta") or "",
+            )
+        elif event_type == "response.output_text.done":
+            _merge_text_segment(
+                text_segments,
+                text_segment_order,
+                _text_segment_key(event),
+                _output_text_done_value(event),
+            )
         elif event_type == "response.function_call_arguments.delta":
             call_id = event.get("call_id")
             if call_id and call_id in tool_call_buffers:
@@ -319,6 +331,10 @@ async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequ
                     seen_web_actions,
                     _normalize_web_search_action(item.get("action")),
                 )
+            elif item.get("type") == "message":
+                text = _extract_message_output_text(item)
+                if text:
+                    message_text_fallback_parts.append(text)
         elif event_type.startswith("response.web_search_call."):
             web_item = event.get("web_search_call") or {}
             _append_web_search_action(
@@ -332,6 +348,11 @@ async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequ
         elif event_type in {"error", "response.failed"}:
             raise RuntimeError("Codex response failed")
 
+    content = "".join(text_segments[key] for key in text_segment_order if text_segments.get(key))
+    if not content and message_text_fallback_parts:
+        # Fallback for variants that only emit final message items.
+        content = "".join(message_text_fallback_parts)
+
     metadata: dict[str, Any] = {}
     if web_search_trace:
         metadata["web_search_trace"] = web_search_trace
@@ -339,6 +360,101 @@ async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequ
 
 
 _FINISH_REASON_MAP = {"completed": "stop", "incomplete": "length", "failed": "error", "cancelled": "error"}
+
+
+def _parse_sse_buffer(buffer: list[str]) -> dict[str, Any] | None:
+    data_lines = [line[5:].strip() for line in buffer if line.startswith("data:")]
+    if not data_lines:
+        return None
+    data = "\n".join(data_lines).strip()
+    if not data or data == "[DONE]":
+        return None
+    try:
+        parsed = json.loads(data)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def _text_segment_key(event: dict[str, Any]) -> str:
+    item_id = event.get("item_id")
+    output_index = event.get("output_index")
+    content_index = event.get("content_index")
+    if any(value is not None for value in (item_id, output_index, content_index)):
+        return f"{item_id or 'item'}:{output_index or 0}:{content_index or 0}"
+    return "global"
+
+
+def _append_text_segment(
+    segments: dict[str, str],
+    order: list[str],
+    key: str,
+    text: str,
+) -> None:
+    if not text:
+        return
+    if key not in segments:
+        segments[key] = ""
+        order.append(key)
+    segments[key] += text
+
+
+def _merge_text_segment(
+    segments: dict[str, str],
+    order: list[str],
+    key: str,
+    text: str,
+) -> None:
+    if not text:
+        return
+    if key not in segments:
+        segments[key] = text
+        order.append(key)
+        return
+    current = segments[key]
+    if not current:
+        segments[key] = text
+        return
+    if text.startswith(current):
+        segments[key] = text
+        return
+    if current.startswith(text) or current.endswith(text):
+        return
+    if text.endswith(current):
+        segments[key] = text
+        return
+    segments[key] = current + text
+
+
+def _output_text_done_value(event: dict[str, Any]) -> str:
+    text = event.get("text")
+    if isinstance(text, str):
+        return text
+    output_text = event.get("output_text")
+    if isinstance(output_text, str):
+        return output_text
+    if isinstance(output_text, dict):
+        nested_text = output_text.get("text")
+        if isinstance(nested_text, str):
+            return nested_text
+    return ""
+
+
+def _extract_message_output_text(item: dict[str, Any]) -> str:
+    content = item.get("content")
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for entry in content:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("type") == "output_text":
+            text = entry.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "".join(parts)
 
 
 def _map_finish_reason(status: str | None) -> str:
