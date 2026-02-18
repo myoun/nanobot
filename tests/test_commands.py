@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 import json
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
 
 import httpx
@@ -15,6 +16,7 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.web import WebChannel
 from nanobot.config.schema import WebConfig
+from nanobot.session.manager import SessionManager
 
 runner = CliRunner()
 
@@ -25,7 +27,7 @@ def mock_paths():
     with (
         patch("nanobot.config.loader.get_config_path") as mock_cp,
         patch("nanobot.config.loader.save_config") as mock_sc,
-        patch("nanobot.config.loader.load_config") as mock_lc,
+        patch("nanobot.config.loader.load_config"),
         patch("nanobot.utils.helpers.get_workspace_path") as mock_ws,
     ):
         base_dir = Path("./test_onboard_data")
@@ -186,7 +188,7 @@ async def test_web_channel_security_rules() -> None:
     await origin_channel.start()
     try:
         with pytest.raises(Exception):
-            await websockets.connect(
+            await cast(Any, websockets.connect)(
                 f"ws://127.0.0.1:{origin_channel.bound_port}/ws",
                 origin="https://blocked.example",
             )
@@ -219,3 +221,133 @@ async def test_web_channel_busy_error() -> None:
             assert got_busy
     finally:
         await channel.stop()
+
+
+@pytest.mark.asyncio
+async def test_web_channel_session_actions(tmp_path: Path) -> None:
+    bus = MessageBus()
+    session_manager = SessionManager(tmp_path)
+    channel = WebChannel(
+        WebConfig(enabled=True, host="127.0.0.1", port=0),
+        bus,
+        session_manager=session_manager,
+    )
+    await channel.start()
+
+    running = True
+
+    async def fake_agent() -> None:
+        while running:
+            inbound = await bus.consume_inbound()
+            await bus.publish_outbound(
+                OutboundMessage(
+                    channel="web",
+                    chat_id=inbound.chat_id,
+                    content=f"echo:{inbound.content}",
+                )
+            )
+
+    async def outbound_dispatcher() -> None:
+        while running:
+            outbound = await bus.consume_outbound()
+            await channel.send(outbound)
+
+    agent_task = asyncio.create_task(fake_agent())
+    dispatch_task = asyncio.create_task(outbound_dispatcher())
+
+    try:
+        ws_url = f"ws://127.0.0.1:{channel.bound_port}/ws?sid=session-actions"
+        async with websockets.connect(ws_url) as ws:
+            hello = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+            assert hello["type"] == "hello"
+
+            await ws.send(json.dumps({"type": "session_action", "action": "list"}))
+            listed = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+            assert listed["type"] == "sessions_state"
+            assert listed.get("active_session_id")
+            assert isinstance(listed.get("sessions"), list)
+            assert isinstance(listed.get("history"), list)
+
+            await ws.send(
+                json.dumps({"type": "session_action", "action": "new", "title": "Scratch"})
+            )
+            created = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+            assert created["type"] == "sessions_state"
+            assert any(s.get("title") == "Scratch" for s in created.get("sessions", []))
+            assert isinstance(created.get("history"), list)
+
+            active_id = str(created.get("active_session_id") or "")
+            assert active_id
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "user_message",
+                        "text": "hello",
+                        "session_id": active_id,
+                    }
+                )
+            )
+            response = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+            assert response["type"] == "assistant_message"
+            assert response["text"] == "echo:hello"
+    finally:
+        running = False
+        agent_task.cancel()
+        dispatch_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await agent_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await dispatch_task
+        await channel.stop()
+
+
+def test_conversation_session_lifecycle(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    conversation_key = "web:abc"
+
+    _, initial = manager.get_or_create_for_conversation(conversation_key)
+    first_id = str(initial["id"])
+    assert first_id
+    assert initial["title"] == "New chat"
+
+    created = manager.create_session(conversation_key, title="Build dashboard", switch_to=True)
+    second_id = str(created["id"])
+    assert second_id
+    assert second_id != first_id
+
+    snapshot = manager.list_conversation_sessions(conversation_key)
+    assert snapshot["active_session_id"] == second_id
+    assert len(snapshot["sessions"]) == 2
+
+    renamed = manager.rename_session(
+        conversation_key, first_id, "Initial planning", auto_title=False
+    )
+    assert renamed["title"] == "Initial planning"
+
+    snapshot = manager.list_conversation_sessions(conversation_key)
+    first = next(item for item in snapshot["sessions"] if item["id"] == first_id)
+    assert first["title"] == "Initial planning"
+    assert first["auto_title"] is False
+
+    deleted = manager.delete_session(conversation_key, second_id)
+    assert deleted["deleted_session_id"] == second_id
+
+    snapshot = manager.list_conversation_sessions(conversation_key)
+    assert len(snapshot["sessions"]) == 1
+    assert snapshot["active_session_id"] == first_id
+
+
+def test_delete_last_session_creates_replacement(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    conversation_key = "telegram:42"
+
+    _, initial = manager.get_or_create_for_conversation(conversation_key)
+    first_id = str(initial["id"])
+
+    result = manager.delete_session(conversation_key, first_id)
+    assert result["deleted_session_id"] == first_id
+    assert result["created_replacement"] is True
+
+    snapshot = manager.list_conversation_sessions(conversation_key)
+    assert len(snapshot["sessions"]) == 1
+    assert snapshot["active_session_id"] != first_id

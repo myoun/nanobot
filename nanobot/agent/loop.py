@@ -7,6 +7,7 @@ import json_repair
 import os
 from pathlib import Path
 import re
+import shlex
 from typing import Any, TYPE_CHECKING
 
 from loguru import logger
@@ -96,6 +97,9 @@ class AgentLoop:
     _MAX_NO_TOOL_TEXT_ROUNDS = 3
     _MAX_NO_TOOL_EMPTY_ROUNDS = 4
     _PREFILL_FILE_CANDIDATES = ("workspace/PREFILL.md", "PREFILL.md")
+    _SESSION_TITLE_MAX_CHARS = 60
+    _SESSION_TITLE_CONTEXT_MESSAGES = 6
+    _SESSION_DEFAULT_TITLE = "New chat"
     _NO_TOOL_FALLBACK = (
         "I couldn't make progress with tool execution or completion signaling. "
         "Please provide a more specific next instruction."
@@ -266,6 +270,415 @@ class AgentLoop:
         if len(clean) <= max_len:
             return clean
         return clean[:max_len] + f"\n... (truncated, {len(clean) - max_len} more chars)"
+
+    @staticmethod
+    def _conversation_key(channel: str, chat_id: str) -> str:
+        return f"{channel}:{chat_id}"
+
+    @staticmethod
+    def _extract_requested_session_id(metadata: dict[str, Any] | None) -> str | None:
+        if not isinstance(metadata, dict):
+            return None
+
+        direct = metadata.get("session_id")
+        if isinstance(direct, str) and direct.strip():
+            return direct.strip()
+
+        session_block = metadata.get("session")
+        if isinstance(session_block, dict):
+            sid = session_block.get("id")
+            if isinstance(sid, str) and sid.strip():
+                return sid.strip()
+
+        web_block = metadata.get("web")
+        if isinstance(web_block, dict):
+            sid = web_block.get("session_id")
+            if isinstance(sid, str) and sid.strip():
+                return sid.strip()
+
+        nanobot_block = metadata.get("_nanobot")
+        if isinstance(nanobot_block, dict):
+            sid = nanobot_block.get("session_id")
+            if isinstance(sid, str) and sid.strip():
+                return sid.strip()
+
+        return None
+
+    @staticmethod
+    def _parse_command_tokens(raw_command: str) -> list[str]:
+        text = raw_command.strip()
+        if not text:
+            return []
+        try:
+            return shlex.split(text)
+        except ValueError:
+            return text.split()
+
+    @staticmethod
+    def _session_state_metadata(snapshot: dict[str, Any]) -> dict[str, Any]:
+        return {"session_state": snapshot}
+
+    @staticmethod
+    def _resolve_session_token(snapshot: dict[str, Any], token: str) -> str | None:
+        sessions = snapshot.get("sessions")
+        if not isinstance(sessions, list):
+            return None
+
+        cleaned = token.strip()
+        if not cleaned:
+            return None
+
+        if cleaned in {"active", "current"}:
+            active = snapshot.get("active_session_id")
+            return str(active) if isinstance(active, str) and active else None
+
+        for item in sessions:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("id", "")) == cleaned:
+                return cleaned
+
+        if cleaned.isdigit():
+            idx = int(cleaned) - 1
+            if 0 <= idx < len(sessions):
+                item = sessions[idx]
+                if isinstance(item, dict):
+                    sid = item.get("id")
+                    if isinstance(sid, str) and sid:
+                        return sid
+
+        return None
+
+    def _render_session_list_text(self, snapshot: dict[str, Any]) -> str:
+        sessions = snapshot.get("sessions")
+        if not isinstance(sessions, list) or not sessions:
+            return "No sessions in this chat yet. Use /new to create one."
+
+        lines = ["Sessions in this chat:"]
+        for idx, item in enumerate(sessions, start=1):
+            if not isinstance(item, dict):
+                continue
+            marker = "*" if bool(item.get("active")) else " "
+            title = str(item.get("title") or self._SESSION_DEFAULT_TITLE)
+            sid = str(item.get("id") or "")
+            lines.append(f"{idx}. [{marker}] {title} ({sid})")
+
+        lines.append(
+            "Use /new, /session switch <id|index>, /session rename <id|index|active> <title>, /session delete <id|index|active>."
+        )
+        return "\n".join(lines)
+
+    def _handle_session_command(
+        self,
+        *,
+        msg: InboundMessage,
+        cmd_name: str,
+        conversation_key: str,
+    ) -> OutboundMessage | None:
+        if cmd_name not in {"/new", "/sessions", "/session"}:
+            return None
+
+        if cmd_name == "/new":
+            created = self.sessions.create_session(conversation_key, title=None, switch_to=True)
+            snapshot = self.sessions.list_conversation_sessions(conversation_key)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    f"Started a new session: {created['title']} ({created['id']}).\n"
+                    "Use /sessions to browse or switch sessions."
+                ),
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(snapshot),
+                ),
+            )
+
+        if cmd_name == "/sessions":
+            snapshot = self.sessions.list_conversation_sessions(conversation_key)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=self._render_session_list_text(snapshot),
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(snapshot),
+                ),
+            )
+
+        tokens = self._parse_command_tokens(msg.content)
+        if len(tokens) < 2:
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    "Session commands:\n"
+                    "/session list\n"
+                    "/session current\n"
+                    "/session new [title]\n"
+                    "/session switch <id|index|active>\n"
+                    "/session rename <id|index|active> <new title>\n"
+                    "/session delete <id|index|active>"
+                ),
+            )
+
+        action = tokens[1].lower()
+        snapshot = self.sessions.list_conversation_sessions(conversation_key)
+
+        if action in {"list", "ls"}:
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=self._render_session_list_text(snapshot),
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(snapshot),
+                ),
+            )
+
+        if action in {"current", "active"}:
+            sid = str(snapshot.get("active_session_id") or "")
+            current = None
+            for item in snapshot.get("sessions", []):
+                if isinstance(item, dict) and str(item.get("id", "")) == sid:
+                    current = item
+                    break
+            if current is None:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="No active session.",
+                )
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=f"Current session: {current.get('title')} ({current.get('id')})",
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(snapshot),
+                ),
+            )
+
+        if action in {"new", "create"}:
+            title = " ".join(tokens[2:]).strip() or None
+            created = self.sessions.create_session(conversation_key, title=title, switch_to=True)
+            snapshot = self.sessions.list_conversation_sessions(conversation_key)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=f"Switched to new session: {created['title']} ({created['id']}).",
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(snapshot),
+                ),
+            )
+
+        if action in {"switch", "use"}:
+            if len(tokens) < 3:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Usage: /session switch <id|index|active>",
+                )
+            target = self._resolve_session_token(snapshot, tokens[2])
+            if not target:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Unknown session target. Run /sessions to check ids.",
+                )
+            switched = self.sessions.switch_session(conversation_key, target)
+            snapshot = self.sessions.list_conversation_sessions(conversation_key)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=f"Switched to session: {switched['title']} ({switched['id']}).",
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(snapshot),
+                ),
+            )
+
+        if action == "rename":
+            if len(tokens) < 4:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Usage: /session rename <id|index|active> <new title>",
+                )
+            target = self._resolve_session_token(snapshot, tokens[2])
+            if not target:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Unknown session target. Run /sessions to check ids.",
+                )
+            new_title = " ".join(tokens[3:]).strip()
+            if not new_title:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="New title must not be empty.",
+                )
+            renamed = self.sessions.rename_session(
+                conversation_key,
+                target,
+                new_title,
+                auto_title=False,
+            )
+            snapshot = self.sessions.list_conversation_sessions(conversation_key)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=f"Renamed session to: {renamed['title']} ({renamed['id']}).",
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(snapshot),
+                ),
+            )
+
+        if action in {"delete", "remove", "rm"}:
+            if len(tokens) < 3:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Usage: /session delete <id|index|active>",
+                )
+            target = self._resolve_session_token(snapshot, tokens[2])
+            if not target:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Unknown session target. Run /sessions to check ids.",
+                )
+            result = self.sessions.delete_session(conversation_key, target)
+            after_snapshot = self.sessions.list_conversation_sessions(conversation_key)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    f"Deleted session ({result['deleted_session_id']}). "
+                    f"Active session is now {result['active_session_id']}."
+                ),
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(after_snapshot),
+                ),
+            )
+
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=(
+                "Unknown /session command. Use one of: list, current, new, switch, rename, delete."
+            ),
+        )
+
+    @classmethod
+    def _normalize_generated_title(cls, raw_title: str) -> str:
+        text = (raw_title or "").strip()
+        if not text:
+            return ""
+
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1]
+            if "```" in text:
+                text = text.rsplit("```", 1)[0]
+            text = text.strip()
+
+        text = text.splitlines()[0].strip()
+        text = re.sub(r"^(?:title\s*[:\-]|\-|\*|\d+\.)\s*", "", text, flags=re.IGNORECASE)
+        text = text.strip("\"'` ")
+        text = " ".join(text.split())
+        return text[: cls._SESSION_TITLE_MAX_CHARS]
+
+    async def _maybe_generate_session_title(
+        self,
+        *,
+        conversation_key: str,
+        session_id: str,
+        session: Session,
+    ) -> str | None:
+        snapshot = self.sessions.list_conversation_sessions(conversation_key)
+        target: dict[str, Any] | None = None
+        for item in snapshot.get("sessions", []):
+            if isinstance(item, dict) and str(item.get("id", "")) == session_id:
+                target = item
+                break
+        if target is None:
+            return None
+        if not bool(target.get("auto_title", True)):
+            return None
+
+        turns: list[dict[str, Any]] = []
+        for msg in session.messages:
+            role = str(msg.get("role") or "").strip()
+            if role not in {"user", "assistant"}:
+                continue
+            content = str(msg.get("content") or "").strip()
+            if not content:
+                continue
+            turns.append({"role": role, "content": content})
+            if len(turns) >= self._SESSION_TITLE_CONTEXT_MESSAGES:
+                break
+        if len(turns) < 2:
+            return None
+
+        transcript = "\n".join(f"{item['role'].upper()}: {item['content'][:280]}" for item in turns)
+        prompt_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Generate a concise title for a chat session. "
+                    "Return only the title text, no quotes, max 8 words."
+                ),
+            },
+            {
+                "role": "user",
+                "content": "Conversation:\n" + transcript,
+            },
+        ]
+
+        try:
+            response = await self.provider.chat(
+                messages=prompt_messages,
+                tools=None,
+                model=self.model,
+                max_tokens=32,
+                temperature=0.2,
+            )
+            candidate = self._normalize_generated_title(response.content or "")
+        except Exception as e:
+            logger.debug(f"Session title generation skipped due to provider error: {e}")
+            candidate = ""
+
+        if not candidate:
+            fallback = next(
+                (
+                    str(item.get("content") or "")
+                    for item in turns
+                    if str(item.get("role") or "") == "user"
+                ),
+                "",
+            )
+            candidate = self._normalize_generated_title(fallback)
+
+        if not candidate:
+            return None
+
+        normalized_default = self._SESSION_DEFAULT_TITLE.lower()
+        if candidate.lower() == normalized_default:
+            return None
+
+        self.sessions.rename_session(
+            conversation_key,
+            session_id,
+            candidate,
+            auto_title=False,
+        )
+        session.metadata["title"] = candidate
+        self.sessions.save(session)
+        return candidate
 
     async def _handle_privileged_approval(
         self,
@@ -995,47 +1408,56 @@ class AgentLoop:
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {preview}")
 
-        key = session_key or msg.session_key
-        session = self.sessions.get_or_create(key)
+        conversation_key = self._conversation_key(msg.channel, msg.chat_id)
+        resolved_session_id = ""
+        if session_key is not None:
+            session = self.sessions.get_or_create(session_key)
+        else:
+            requested_session_id = self._extract_requested_session_id(msg.metadata)
+            session, descriptor = self.sessions.get_or_create_for_conversation(
+                conversation_key,
+                requested_session_id=requested_session_id,
+            )
+            resolved_session_id = str(descriptor.get("id") or "")
 
         # Handle slash commands
         cmd = msg.content.strip().lower()
         cmd_token = cmd.split()[0] if cmd else ""
         cmd_name = cmd_token.split("@", 1)[0]
-        if cmd_name == "/new":
-            # Capture messages before clearing (avoid race condition with background task)
-            messages_to_archive = session.messages.copy()
-            session.clear()
-            self.sessions.save(session)
-            self.sessions.invalidate(session.key)
-
-            async def _consolidate_and_cleanup():
-                temp_session = Session(key=session.key)
-                temp_session.messages = messages_to_archive
-                await self._consolidate_memory(temp_session, archive_all=True)
-
-            asyncio.create_task(_consolidate_and_cleanup())
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content="New session started. Memory consolidation in progress.",
-            )
         if cmd_name == "/help":
+            help_text = (
+                "nanobot commands:\n"
+                "/new - Start and switch to a new session\n"
+                "/sessions - List sessions in this chat\n"
+                "/session ... - Manage sessions (list/current/new/switch/rename/delete)\n"
+                "/help - Show available commands\n"
+                "/approve - Approve pending privileged request\n"
+                "/deny - Deny pending privileged request"
+            )
+            help_metadata = dict(msg.metadata)
+            if session_key is None:
+                snapshot = self.sessions.list_conversation_sessions(conversation_key)
+                help_metadata = self._merge_outbound_metadata(
+                    help_metadata,
+                    self._session_state_metadata(snapshot),
+                )
             return OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
-                content=(
-                    "🐈 nanobot commands:\n"
-                    "/new — Start a new conversation\n"
-                    "/help — Show available commands\n"
-                    "/approve — Approve pending privileged request\n"
-                    "/deny — Deny pending privileged request"
-                ),
+                content=help_text,
+                metadata=help_metadata,
             )
         if cmd_name == "/approve":
             return await self._handle_privileged_approval(msg=msg, session=session, approve=True)
         if cmd_name == "/deny":
             return await self._handle_privileged_approval(msg=msg, session=session, approve=False)
+
+        if session_cmd_response := self._handle_session_command(
+            msg=msg,
+            cmd_name=cmd_name,
+            conversation_key=conversation_key,
+        ):
+            return session_cmd_response
 
         if len(session.messages) > self.memory_window:
             asyncio.create_task(self._consolidate_memory(session))
@@ -1049,10 +1471,25 @@ class AgentLoop:
             session.metadata["last_request_mode"] = request_mode
             session.metadata["last_request_mode_reason"] = mode_reason
             self.sessions.save(session)
+            if resolved_session_id:
+                await self._maybe_generate_session_title(
+                    conversation_key=conversation_key,
+                    session_id=resolved_session_id,
+                    session=session,
+                )
+
+            outbound_metadata = dict(msg.metadata)
+            if session_key is None:
+                snapshot = self.sessions.list_conversation_sessions(conversation_key)
+                outbound_metadata = self._merge_outbound_metadata(
+                    outbound_metadata,
+                    self._session_state_metadata(snapshot),
+                )
             return OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
                 content=final_content,
+                metadata=outbound_metadata,
             )
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.sender_id)
@@ -1082,13 +1519,26 @@ class AgentLoop:
         session.metadata["last_request_mode_reason"] = mode_reason
         self.sessions.save(session)
 
+        if resolved_session_id:
+            await self._maybe_generate_session_title(
+                conversation_key=conversation_key,
+                session_id=resolved_session_id,
+                session=session,
+            )
+
         outbound_metadata = self._merge_outbound_metadata(msg.metadata, llm_metadata)
+        if session_key is None:
+            snapshot = self.sessions.list_conversation_sessions(conversation_key)
+            outbound_metadata = self._merge_outbound_metadata(
+                outbound_metadata,
+                self._session_state_metadata(snapshot),
+            )
 
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content,
-            metadata=outbound_metadata,  # Pass through for channels and include LLM traces.
+            metadata=outbound_metadata,
         )
 
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
@@ -1110,8 +1560,12 @@ class AgentLoop:
             origin_channel = "cli"
             origin_chat_id = msg.chat_id
 
-        session_key = f"{origin_channel}:{origin_chat_id}"
-        session = self.sessions.get_or_create(session_key)
+        conversation_key = self._conversation_key(origin_channel, origin_chat_id)
+        requested_session_id = self._extract_requested_session_id(msg.metadata)
+        session, descriptor = self.sessions.get_or_create_for_conversation(
+            conversation_key,
+            requested_session_id=requested_session_id,
+        )
         self._set_tool_context(origin_channel, origin_chat_id, msg.sender_id)
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
@@ -1128,11 +1582,25 @@ class AgentLoop:
         session.add_message("assistant", final_content)
         self.sessions.save(session)
 
+        if sid := str(descriptor.get("id") or ""):
+            await self._maybe_generate_session_title(
+                conversation_key=conversation_key,
+                session_id=sid,
+                session=session,
+            )
+
+        outbound_metadata = self._merge_outbound_metadata(msg.metadata, llm_metadata)
+        snapshot = self.sessions.list_conversation_sessions(conversation_key)
+        outbound_metadata = self._merge_outbound_metadata(
+            outbound_metadata,
+            self._session_state_metadata(snapshot),
+        )
+
         return OutboundMessage(
             channel=origin_channel,
             chat_id=origin_chat_id,
             content=final_content,
-            metadata=self._merge_outbound_metadata(msg.metadata, llm_metadata),
+            metadata=outbound_metadata,
         )
 
     async def _consolidate_memory(self, session, archive_all: bool = False) -> None:
