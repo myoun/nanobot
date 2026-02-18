@@ -2,10 +2,17 @@
 
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
+from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
 
-class WhatsAppConfig(BaseModel):
+class Base(BaseModel):
+    """Base model that accepts both camelCase and snake_case keys."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+
+class WhatsAppConfig(Base):
     """WhatsApp channel configuration."""
 
     enabled: bool = False
@@ -14,7 +21,7 @@ class WhatsAppConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed phone numbers
 
 
-class TelegramConfig(BaseModel):
+class TelegramConfig(Base):
     """Telegram channel configuration."""
 
     enabled: bool = False
@@ -25,7 +32,7 @@ class TelegramConfig(BaseModel):
     )
 
 
-class FeishuConfig(BaseModel):
+class FeishuConfig(Base):
     """Feishu/Lark channel configuration using WebSocket long connection."""
 
     enabled: bool = False
@@ -36,7 +43,7 @@ class FeishuConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
 
 
-class DingTalkConfig(BaseModel):
+class DingTalkConfig(Base):
     """DingTalk channel configuration using Stream mode."""
 
     enabled: bool = False
@@ -45,7 +52,7 @@ class DingTalkConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed staff_ids
 
 
-class DiscordConfig(BaseModel):
+class DiscordConfig(Base):
     """Discord channel configuration."""
 
     enabled: bool = False
@@ -55,7 +62,7 @@ class DiscordConfig(BaseModel):
     intents: int = 37377  # GUILDS + GUILD_MESSAGES + DIRECT_MESSAGES + MESSAGE_CONTENT
 
 
-class EmailConfig(BaseModel):
+class EmailConfig(Base):
     """Email channel configuration (IMAP inbound + SMTP outbound)."""
 
     enabled: bool = False
@@ -89,19 +96,19 @@ class EmailConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed sender email addresses
 
 
-class MochatMentionConfig(BaseModel):
+class MochatMentionConfig(Base):
     """Mochat mention behavior configuration."""
 
     require_in_groups: bool = False
 
 
-class MochatGroupRule(BaseModel):
+class MochatGroupRule(Base):
     """Mochat per-group mention requirement."""
 
     require_mention: bool = False
 
 
-class MochatConfig(BaseModel):
+class MochatConfig(Base):
     """Mochat channel configuration."""
 
     enabled: bool = False
@@ -128,7 +135,7 @@ class MochatConfig(BaseModel):
     reply_delay_ms: int = 120000
 
 
-class SlackDMConfig(BaseModel):
+class SlackDMConfig(Base):
     """Slack DM policy configuration."""
 
     enabled: bool = True
@@ -136,7 +143,7 @@ class SlackDMConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed Slack user IDs
 
 
-class SlackConfig(BaseModel):
+class SlackConfig(Base):
     """Slack channel configuration."""
 
     enabled: bool = False
@@ -145,12 +152,14 @@ class SlackConfig(BaseModel):
     bot_token: str = ""  # xoxb-...
     app_token: str = ""  # xapp-...
     user_token_read_only: bool = True
+    reply_in_thread: bool = True
+    react_emoji: str = "eyes"
     group_policy: str = "mention"  # "mention", "open", "allowlist"
     group_allow_from: list[str] = Field(default_factory=list)  # Allowed channel IDs if allowlist
     dm: SlackDMConfig = Field(default_factory=SlackDMConfig)
 
 
-class QQConfig(BaseModel):
+class QQConfig(Base):
     """QQ channel configuration using botpy SDK."""
 
     enabled: bool = False
@@ -175,7 +184,7 @@ class WebConfig(BaseModel):
     rate_limit_window_s: int = 10
 
 
-class ChannelsConfig(BaseModel):
+class ChannelsConfig(Base):
     """Configuration for chat channels."""
 
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
@@ -190,7 +199,7 @@ class ChannelsConfig(BaseModel):
     web: WebConfig = Field(default_factory=WebConfig)
 
 
-class AgentDefaults(BaseModel):
+class AgentDefaults(Base):
     """Default agent configuration."""
 
     workspace: str = "~/.nanobot/workspace"
@@ -201,13 +210,13 @@ class AgentDefaults(BaseModel):
     memory_window: int = 50
 
 
-class AgentsConfig(BaseModel):
+class AgentsConfig(Base):
     """Agent configuration."""
 
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
 
 
-class ProviderConfig(BaseModel):
+class ProviderConfig(Base):
     """LLM provider configuration."""
 
     api_key: str = ""
@@ -215,7 +224,7 @@ class ProviderConfig(BaseModel):
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
 
 
-class ProvidersConfig(BaseModel):
+class ProvidersConfig(Base):
     """Configuration for LLM providers."""
 
     custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
@@ -231,30 +240,34 @@ class ProvidersConfig(BaseModel):
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
     aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
+    siliconflow: ProviderConfig = Field(
+        default_factory=ProviderConfig
+    )  # SiliconFlow (硅基流动) API gateway
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenAI Codex (OAuth)
+    github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth)
 
 
-class GatewayConfig(BaseModel):
+class GatewayConfig(Base):
     """Gateway/server configuration."""
 
     host: str = "0.0.0.0"
     port: int = 18790
 
 
-class WebSearchConfig(BaseModel):
+class WebSearchConfig(Base):
     """Web search tool configuration."""
 
     api_key: str = ""  # Brave Search API key
     max_results: int = 5
 
 
-class WebToolsConfig(BaseModel):
+class WebToolsConfig(Base):
     """Web tools configuration."""
 
     search: WebSearchConfig = Field(default_factory=WebSearchConfig)
 
 
-class ExecToolConfig(BaseModel):
+class ExecToolConfig(Base):
     """Shell exec tool configuration."""
 
     timeout: int = 60
@@ -264,7 +277,7 @@ class ExecToolConfig(BaseModel):
     single_pending_per_chat: bool = True
 
 
-class MCPServerConfig(BaseModel):
+class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
 
     command: str = ""  # Stdio: command to run (e.g. "npx")
@@ -273,7 +286,7 @@ class MCPServerConfig(BaseModel):
     url: str = ""  # HTTP: streamable HTTP endpoint URL
 
 
-class ToolsConfig(BaseModel):
+class ToolsConfig(Base):
     """Tools configuration."""
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
