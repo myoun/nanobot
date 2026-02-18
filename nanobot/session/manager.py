@@ -188,6 +188,7 @@ class SessionManager:
             "created_at": now,
             "updated_at": now,
             "auto_title": bool(auto_title),
+            "pinned": False,
         }
         sessions = entry.get("sessions")
         if not isinstance(sessions, list):
@@ -346,6 +347,7 @@ class SessionManager:
             "created_at": meta.get("created_at"),
             "updated_at": meta.get("updated_at"),
             "auto_title": bool(meta.get("auto_title", True)),
+            "pinned": bool(meta.get("pinned", False)),
             "active": True,
         }
         return session, descriptor
@@ -369,10 +371,17 @@ class SessionManager:
                     "created_at": item.get("created_at"),
                     "updated_at": item.get("updated_at"),
                     "auto_title": bool(item.get("auto_title", True)),
+                    "pinned": bool(item.get("pinned", False)),
                     "active": sid == active_id,
                 }
             )
-        out.sort(key=lambda x: str(x.get("updated_at") or ""), reverse=True)
+        out.sort(
+            key=lambda x: (
+                bool(x.get("pinned", False)),
+                str(x.get("updated_at") or ""),
+            ),
+            reverse=True,
+        )
         return {
             "conversation_key": conversation_key,
             "active_session_id": active_id,
@@ -432,6 +441,7 @@ class SessionManager:
             "created_at": meta.get("created_at"),
             "updated_at": meta.get("updated_at"),
             "auto_title": bool(meta.get("auto_title", True)),
+            "pinned": bool(meta.get("pinned", False)),
             "active": bool(switch_to),
         }
         return result
@@ -453,6 +463,7 @@ class SessionManager:
             "created_at": meta.get("created_at"),
             "updated_at": meta.get("updated_at"),
             "auto_title": bool(meta.get("auto_title", True)),
+            "pinned": bool(meta.get("pinned", False)),
             "active": True,
         }
 
@@ -490,7 +501,63 @@ class SessionManager:
             "created_at": meta.get("created_at"),
             "updated_at": meta.get("updated_at"),
             "auto_title": bool(meta.get("auto_title", False)),
+            "pinned": bool(meta.get("pinned", False)),
             "active": str(entry.get("active_session_id", "")) == sid,
+        }
+
+    def set_session_pinned(
+        self,
+        conversation_key: str,
+        session_id: str,
+        *,
+        pinned: bool,
+    ) -> dict[str, Any]:
+        entry = self._ensure_conversation(conversation_key)
+        index = self._load_index()
+        sid = (session_id or "").strip()
+        meta = self._find_meta(entry, sid)
+        if meta is None:
+            raise KeyError(f"Session not found: {sid}")
+
+        meta["pinned"] = bool(pinned)
+        meta["updated_at"] = self._iso_now()
+        self._save_index(index)
+
+        return {
+            "id": sid,
+            "key": str(meta.get("key") or self.compose_key(conversation_key, sid)),
+            "title": self._normalize_title(meta.get("title"), self._DEFAULT_TITLE),
+            "created_at": meta.get("created_at"),
+            "updated_at": meta.get("updated_at"),
+            "auto_title": bool(meta.get("auto_title", True)),
+            "pinned": bool(meta.get("pinned", False)),
+            "active": str(entry.get("active_session_id", "")) == sid,
+        }
+
+    def search_sessions(self, conversation_key: str, query: str) -> dict[str, Any]:
+        snapshot = self.list_conversation_sessions(conversation_key)
+        token = (query or "").strip().lower()
+        if not token:
+            return snapshot
+
+        sessions = snapshot.get("sessions")
+        if not isinstance(sessions, list):
+            sessions = []
+
+        filtered = []
+        for item in sessions:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "").lower()
+            sid = str(item.get("id") or "").lower()
+            if token in title or token in sid:
+                filtered.append(item)
+
+        return {
+            "conversation_key": snapshot.get("conversation_key"),
+            "active_session_id": snapshot.get("active_session_id"),
+            "query": query,
+            "sessions": filtered,
         }
 
     def delete_session(self, conversation_key: str, session_id: str) -> dict[str, Any]:

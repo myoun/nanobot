@@ -16,6 +16,8 @@ KEY_SESSION_ID = "session_id"
 KEY_SESSIONS = "sessions"
 KEY_HISTORY = "history"
 KEY_TITLE = "title"
+KEY_QUERY = "query"
+KEY_PINNED = "pinned"
 
 TYPE_HELLO = "hello"
 TYPE_USER_MESSAGE = "user_message"

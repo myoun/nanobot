@@ -25,6 +25,7 @@ from nanobot.channels.web_protocol import (
     KEY_ACTION,
     KEY_CODE,
     KEY_HISTORY,
+    KEY_QUERY,
     KEY_SESSIONS,
     KEY_SESSION_ID,
     KEY_TITLE,
@@ -292,6 +293,7 @@ class WebChannel(BaseChannel):
             "active_session_id": snapshot.get("active_session_id"),
             KEY_SESSIONS: snapshot.get("sessions", []),
             KEY_HISTORY: snapshot.get("history", []),
+            KEY_QUERY: snapshot.get("query", ""),
         }
         dead: list[Any] = []
         for ws in list(self._connections.get(sid, set())):
@@ -307,15 +309,28 @@ class WebChannel(BaseChannel):
     def _normalize_sessions_snapshot(
         self, sid: str, snapshot: dict[str, Any] | None
     ) -> dict[str, Any]:
-        current = dict(snapshot or {})
+        incoming = dict(snapshot or {})
         if self._session_manager is None:
-            if not isinstance(current.get("history"), list):
-                current["history"] = []
-            return current
+            if not isinstance(incoming.get("history"), list):
+                incoming["history"] = []
+            return incoming
 
         conversation_key = self._conversation_key_for_sid(sid)
-        current = self._session_manager.list_conversation_sessions(conversation_key)
-        current["history"] = self._active_session_history(current)
+        full_snapshot = self._session_manager.list_conversation_sessions(conversation_key)
+
+        sessions = full_snapshot.get("sessions", [])
+        query = ""
+        if isinstance(incoming.get("sessions"), list):
+            sessions = incoming.get("sessions", [])
+            query = str(incoming.get("query") or "")
+
+        current = {
+            "conversation_key": full_snapshot.get("conversation_key", conversation_key),
+            "active_session_id": full_snapshot.get("active_session_id", ""),
+            "sessions": sessions,
+            "query": query,
+            "history": self._active_session_history(full_snapshot),
+        }
         return current
 
     def _active_session_history(self, snapshot: dict[str, Any]) -> list[dict[str, Any]]:
@@ -427,6 +442,31 @@ class WebChannel(BaseChannel):
                     return
                 self._session_manager.delete_session(conversation_key, target_id)
                 snapshot = self._session_manager.list_conversation_sessions(conversation_key)
+                await self._broadcast_sessions_state(sid, snapshot)
+                return
+
+            if action in {"pin", "unpin"}:
+                target_id = coerce_text(data.get(KEY_SESSION_ID))
+                if not target_id:
+                    await self._send_error(
+                        websocket,
+                        sid,
+                        ERR_BAD_MESSAGE,
+                        "session_id is required for pin/unpin",
+                    )
+                    return
+                self._session_manager.set_session_pinned(
+                    conversation_key,
+                    target_id,
+                    pinned=action == "pin",
+                )
+                snapshot = self._session_manager.list_conversation_sessions(conversation_key)
+                await self._broadcast_sessions_state(sid, snapshot)
+                return
+
+            if action == "search":
+                query = coerce_text(data.get(KEY_QUERY))
+                snapshot = self._session_manager.search_sessions(conversation_key, query)
                 await self._broadcast_sessions_state(sid, snapshot)
                 return
         except KeyError:

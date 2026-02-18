@@ -281,6 +281,37 @@ async def test_web_channel_session_actions(tmp_path: Path) -> None:
 
             active_id = str(created.get("active_session_id") or "")
             assert active_id
+
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "session_action",
+                        "action": "pin",
+                        "session_id": active_id,
+                    }
+                )
+            )
+            pinned = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+            assert pinned["type"] == "sessions_state"
+            assert any(
+                s.get("id") == active_id and bool(s.get("pinned"))
+                for s in pinned.get("sessions", [])
+            )
+
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "session_action",
+                        "action": "search",
+                        "query": "Scratch",
+                    }
+                )
+            )
+            searched = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+            assert searched["type"] == "sessions_state"
+            assert searched.get("query") == "Scratch"
+            assert all("Scratch" in str(s.get("title") or "") for s in searched.get("sessions", []))
+
             await ws.send(
                 json.dumps(
                     {
@@ -322,6 +353,12 @@ def test_conversation_session_lifecycle(tmp_path: Path) -> None:
     assert snapshot["active_session_id"] == second_id
     assert len(snapshot["sessions"]) == 2
 
+    pinned = manager.set_session_pinned(conversation_key, first_id, pinned=True)
+    assert pinned["pinned"] is True
+
+    searched = manager.search_sessions(conversation_key, "initial")
+    assert isinstance(searched.get("sessions"), list)
+
     renamed = manager.rename_session(
         conversation_key, first_id, "Initial planning", auto_title=False
     )
@@ -331,6 +368,7 @@ def test_conversation_session_lifecycle(tmp_path: Path) -> None:
     first = next(item for item in snapshot["sessions"] if item["id"] == first_id)
     assert first["title"] == "Initial planning"
     assert first["auto_title"] is False
+    assert first["pinned"] is True
 
     deleted = manager.delete_session(conversation_key, second_id)
     assert deleted["deleted_session_id"] == second_id

@@ -146,6 +146,24 @@ class DiscordChannel(BaseChannel):
                 {
                     "type": 2,
                     "style": 2,
+                    "label": "Pin",
+                    "custom_id": f"{self._SESSION_CB_PREFIX}:pin:{owner_id}:{normalized_page}",
+                },
+                {
+                    "type": 2,
+                    "style": 2,
+                    "label": "Unpin",
+                    "custom_id": f"{self._SESSION_CB_PREFIX}:unpin:{owner_id}:{normalized_page}",
+                },
+            ],
+        }
+
+        nav_row = {
+            "type": 1,
+            "components": [
+                {
+                    "type": 2,
+                    "style": 2,
                     "label": "Prev",
                     "custom_id": (
                         f"{self._SESSION_CB_PREFIX}:pg:{owner_id}:{max(0, normalized_page - 1)}"
@@ -164,7 +182,7 @@ class DiscordChannel(BaseChannel):
             ],
         }
 
-        return [select_row, action_row]
+        return [select_row, action_row, nav_row]
 
     @classmethod
     def _render_sessions_panel_text(
@@ -190,7 +208,7 @@ class DiscordChannel(BaseChannel):
             "Session switcher",
             f"Active: {active_title} ({active_id})",
             f"Sessions: {len(sessions)} | Page {normalized_page + 1}/{total_pages}",
-            "Use the select menu and buttons below.",
+            "Use select/buttons. Pin and unpin apply to active session.",
         ]
         if notice:
             lines.append(f"\n{notice}")
@@ -320,6 +338,21 @@ class DiscordChannel(BaseChannel):
                     switch_to=True,
                 )
                 notice = f"Started: {created['title']} ({created['id']})"
+            elif action in {"pin", "unpin"}:
+                current_snapshot = self._session_manager.list_conversation_sessions(
+                    conversation_key
+                )
+                active_id = str(current_snapshot.get("active_session_id") or "")
+                if active_id:
+                    updated = self._session_manager.set_session_pinned(
+                        conversation_key,
+                        active_id,
+                        pinned=action == "pin",
+                    )
+                    notice = (
+                        f"{'Pinned' if action == 'pin' else 'Unpinned'}: "
+                        f"{updated['title']} ({updated['id']})"
+                    )
             elif action == "rf":
                 pass
             elif action == "pg":

@@ -142,6 +142,25 @@
       letter-spacing: 0.2px;
       color: #294253;
     }
+    .session-search {
+      padding: 8px;
+      border-bottom: 1px solid var(--line);
+      background: #f7fbfe;
+    }
+    .session-search input {
+      width: 100%;
+      border: 1px solid #c9d9e4;
+      border-radius: 8px;
+      padding: 6px 8px;
+      font: 13px/1.4 "Trebuchet MS", "Segoe UI", sans-serif;
+      color: #274055;
+      background: #fff;
+    }
+    .session-search input:focus {
+      outline: none;
+      border-color: #8bbad2;
+      box-shadow: 0 0 0 2px #d8edf8;
+    }
     .session-list {
       overflow: auto;
       padding: 8px;
@@ -170,6 +189,11 @@
     .session-item .meta {
       font-size: 11px;
       color: #6a7f8d;
+    }
+    .session-item .flags {
+      font-size: 11px;
+      color: #3d6479;
+      min-height: 14px;
     }
     .session-item.active {
       border-color: #8bbad2;
@@ -371,6 +395,9 @@
           <h2>Sessions</h2>
           <button id="session-new-btn" type="button">New</button>
         </div>
+        <div class="session-search">
+          <input id="session-search-input" type="text" placeholder="Search sessions" />
+        </div>
         <div id="session-list" class="session-list"></div>
         <div class="session-actions">
           <button id="session-rename-btn" type="button">Rename</button>
@@ -402,6 +429,7 @@
       reconnectBtn: document.getElementById("reconnect-btn"),
       sessionList: document.getElementById("session-list"),
       sessionNewBtn: document.getElementById("session-new-btn"),
+      sessionSearchInput: document.getElementById("session-search-input"),
       sessionRenameBtn: document.getElementById("session-rename-btn"),
       sessionDeleteBtn: document.getElementById("session-delete-btn")
     };
@@ -414,6 +442,7 @@
     let busy = false;
     let progressNode = null;
     let sessionState = { active_session_id: "", sessions: [] };
+    let sessionSearchTimer = null;
     let historyState = { all: [], start: 0 };
 
     function bootstrapTokenFromUrl() {
@@ -582,7 +611,14 @@
         btn.className = "session-item" + (String(item.id) === active ? " active" : "");
         btn.dataset.sessionId = String(item.id);
         const title = String(item.title || "New chat");
-        btn.innerHTML = `<span class="title">${escapeHtml(title)}</span><span class="meta">${escapeHtml(String(item.id))}</span>`;
+        const flags = [];
+        if (item.pinned) {
+          flags.push("📌 pinned");
+        }
+        if (String(item.id) === active) {
+          flags.push("active");
+        }
+        btn.innerHTML = `<span class="title">${escapeHtml(title)}</span><span class="meta">${escapeHtml(String(item.id))}</span><span class="flags">${escapeHtml(flags.join(" · "))}</span>`;
         btn.addEventListener("click", () => {
           if (busy) {
             hint("wait for current response to finish before switching");
@@ -598,7 +634,13 @@
       }
 
       const current = activeSession();
-      els.activeSessionText.textContent = current ? `${current.title} (${current.id})` : "-";
+      if (current) {
+        els.activeSessionText.textContent = `${current.title} (${current.id})`;
+      } else if (sessionState.active_session_id) {
+        els.activeSessionText.textContent = `(filtered) ${sessionState.active_session_id}`;
+      } else {
+        els.activeSessionText.textContent = "-";
+      }
       const canMutate = Boolean(current) && !busy;
       els.sessionRenameBtn.disabled = !canMutate;
       els.sessionDeleteBtn.disabled = !canMutate;
@@ -608,10 +650,14 @@
       const sessions = Array.isArray(payload.sessions) ? payload.sessions : [];
       const active = String(payload.active_session_id || "");
       const history = Array.isArray(payload.history) ? payload.history : null;
+      const query = String(payload.query || "");
       sessionState = {
         active_session_id: active,
         sessions
       };
+      if (document.activeElement !== els.sessionSearchInput && els.sessionSearchInput.value !== query) {
+        els.sessionSearchInput.value = query;
+      }
       renderSessions();
       if (history !== null) {
         renderHistory(history);
@@ -1036,6 +1082,41 @@
         return;
       }
       sendSessionAction("rename", { session_id: String(current.id), title });
+    });
+
+    els.sessionSearchInput.addEventListener("input", () => {
+      const query = String(els.sessionSearchInput.value || "").trim();
+      if (sessionSearchTimer) {
+        clearTimeout(sessionSearchTimer);
+      }
+      sessionSearchTimer = setTimeout(() => {
+        if (query) {
+          sendSessionAction("search", { query });
+        } else {
+          sendSessionAction("list");
+        }
+      }, 180);
+    });
+
+    els.sessionList.addEventListener("contextmenu", (ev) => {
+      const target = ev.target instanceof HTMLElement ? ev.target.closest(".session-item") : null;
+      if (!target) {
+        return;
+      }
+      ev.preventDefault();
+      const sid = String(target.dataset.sessionId || "").trim();
+      if (!sid) {
+        return;
+      }
+      const session = (Array.isArray(sessionState.sessions) ? sessionState.sessions : []).find(
+        (item) => item && String(item.id || "") === sid
+      );
+      if (!session) {
+        return;
+      }
+      const shouldPin = !Boolean(session.pinned);
+      sendSessionAction(shouldPin ? "pin" : "unpin", { session_id: sid });
+      hint(shouldPin ? "pinned session" : "unpinned session");
     });
 
     els.sessionDeleteBtn.addEventListener("click", () => {

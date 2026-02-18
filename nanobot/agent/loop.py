@@ -359,12 +359,13 @@ class AgentLoop:
             if not isinstance(item, dict):
                 continue
             marker = "*" if bool(item.get("active")) else " "
+            pinned = "📌 " if bool(item.get("pinned", False)) else ""
             title = str(item.get("title") or self._SESSION_DEFAULT_TITLE)
             sid = str(item.get("id") or "")
-            lines.append(f"{idx}. [{marker}] {title} ({sid})")
+            lines.append(f"{idx}. [{marker}] {pinned}{title} ({sid})")
 
         lines.append(
-            "Use /new, /session switch <id|index>, /session rename <id|index|active> <title>, /session delete <id|index|active>."
+            "Use /new, /session switch <id|index>, /session rename <id|index|active> <title>, /session pin <id|index>, /session unpin <id|index>, /session search <keyword>, /session delete <id|index|active>."
         )
         return "\n".join(lines)
 
@@ -418,6 +419,9 @@ class AgentLoop:
                     "/session new [title]\n"
                     "/session switch <id|index|active>\n"
                     "/session rename <id|index|active> <new title>\n"
+                    "/session pin <id|index|active>\n"
+                    "/session unpin <id|index|active>\n"
+                    "/session search <keyword>\n"
                     "/session delete <id|index|active>"
                 ),
             )
@@ -470,6 +474,82 @@ class AgentLoop:
                 metadata=self._merge_outbound_metadata(
                     msg.metadata,
                     self._session_state_metadata(snapshot),
+                ),
+            )
+
+        if action in {"pin", "unpin"}:
+            if len(tokens) < 3:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=f"Usage: /session {action} <id|index|active>",
+                )
+            target = self._resolve_session_token(snapshot, tokens[2])
+            if not target:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Unknown session target. Run /sessions to check ids.",
+                )
+            pinned = action == "pin"
+            updated = self.sessions.set_session_pinned(
+                conversation_key,
+                target,
+                pinned=pinned,
+            )
+            snapshot = self.sessions.list_conversation_sessions(conversation_key)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    f"{'Pinned' if pinned else 'Unpinned'} session: "
+                    f"{updated['title']} ({updated['id']})."
+                ),
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(snapshot),
+                ),
+            )
+
+        if action in {"search", "find"}:
+            keyword = " ".join(tokens[2:]).strip() if len(tokens) > 2 else ""
+            if not keyword:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Usage: /session search <keyword>",
+                )
+            found = self.sessions.search_sessions(conversation_key, keyword)
+            found_sessions = found.get("sessions")
+            if not isinstance(found_sessions, list) or not found_sessions:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=f"No sessions matched '{keyword}'.",
+                    metadata=self._merge_outbound_metadata(
+                        msg.metadata,
+                        self._session_state_metadata(
+                            self.sessions.list_conversation_sessions(conversation_key)
+                        ),
+                    ),
+                )
+            lines = [f"Matches for '{keyword}':"]
+            for idx, item in enumerate(found_sessions, start=1):
+                if not isinstance(item, dict):
+                    continue
+                marker = "*" if bool(item.get("active")) else " "
+                pin = "📌 " if bool(item.get("pinned", False)) else ""
+                lines.append(f"{idx}. [{marker}] {pin}{item.get('title')} ({item.get('id')})")
+            lines.append("Use /session switch <id> to move to one result.")
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="\n".join(lines),
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(
+                        self.sessions.list_conversation_sessions(conversation_key)
+                    ),
                 ),
             )
 

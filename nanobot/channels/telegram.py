@@ -188,7 +188,8 @@ class TelegramChannel(BaseChannel):
             if not sid:
                 continue
             marker = "●" if bool(item.get("active")) else "○"
-            label = f"{marker} {self._short_session_title(str(item.get('title') or ''))}"
+            pin = "📌 " if bool(item.get("pinned", False)) else ""
+            label = f"{marker} {pin}{self._short_session_title(str(item.get('title') or ''))}"
             rows.append(
                 [
                     InlineKeyboardButton(
@@ -205,8 +206,24 @@ class TelegramChannel(BaseChannel):
                     callback_data=f"{self._SESSION_CB_PREFIX}:new:{normalized_page}",
                 ),
                 InlineKeyboardButton(
+                    "📌 Pin",
+                    callback_data=f"{self._SESSION_CB_PREFIX}:pin:active:{normalized_page}",
+                ),
+                InlineKeyboardButton(
+                    "📍 Unpin",
+                    callback_data=f"{self._SESSION_CB_PREFIX}:unpin:active:{normalized_page}",
+                ),
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
                     "🔄 Refresh",
                     callback_data=f"{self._SESSION_CB_PREFIX}:rf:{normalized_page}",
+                ),
+                InlineKeyboardButton(
+                    "🔎 Search",
+                    callback_data=f"{self._SESSION_CB_PREFIX}:helpsearch:{normalized_page}",
                 ),
             ]
         )
@@ -374,6 +391,28 @@ class TelegramChannel(BaseChannel):
                     page = self._parse_int(parts[3] if len(parts) > 3 else "0")
                     switched = self._session_manager.switch_session(conversation_key, target)
                     notice = f"Switched: {switched['title']} ({switched['id']})"
+            elif action in {"pin", "unpin"}:
+                if len(parts) < 3:
+                    notice = "Invalid session target."
+                else:
+                    target_raw = parts[2]
+                    page = self._parse_int(parts[3] if len(parts) > 3 else "0")
+                    target = target_raw
+                    if target_raw == "active":
+                        current = self._session_manager.list_conversation_sessions(conversation_key)
+                        target = str(current.get("active_session_id") or "")
+                    if target:
+                        updated = self._session_manager.set_session_pinned(
+                            conversation_key,
+                            target,
+                            pinned=action == "pin",
+                        )
+                        notice = (
+                            f"{'Pinned' if action == 'pin' else 'Unpinned'}: "
+                            f"{updated['title']} ({updated['id']})"
+                        )
+            elif action == "helpsearch":
+                notice = "Use /session search <keyword> for filtering sessions."
             elif action == "noop":
                 pass
             else:
