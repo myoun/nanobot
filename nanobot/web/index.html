@@ -407,7 +407,7 @@
       let text = escapeHtml(raw);
       const codeTokens = [];
       text = text.replace(/`([^`\n]+)`/g, (_m, code) => {
-        const token = `@@CODE_${codeTokens.length}@@`;
+        const token = `@@NBCT${codeTokens.length}@@`;
         codeTokens.push(`<code>${code}</code>`);
         return token;
       });
@@ -426,7 +426,10 @@
         .replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, "$1<em>$2</em>")
         .replace(/(^|[^_])_([^_]+)_(?!_)/g, "$1<em>$2</em>");
 
-      text = text.replace(/@@CODE_(\d+)@@/g, (_m, idx) => codeTokens[Number(idx)] || "");
+      text = text.replace(/@@NBCT(\d+)@@/g, (m, idx) => {
+        const replacement = codeTokens[Number(idx)];
+        return replacement === undefined ? m : replacement;
+      });
       return text;
     }
 
