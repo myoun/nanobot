@@ -46,7 +46,7 @@ class MessageTool(Tool):
             "properties": {
                 "content": {
                     "type": "string",
-                    "description": "Optional text content to send"
+                    "description": "Text content to send (use empty string when sending only media)"
                 },
                 "media": {
                     "type": "array",
@@ -62,7 +62,7 @@ class MessageTool(Tool):
                     "description": "Optional: target chat/user ID"
                 }
             },
-            "required": []
+            "required": ["content"]
         }
     
     async def execute(
