@@ -23,4 +23,5 @@ Some bundled skills may include upstream third-party content and retain their or
 | `weather` | Get weather info using wttr.in and Open-Meteo |
 | `summarize` | Summarize URLs, files, and YouTube videos |
 | `tmux` | Remote-control tmux sessions |
+| `clawhub` | Search and install skills from ClawHub registry |
 | `skill-creator` | Create new skills |
