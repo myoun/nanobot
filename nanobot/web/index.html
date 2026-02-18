@@ -285,6 +285,22 @@
       font-family: "Trebuchet MS", "Segoe UI", sans-serif;
       font-size: 13px;
     }
+    .history-toolbar {
+      display: flex;
+      justify-content: center;
+      margin: 2px 0 8px;
+    }
+    .history-load {
+      border: 1px solid #c6d5df;
+      border-radius: 999px;
+      background: #f8fbfd;
+      color: #314b5d;
+      padding: 6px 12px;
+      font-size: 12px;
+      cursor: pointer;
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+    }
+    .history-load:hover { background: #eef5f9; }
     .composer {
       padding: 12px;
       display: grid;
@@ -390,7 +406,7 @@
       sessionDeleteBtn: document.getElementById("session-delete-btn")
     };
 
-    const MAX_MESSAGES = 0;
+    const HISTORY_WINDOW_STEP = 240;
     let ws = null;
     let reconnectTimer = null;
     let reconnectAttempt = 0;
@@ -398,6 +414,7 @@
     let busy = false;
     let progressNode = null;
     let sessionState = { active_session_id: "", sessions: [] };
+    let historyState = { all: [], start: 0 };
 
     function bootstrapTokenFromUrl() {
       const url = new URL(window.location.href);
@@ -430,22 +447,88 @@
       return m.scrollHeight - m.scrollTop - m.clientHeight < 80;
     }
 
-    function pushMessage(role, text) {
-      const autoscroll = nearBottom();
+    function createMessageNode(role, text) {
       const node = document.createElement("div");
       node.className = "msg";
       node.dataset.role = role;
       setMessageContent(node, role, text);
+      return node;
+    }
+
+    function pushMessage(role, text) {
+      const autoscroll = nearBottom();
+      const node = createMessageNode(role, text);
       els.messages.appendChild(node);
-      if (MAX_MESSAGES > 0) {
-        while (els.messages.children.length > MAX_MESSAGES) {
-          els.messages.removeChild(els.messages.firstChild);
-        }
-      }
       if (autoscroll) {
         els.messages.scrollTop = els.messages.scrollHeight;
       }
       return node;
+    }
+
+    function normalizeHistory(history) {
+      const items = Array.isArray(history) ? history : [];
+      const out = [];
+      for (const item of items) {
+        if (!item || typeof item !== "object") {
+          continue;
+        }
+        const role = String(item.role || "").trim() === "assistant" ? "assistant" : "user";
+        const content = String(item.content || "");
+        if (!content) {
+          continue;
+        }
+        out.push({ role, content });
+      }
+      return out;
+    }
+
+    function renderHistoryWindow() {
+      const list = historyState.all;
+      const fragment = document.createDocumentFragment();
+
+      if (historyState.start > 0) {
+        const toolbar = document.createElement("div");
+        toolbar.className = "history-toolbar";
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "history-load";
+        button.textContent = `Load older messages (${historyState.start})`;
+        button.addEventListener("click", () => {
+          historyState.start = Math.max(0, historyState.start - HISTORY_WINDOW_STEP);
+          renderHistoryWindow();
+        });
+        toolbar.appendChild(button);
+        fragment.appendChild(toolbar);
+      }
+
+      const visible = list.slice(historyState.start);
+      for (const item of visible) {
+        fragment.appendChild(createMessageNode(item.role, item.content));
+      }
+
+      els.messages.innerHTML = "";
+      els.messages.appendChild(fragment);
+      clearProgress();
+      els.messages.scrollTop = els.messages.scrollHeight;
+    }
+
+    function renderHistory(history) {
+      const normalized = normalizeHistory(history);
+      historyState = {
+        all: normalized,
+        start: Math.max(0, normalized.length - HISTORY_WINDOW_STEP)
+      };
+      renderHistoryWindow();
+    }
+
+    function appendHistoryTurn(role, text) {
+      const content = String(text || "");
+      if (!content) {
+        return;
+      }
+      historyState.all.push({ role, content });
+      historyState.start = Math.max(0, historyState.all.length - HISTORY_WINDOW_STEP);
+      renderHistoryWindow();
     }
 
     function showProgress(text) {
@@ -519,32 +602,6 @@
       const canMutate = Boolean(current) && !busy;
       els.sessionRenameBtn.disabled = !canMutate;
       els.sessionDeleteBtn.disabled = !canMutate;
-    }
-
-    function renderHistory(history) {
-      const list = Array.isArray(history) ? history : [];
-      const fragment = document.createDocumentFragment();
-
-      for (const item of list) {
-        if (!item || typeof item !== "object") {
-          continue;
-        }
-        const role = String(item.role || "").trim() === "assistant" ? "assistant" : "user";
-        const content = String(item.content || "");
-        if (!content) {
-          continue;
-        }
-        const node = document.createElement("div");
-        node.className = "msg";
-        node.dataset.role = role;
-        setMessageContent(node, role, content);
-        fragment.appendChild(node);
-      }
-
-      els.messages.innerHTML = "";
-      els.messages.appendChild(fragment);
-      clearProgress();
-      els.messages.scrollTop = els.messages.scrollHeight;
     }
 
     function applySessionState(payload) {
@@ -890,7 +947,7 @@
         }
         if (type === "assistant_message") {
           clearProgress();
-          pushMessage("assistant", payload.text || "");
+          appendHistoryTurn("assistant", payload.text || "");
           busy = false;
           updateSendState();
           hint("");
@@ -926,7 +983,7 @@
         return;
       }
       ws.send(JSON.stringify({ type: "user_message", text, session_id: activeId }));
-      pushMessage("user", text);
+      appendHistoryTurn("user", text);
       els.composer.value = "";
       busy = true;
       hint("waiting for response...");
@@ -948,6 +1005,7 @@
     });
 
     els.newChatBtn.addEventListener("click", () => {
+      historyState = { all: [], start: 0 };
       els.messages.innerHTML = "";
       clearProgress();
       reconnectNow(true);
