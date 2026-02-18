@@ -382,10 +382,17 @@ def test_conversation_session_lifecycle(tmp_path: Path) -> None:
 
     deleted = manager.delete_session(conversation_key, second_id)
     assert deleted["deleted_session_id"] == second_id
+    assert deleted["recoverable"] is True
+
+    restored = manager.restore_session(conversation_key, second_id)
+    assert restored["id"] == second_id
 
     snapshot = manager.list_conversation_sessions(conversation_key)
-    assert len(snapshot["sessions"]) == 1
-    assert snapshot["active_session_id"] == first_id
+    assert any(item["id"] == second_id for item in snapshot["sessions"])
+
+    snapshot = manager.list_conversation_sessions(conversation_key)
+    assert len(snapshot["sessions"]) == 2
+    assert snapshot["active_session_id"] == second_id
 
 
 def test_delete_last_session_creates_replacement(tmp_path: Path) -> None:
@@ -398,6 +405,7 @@ def test_delete_last_session_creates_replacement(tmp_path: Path) -> None:
     result = manager.delete_session(conversation_key, first_id)
     assert result["deleted_session_id"] == first_id
     assert result["created_replacement"] is True
+    assert result["recoverable"] is True
 
     snapshot = manager.list_conversation_sessions(conversation_key)
     assert len(snapshot["sessions"]) == 1

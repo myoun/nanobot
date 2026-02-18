@@ -633,12 +633,22 @@ class SessionManager:
             raise KeyError(f"Session not found: {sid}")
 
         key = str(target.get("key") or self.compose_key(conversation_key, sid))
+        deleted_sessions = entry.get("deleted_sessions")
+        if not isinstance(deleted_sessions, list):
+            deleted_sessions = []
+            entry["deleted_sessions"] = deleted_sessions
+        deleted_sessions.append(
+            {
+                "id": sid,
+                "key": key,
+                "title": self._normalize_title(target.get("title"), self._DEFAULT_TITLE),
+                "deleted_at": self._iso_now(),
+                "meta": dict(target),
+            }
+        )
+
         entry["sessions"] = [s for s in sessions if str(s.get("id", "")) != sid]
         self.invalidate(key)
-        try:
-            self._get_session_path(key).unlink(missing_ok=True)
-        except Exception:
-            pass
 
         created_replacement = False
         active_id = str(entry.get("active_session_id") or "")
@@ -650,6 +660,7 @@ class SessionManager:
             remaining_snapshot = self.list_conversation_sessions(conversation_key)
             return {
                 "deleted_session_id": sid,
+                "recoverable": True,
                 "active_session_id": active_id,
                 "created_replacement": created_replacement,
                 "sessions": remaining_snapshot["sessions"],
@@ -667,9 +678,87 @@ class SessionManager:
         snapshot = self.list_conversation_sessions(conversation_key)
         return {
             "deleted_session_id": sid,
+            "recoverable": True,
             "active_session_id": snapshot["active_session_id"],
             "created_replacement": created_replacement,
             "sessions": snapshot["sessions"],
+        }
+
+    def list_deleted_sessions(self, conversation_key: str) -> dict[str, Any]:
+        entry = self._ensure_conversation(conversation_key)
+        deleted_sessions = entry.get("deleted_sessions")
+        if not isinstance(deleted_sessions, list):
+            deleted_sessions = []
+
+        out: list[dict[str, Any]] = []
+        for item in deleted_sessions:
+            if not isinstance(item, dict):
+                continue
+            out.append(
+                {
+                    "id": str(item.get("id") or ""),
+                    "key": str(item.get("key") or ""),
+                    "title": self._normalize_title(item.get("title"), self._DEFAULT_TITLE),
+                    "deleted_at": item.get("deleted_at"),
+                }
+            )
+
+        out.sort(key=lambda x: str(x.get("deleted_at") or ""), reverse=True)
+        return {
+            "conversation_key": conversation_key,
+            "deleted_sessions": out,
+        }
+
+    def restore_session(self, conversation_key: str, session_id: str) -> dict[str, Any]:
+        entry = self._ensure_conversation(conversation_key)
+        index = self._load_index()
+        sid = (session_id or "").strip()
+
+        deleted_sessions = entry.get("deleted_sessions")
+        if not isinstance(deleted_sessions, list):
+            deleted_sessions = []
+            entry["deleted_sessions"] = deleted_sessions
+
+        target: dict[str, Any] | None = None
+        remaining: list[dict[str, Any]] = []
+        for item in deleted_sessions:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("id") or "") == sid and target is None:
+                target = item
+                continue
+            remaining.append(item)
+
+        if target is None:
+            raise KeyError(f"Deleted session not found: {sid}")
+
+        meta = target.get("meta")
+        if not isinstance(meta, dict):
+            meta = {
+                "id": sid,
+                "key": str(target.get("key") or self.compose_key(conversation_key, sid)),
+                "title": self._normalize_title(target.get("title"), self._DEFAULT_TITLE),
+                "created_at": self._iso_now(),
+                "updated_at": self._iso_now(),
+                "auto_title": False,
+                "pinned": False,
+            }
+
+        sessions = entry.get("sessions")
+        if not isinstance(sessions, list):
+            sessions = []
+            entry["sessions"] = sessions
+
+        if self._find_meta(entry, sid) is None:
+            sessions.append(meta)
+        entry["deleted_sessions"] = remaining
+        entry["active_session_id"] = sid
+        self._save_index(index)
+
+        return {
+            "id": sid,
+            "title": self._normalize_title(meta.get("title"), self._DEFAULT_TITLE),
+            "active": True,
         }
 
     def _load(self, key: str) -> Session | None:

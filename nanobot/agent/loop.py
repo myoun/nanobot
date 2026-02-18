@@ -369,7 +369,7 @@ class AgentLoop:
             lines.append(f"{idx}. [{marker}] {pinned}{title} ({sid})")
 
         lines.append(
-            "Use /new, /session switch <id|index>, /session rename <id|index|active> <title>, /session pin <id|index>, /session unpin <id|index>, /session search <keyword>, /session delete <id|index|active>."
+            "Use /new, /session switch <id|index>, /session rename <id|index|active> <title>, /session pin <id|index>, /session unpin <id|index>, /session search <keyword>, /session trash, /session restore <id>, /session delete <id|index|active>."
         )
         return "\n".join(lines)
 
@@ -426,6 +426,8 @@ class AgentLoop:
                     "/session pin <id|index|active>\n"
                     "/session unpin <id|index|active>\n"
                     "/session search <keyword>\n"
+                    "/session trash\n"
+                    "/session restore <id>\n"
                     "/session delete <id|index|active>"
                 ),
             )
@@ -557,6 +559,68 @@ class AgentLoop:
                 ),
             )
 
+        if action in {"trash", "deleted"}:
+            deleted = self.sessions.list_deleted_sessions(conversation_key)
+            deleted_items = deleted.get("deleted_sessions")
+            if not isinstance(deleted_items, list) or not deleted_items:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Trash is empty.",
+                )
+            lines = ["Deleted sessions:"]
+            for idx, item in enumerate(deleted_items, start=1):
+                if not isinstance(item, dict):
+                    continue
+                lines.append(
+                    f"{idx}. {item.get('title')} ({item.get('id')}) deleted at {item.get('deleted_at')}"
+                )
+            lines.append("Use /session restore <id> to recover one.")
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="\n".join(lines),
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(
+                        self.sessions.list_conversation_sessions(conversation_key)
+                    ),
+                ),
+            )
+
+        if action == "restore":
+            if len(tokens) < 3:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Usage: /session restore <id>",
+                )
+            target_id = tokens[2].strip()
+            if not target_id:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Usage: /session restore <id>",
+                )
+            try:
+                restored = self.sessions.restore_session(conversation_key, target_id)
+            except KeyError:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Deleted session not found. Use /session trash first.",
+                )
+            snapshot = self.sessions.list_conversation_sessions(conversation_key)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=f"Restored session: {restored['title']} ({restored['id']}).",
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(snapshot),
+                ),
+            )
+
         if action in {"switch", "use"}:
             if len(tokens) < 3:
                 return OutboundMessage(
@@ -642,7 +706,8 @@ class AgentLoop:
                 chat_id=msg.chat_id,
                 content=(
                     f"Deleted session ({result['deleted_session_id']}). "
-                    f"Active session is now {result['active_session_id']}."
+                    f"Active session is now {result['active_session_id']}. "
+                    "Use /session trash to restore if needed."
                 ),
                 metadata=self._merge_outbound_metadata(
                     msg.metadata,
@@ -654,7 +719,7 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=(
-                "Unknown /session command. Use one of: list, current, new, switch, rename, delete."
+                "Unknown /session command. Use one of: list, current, new, switch, rename, pin, unpin, search, trash, restore, delete."
             ),
         )
 
