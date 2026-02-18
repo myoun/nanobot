@@ -15,9 +15,10 @@ from typer.testing import CliRunner
 from nanobot.cli.commands import app
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.web import WebChannel
+from nanobot.channels.discord import DiscordChannel
 from nanobot.channels.telegram import TelegramChannel
-from nanobot.config.schema import TelegramConfig, WebConfig
+from nanobot.channels.web import WebChannel
+from nanobot.config.schema import DiscordConfig, TelegramConfig, WebConfig
 from nanobot.session.manager import SessionManager
 
 runner = CliRunner()
@@ -417,3 +418,77 @@ async def test_telegram_sessions_callback_switch_and_panel(tmp_path: Path) -> No
     assert snapshot["active_session_id"] == first_id
     assert query.answered is True
     assert "Switched:" in query_message.text
+
+
+@pytest.mark.asyncio
+async def test_discord_component_session_switcher(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    channel = DiscordChannel(
+        DiscordConfig(enabled=True, token="dummy-token"),
+        MessageBus(),
+        session_manager=manager,
+    )
+    conversation_key = "discord:555"
+
+    _, first = manager.get_or_create_for_conversation(conversation_key)
+    first_id = str(first["id"])
+    second = manager.create_session(conversation_key, title="Second", switch_to=True)
+    second_id = str(second["id"])
+    assert second_id != first_id
+
+    class DummyResponse:
+        def __init__(self, status_code: int = 200):
+            self.status_code = status_code
+            self.text = "ok"
+
+    class DummyHTTP:
+        def __init__(self):
+            self.posts: list[dict[str, Any]] = []
+
+        async def post(
+            self,
+            url: str,
+            headers: dict[str, str] | None = None,
+            json: dict[str, Any] | None = None,
+            data: dict[str, Any] | None = None,
+            files: Any | None = None,
+        ) -> DummyResponse:
+            self.posts.append(
+                {
+                    "url": url,
+                    "headers": headers,
+                    "json": json,
+                    "data": data,
+                    "files": files,
+                }
+            )
+            return DummyResponse()
+
+    dummy_http = DummyHTTP()
+    channel._http = cast(Any, dummy_http)
+
+    await channel._send_sessions_panel_message(channel_id="555", user_id="u1", page=0)
+    assert dummy_http.posts
+    first_payload = dummy_http.posts[-1]
+    assert first_payload["url"].endswith("/channels/555/messages")
+    assert isinstance((first_payload["json"] or {}).get("components"), list)
+
+    interaction_payload = {
+        "id": "i1",
+        "token": "itok",
+        "channel_id": "555",
+        "member": {"user": {"id": "u1"}},
+        "data": {
+            "custom_id": "nbs:sel:u1:0",
+            "values": [first_id],
+        },
+    }
+    await channel._handle_interaction_create(interaction_payload)
+    snapshot = manager.list_conversation_sessions(conversation_key)
+    assert snapshot["active_session_id"] == first_id
+
+    callback_payload = dummy_http.posts[-1]
+    assert callback_payload["url"].endswith("/interactions/i1/itok/callback")
+    body = callback_payload["json"] or {}
+    assert body.get("type") == 7
+    assert isinstance((body.get("data") or {}).get("components"), list)
