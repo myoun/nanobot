@@ -14,6 +14,7 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import DiscordConfig
+from nanobot.session.manager import SessionManager
 
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
@@ -25,9 +26,15 @@ class DiscordChannel(BaseChannel):
 
     name = "discord"
 
-    def __init__(self, config: DiscordConfig, bus: MessageBus):
+    def __init__(
+        self,
+        config: DiscordConfig,
+        bus: MessageBus,
+        session_manager: SessionManager | None = None,
+    ):
         super().__init__(config, bus)
         self.config: DiscordConfig = config
+        self._session_manager = session_manager
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._seq: int | None = None
         self._heartbeat_task: asyncio.Task | None = None
@@ -108,7 +115,9 @@ class DiscordChannel(BaseChannel):
             failed_lines = [f"[media not found: {m}]" for m in failed_media]
             text_content = "\n".join(part for part in [text_content, *failed_lines] if part)
         if skipped_media:
-            skipped_lines = [f"[media skipped: attachment limit exceeded: {m}]" for m in skipped_media]
+            skipped_lines = [
+                f"[media skipped: attachment limit exceeded: {m}]" for m in skipped_media
+            ]
             text_content = "\n".join(part for part in [text_content, *skipped_lines] if part)
 
         payload: dict[str, Any] = {}
@@ -285,7 +294,9 @@ class DiscordChannel(BaseChannel):
                 continue
             try:
                 media_dir.mkdir(parents=True, exist_ok=True)
-                file_path = media_dir / f"{attachment.get('id', 'file')}_{filename.replace('/', '_')}"
+                file_path = (
+                    media_dir / f"{attachment.get('id', 'file')}_{filename.replace('/', '_')}"
+                )
                 resp = await self._http.get(url)
                 resp.raise_for_status()
                 file_path.write_bytes(resp.content)

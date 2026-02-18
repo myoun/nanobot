@@ -6,15 +6,25 @@ import asyncio
 import mimetypes
 from pathlib import Path
 import re
+from typing import Any
+
 from loguru import logger
-from telegram import BotCommand, Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from telegram.request import HTTPXRequest
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import TelegramConfig
+from nanobot.session.manager import SessionManager
 
 
 def _markdown_to_telegram_html(text: str) -> str:
@@ -110,6 +120,9 @@ class TelegramChannel(BaseChannel):
     """
 
     name = "telegram"
+    _SESSION_CB_PREFIX = "nbs"
+    _SESSION_PAGE_SIZE = 6
+    _SESSION_TITLE_MAX_LEN = 28
 
     # Commands registered with Telegram's command menu
     BOT_COMMANDS = [
@@ -127,13 +140,255 @@ class TelegramChannel(BaseChannel):
         config: TelegramConfig,
         bus: MessageBus,
         groq_api_key: str = "",
+        session_manager: SessionManager | None = None,
     ):
         super().__init__(config, bus)
         self.config: TelegramConfig = config
         self.groq_api_key = groq_api_key
+        self._session_manager = session_manager
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
+
+    @classmethod
+    def _short_session_title(cls, title: str) -> str:
+        raw = " ".join((title or "").split()).strip()
+        if not raw:
+            raw = "New chat"
+        if len(raw) <= cls._SESSION_TITLE_MAX_LEN:
+            return raw
+        return raw[: cls._SESSION_TITLE_MAX_LEN - 1].rstrip() + "..."
+
+    @staticmethod
+    def _conversation_key(chat_id: str) -> str:
+        return f"telegram:{chat_id}"
+
+    @classmethod
+    def _session_pages(cls, total_items: int) -> int:
+        if total_items <= 0:
+            return 1
+        return (total_items + cls._SESSION_PAGE_SIZE - 1) // cls._SESSION_PAGE_SIZE
+
+    def _build_sessions_keyboard(self, snapshot: dict[str, Any], page: int) -> InlineKeyboardMarkup:
+        sessions = snapshot.get("sessions")
+        if not isinstance(sessions, list):
+            sessions = []
+
+        total_pages = self._session_pages(len(sessions))
+        normalized_page = min(max(0, page), total_pages - 1)
+        start = normalized_page * self._SESSION_PAGE_SIZE
+        end = start + self._SESSION_PAGE_SIZE
+        visible = sessions[start:end]
+
+        rows: list[list[InlineKeyboardButton]] = []
+        for item in visible:
+            if not isinstance(item, dict):
+                continue
+            sid = str(item.get("id") or "").strip()
+            if not sid:
+                continue
+            marker = "●" if bool(item.get("active")) else "○"
+            label = f"{marker} {self._short_session_title(str(item.get('title') or ''))}"
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        label,
+                        callback_data=(f"{self._SESSION_CB_PREFIX}:sw:{sid}:{normalized_page}"),
+                    )
+                ]
+            )
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "➕ New",
+                    callback_data=f"{self._SESSION_CB_PREFIX}:new:{normalized_page}",
+                ),
+                InlineKeyboardButton(
+                    "🔄 Refresh",
+                    callback_data=f"{self._SESSION_CB_PREFIX}:rf:{normalized_page}",
+                ),
+            ]
+        )
+
+        if total_pages > 1:
+            nav_row: list[InlineKeyboardButton] = []
+            if normalized_page > 0:
+                nav_row.append(
+                    InlineKeyboardButton(
+                        "◀ Prev",
+                        callback_data=(f"{self._SESSION_CB_PREFIX}:pg:{normalized_page - 1}"),
+                    )
+                )
+            nav_row.append(
+                InlineKeyboardButton(
+                    f"{normalized_page + 1}/{total_pages}",
+                    callback_data=f"{self._SESSION_CB_PREFIX}:noop",
+                )
+            )
+            if normalized_page < total_pages - 1:
+                nav_row.append(
+                    InlineKeyboardButton(
+                        "Next ▶",
+                        callback_data=(f"{self._SESSION_CB_PREFIX}:pg:{normalized_page + 1}"),
+                    )
+                )
+            rows.append(nav_row)
+
+        return InlineKeyboardMarkup(rows)
+
+    @classmethod
+    def _render_sessions_panel_text(
+        cls,
+        snapshot: dict[str, Any],
+        *,
+        page: int,
+        notice: str | None = None,
+    ) -> str:
+        sessions = snapshot.get("sessions")
+        if not isinstance(sessions, list):
+            sessions = []
+        total_pages = cls._session_pages(len(sessions))
+        normalized_page = min(max(0, page), total_pages - 1)
+        active = next(
+            (item for item in sessions if isinstance(item, dict) and bool(item.get("active"))),
+            None,
+        )
+        active_title = cls._short_session_title(str((active or {}).get("title") or "New chat"))
+        active_id = str((active or {}).get("id") or "-")
+        header = [
+            "Session switcher",
+            f"Active: {active_title} ({active_id})",
+            f"Sessions: {len(sessions)} | Page {normalized_page + 1}/{total_pages}",
+        ]
+        if notice:
+            header.append(f"\n{notice}")
+        return "\n".join(header)
+
+    async def _send_sessions_panel(
+        self,
+        *,
+        update: Update | None = None,
+        page: int = 0,
+        notice: str | None = None,
+        query_message: Any | None = None,
+    ) -> None:
+        if self._session_manager is None:
+            if update and update.message:
+                await update.message.reply_text("Session panel is unavailable.")
+            return
+
+        target_chat_id: str | None = None
+        if update and update.effective_chat is not None and update.effective_chat.id is not None:
+            target_chat_id = str(update.effective_chat.id)
+        elif query_message is not None and getattr(query_message, "chat_id", None) is not None:
+            target_chat_id = str(query_message.chat_id)
+        if not target_chat_id:
+            return
+
+        snapshot = self._session_manager.list_conversation_sessions(
+            self._conversation_key(target_chat_id)
+        )
+        text = self._render_sessions_panel_text(snapshot, page=page, notice=notice)
+        keyboard = self._build_sessions_keyboard(snapshot, page=page)
+
+        if query_message is not None:
+            try:
+                await query_message.edit_text(text=text, reply_markup=keyboard)
+            except Exception as e:
+                if "Message is not modified" not in str(e):
+                    logger.debug(f"Telegram sessions panel edit skipped: {e}")
+            return
+
+        if update and update.message:
+            await update.message.reply_text(text, reply_markup=keyboard)
+
+    @staticmethod
+    def _parse_int(raw: str, default: int = 0) -> int:
+        try:
+            return int(raw)
+        except Exception:
+            return default
+
+    async def _on_sessions_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if not update.message:
+            return
+        if self._session_manager is None:
+            await self._forward_command(update, context)
+            return
+        await self._send_sessions_panel(update=update, page=0)
+
+    async def _on_session_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        query = update.callback_query
+        if query is None:
+            return
+
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
+        if self._session_manager is None:
+            return
+
+        data = str(query.data or "")
+        if not data.startswith(f"{self._SESSION_CB_PREFIX}:"):
+            return
+
+        message = query.message
+        chat_id_raw = getattr(message, "chat_id", None)
+        if chat_id_raw is None:
+            return
+        conversation_key = self._conversation_key(str(chat_id_raw))
+
+        parts = data.split(":")
+        if len(parts) < 2:
+            return
+
+        action = parts[1]
+        page = 0
+        notice: str | None = None
+
+        try:
+            if action == "pg":
+                page = self._parse_int(parts[2] if len(parts) > 2 else "0")
+            elif action == "rf":
+                page = self._parse_int(parts[2] if len(parts) > 2 else "0")
+            elif action == "new":
+                page = self._parse_int(parts[2] if len(parts) > 2 else "0")
+                created = self._session_manager.create_session(
+                    conversation_key,
+                    title=None,
+                    switch_to=True,
+                )
+                notice = f"Started: {created['title']} ({created['id']})"
+            elif action == "sw":
+                if len(parts) < 3:
+                    notice = "Invalid session target."
+                else:
+                    target = parts[2]
+                    page = self._parse_int(parts[3] if len(parts) > 3 else "0")
+                    switched = self._session_manager.switch_session(conversation_key, target)
+                    notice = f"Switched: {switched['title']} ({switched['id']})"
+            elif action == "noop":
+                pass
+            else:
+                notice = "Unknown action."
+        except KeyError:
+            notice = "Session not found. Refreshing list."
+        except Exception as e:
+            logger.warning(f"Telegram session callback failed: {e}")
+            notice = "Session action failed."
+
+        await self._send_sessions_panel(
+            page=page,
+            notice=notice,
+            query_message=message,
+        )
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -158,11 +413,17 @@ class TelegramChannel(BaseChannel):
         # Add command handlers
         self._app.add_handler(CommandHandler("start", self._on_start))
         self._app.add_handler(CommandHandler("new", self._forward_command))
-        self._app.add_handler(CommandHandler("sessions", self._forward_command))
+        self._app.add_handler(CommandHandler("sessions", self._on_sessions_command))
         self._app.add_handler(CommandHandler("session", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._forward_command))
         self._app.add_handler(CommandHandler("approve", self._forward_command))
         self._app.add_handler(CommandHandler("deny", self._forward_command))
+        self._app.add_handler(
+            CallbackQueryHandler(
+                self._on_session_callback,
+                pattern=rf"^{self._SESSION_CB_PREFIX}:",
+            )
+        )
 
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
@@ -199,7 +460,7 @@ class TelegramChannel(BaseChannel):
         updater = self._app.updater
         if updater is not None:
             await updater.start_polling(
-                allowed_updates=["message"],
+                allowed_updates=["message", "callback_query"],
                 drop_pending_updates=True,
             )
 

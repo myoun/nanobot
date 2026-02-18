@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
 
@@ -15,7 +16,8 @@ from nanobot.cli.commands import app
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.web import WebChannel
-from nanobot.config.schema import WebConfig
+from nanobot.channels.telegram import TelegramChannel
+from nanobot.config.schema import TelegramConfig, WebConfig
 from nanobot.session.manager import SessionManager
 
 runner = CliRunner()
@@ -351,3 +353,67 @@ def test_delete_last_session_creates_replacement(tmp_path: Path) -> None:
     snapshot = manager.list_conversation_sessions(conversation_key)
     assert len(snapshot["sessions"]) == 1
     assert snapshot["active_session_id"] != first_id
+
+
+@pytest.mark.asyncio
+async def test_telegram_sessions_callback_switch_and_panel(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="dummy-token"),
+        MessageBus(),
+        session_manager=manager,
+    )
+    conversation_key = "telegram:100"
+
+    _, first = manager.get_or_create_for_conversation(conversation_key)
+    first_id = str(first["id"])
+    second = manager.create_session(conversation_key, title="Second", switch_to=True)
+    second_id = str(second["id"])
+    assert second_id != first_id
+
+    class DummyReplyMessage:
+        def __init__(self, chat_id: int):
+            self.chat_id = chat_id
+            self.text = ""
+            self.reply_markup = None
+
+        async def reply_text(self, text: str, reply_markup: Any | None = None) -> None:
+            self.text = text
+            self.reply_markup = reply_markup
+
+    msg = DummyReplyMessage(chat_id=100)
+    update = SimpleNamespace(message=msg, effective_chat=SimpleNamespace(id=100))
+    await channel._on_sessions_command(cast(Any, update), cast(Any, SimpleNamespace()))
+    assert "Session switcher" in msg.text
+    assert msg.reply_markup is not None
+
+    class DummyQueryMessage:
+        def __init__(self, chat_id: int):
+            self.chat_id = chat_id
+            self.text = ""
+            self.reply_markup = None
+
+        async def edit_text(self, text: str, reply_markup: Any | None = None) -> None:
+            self.text = text
+            self.reply_markup = reply_markup
+
+    class DummyQuery:
+        def __init__(self, data: str, message: DummyQueryMessage):
+            self.data = data
+            self.message = message
+            self.answered = False
+
+        async def answer(self) -> None:
+            self.answered = True
+
+    query_message = DummyQueryMessage(chat_id=100)
+    query = DummyQuery(f"nbs:sw:{first_id}:0", query_message)
+    callback_update = SimpleNamespace(callback_query=query)
+    await channel._on_session_callback(
+        cast(Any, callback_update),
+        cast(Any, SimpleNamespace()),
+    )
+    snapshot = manager.list_conversation_sessions(conversation_key)
+    assert snapshot["active_session_id"] == first_id
+    assert query.answered is True
+    assert "Switched:" in query_message.text
