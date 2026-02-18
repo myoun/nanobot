@@ -68,6 +68,7 @@ packages = ["nanobot"]
 [tool.hatch.build]
 include = [
     "nanobot/**/*.py",
+    "nanobot/**/*.html",
     "nanobot/skills/**/*.md",
     "nanobot/skills/**/*.sh",
 ]

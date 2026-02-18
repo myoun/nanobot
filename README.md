@@ -139,6 +139,40 @@ Talk to your nanobot through Telegram, Discord, WhatsApp, Feishu, Mochat, DingTa
 | **Slack** | Medium (bot + app tokens) |
 | **Email** | Medium (IMAP/SMTP credentials) |
 | **QQ** | Easy (app credentials) |
+| **Web** | Easy (built-in browser UI) |
+
+<details>
+<summary><b>Web Chat (Built-in)</b></summary>
+
+Use the built-in browser UI served by the gateway.
+
+**1. Configure**
+
+```json
+{
+  "channels": {
+    "web": {
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 18790
+    }
+  }
+}
+```
+
+**2. Run gateway**
+
+```bash
+uv run nanobot gateway --port 18790
+```
+
+**3. Open in browser**
+
+```text
+http://127.0.0.1:18790/
+```
+
+</details>
 
 <details>
 <summary><b>Telegram</b> (Recommended)</summary>
