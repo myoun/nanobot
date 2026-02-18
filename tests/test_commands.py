@@ -363,12 +363,22 @@ def test_conversation_session_lifecycle(tmp_path: Path) -> None:
         conversation_key, first_id, "Initial planning", auto_title=False
     )
     assert renamed["title"] == "Initial planning"
+    assert renamed["title_source"] == "manual"
+    assert renamed["title_locked"] is True
+
+    attempt = manager.note_auto_title_attempt(
+        conversation_key,
+        first_id,
+        message_count=6,
+    )
+    assert attempt["title_auto_attempts"] >= 1
 
     snapshot = manager.list_conversation_sessions(conversation_key)
     first = next(item for item in snapshot["sessions"] if item["id"] == first_id)
     assert first["title"] == "Initial planning"
     assert first["auto_title"] is False
     assert first["pinned"] is True
+    assert first["title_auto_attempts"] >= 1
 
     deleted = manager.delete_session(conversation_key, second_id)
     assert deleted["deleted_session_id"] == second_id
@@ -392,6 +402,25 @@ def test_delete_last_session_creates_replacement(tmp_path: Path) -> None:
     snapshot = manager.list_conversation_sessions(conversation_key)
     assert len(snapshot["sessions"]) == 1
     assert snapshot["active_session_id"] != first_id
+
+
+def test_title_policy_fields_for_auto_rename(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    conversation_key = "web:title"
+
+    _, initial = manager.get_or_create_for_conversation(conversation_key)
+    sid = str(initial["id"])
+
+    renamed = manager.rename_session(
+        conversation_key,
+        sid,
+        "Auto Generated Title",
+        auto_title=False,
+        source="auto",
+        lock_title=False,
+    )
+    assert renamed["title_source"] == "auto"
+    assert renamed["title_locked"] is False
 
 
 @pytest.mark.asyncio

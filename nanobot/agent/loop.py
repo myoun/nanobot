@@ -99,6 +99,10 @@ class AgentLoop:
     _PREFILL_FILE_CANDIDATES = ("workspace/PREFILL.md", "PREFILL.md")
     _SESSION_TITLE_MAX_CHARS = 60
     _SESSION_TITLE_CONTEXT_MESSAGES = 6
+    _SESSION_TITLE_MIN_USER_MESSAGES = 2
+    _SESSION_TITLE_MIN_ASSISTANT_MESSAGES = 1
+    _SESSION_TITLE_RETRY_MESSAGE_GAP = 3
+    _SESSION_TITLE_MAX_AUTO_ATTEMPTS = 3
     _SESSION_DEFAULT_TITLE = "New chat"
     _NO_TOOL_FALLBACK = (
         "I couldn't make progress with tool execution or completion signaling. "
@@ -672,6 +676,27 @@ class AgentLoop:
         text = " ".join(text.split())
         return text[: cls._SESSION_TITLE_MAX_CHARS]
 
+    @classmethod
+    def _is_low_quality_generated_title(cls, title: str) -> bool:
+        normalized = " ".join((title or "").lower().split())
+        if not normalized:
+            return True
+        blocked = {
+            "new chat",
+            "chat",
+            "conversation",
+            "session",
+            "untitled",
+        }
+        if normalized in blocked:
+            return True
+        if len(normalized) < 4:
+            return True
+        words = normalized.split()
+        if len(words) == 1 and len(words[0]) < 8:
+            return True
+        return False
+
     async def _maybe_generate_session_title(
         self,
         *,
@@ -689,8 +714,16 @@ class AgentLoop:
             return None
         if not bool(target.get("auto_title", True)):
             return None
+        if bool(target.get("title_locked", False)):
+            return None
+
+        attempts = int(target.get("title_auto_attempts", 0) or 0)
+        if attempts >= self._SESSION_TITLE_MAX_AUTO_ATTEMPTS:
+            return None
 
         turns: list[dict[str, Any]] = []
+        user_count = 0
+        assistant_count = 0
         for msg in session.messages:
             role = str(msg.get("role") or "").strip()
             if role not in {"user", "assistant"}:
@@ -699,9 +732,25 @@ class AgentLoop:
             if not content:
                 continue
             turns.append({"role": role, "content": content})
+            if role == "user":
+                user_count += 1
+            elif role == "assistant":
+                assistant_count += 1
             if len(turns) >= self._SESSION_TITLE_CONTEXT_MESSAGES:
                 break
+        if user_count < self._SESSION_TITLE_MIN_USER_MESSAGES:
+            return None
+        if assistant_count < self._SESSION_TITLE_MIN_ASSISTANT_MESSAGES:
+            return None
         if len(turns) < 2:
+            return None
+
+        total_messages = user_count + assistant_count
+        last_attempt_at = int(target.get("title_last_auto_message_count", 0) or 0)
+        if (
+            last_attempt_at
+            and total_messages - last_attempt_at < self._SESSION_TITLE_RETRY_MESSAGE_GAP
+        ):
             return None
 
         transcript = "\n".join(f"{item['role'].upper()}: {item['content'][:280]}" for item in turns)
@@ -710,7 +759,8 @@ class AgentLoop:
                 "role": "system",
                 "content": (
                     "Generate a concise title for a chat session. "
-                    "Return only the title text, no quotes, max 8 words."
+                    "Return only the title text, no quotes, max 8 words. "
+                    "Focus on the user's goal and concrete topic."
                 ),
             },
             {
@@ -732,6 +782,9 @@ class AgentLoop:
             logger.debug(f"Session title generation skipped due to provider error: {e}")
             candidate = ""
 
+        if candidate and self._is_low_quality_generated_title(candidate):
+            candidate = ""
+
         if not candidate:
             fallback = next(
                 (
@@ -742,12 +795,24 @@ class AgentLoop:
                 "",
             )
             candidate = self._normalize_generated_title(fallback)
+            if candidate and self._is_low_quality_generated_title(candidate):
+                candidate = ""
 
         if not candidate:
+            self.sessions.note_auto_title_attempt(
+                conversation_key,
+                session_id,
+                message_count=total_messages,
+            )
             return None
 
         normalized_default = self._SESSION_DEFAULT_TITLE.lower()
         if candidate.lower() == normalized_default:
+            self.sessions.note_auto_title_attempt(
+                conversation_key,
+                session_id,
+                message_count=total_messages,
+            )
             return None
 
         self.sessions.rename_session(
@@ -755,6 +820,8 @@ class AgentLoop:
             session_id,
             candidate,
             auto_title=False,
+            source="auto",
+            lock_title=False,
         )
         session.metadata["title"] = candidate
         self.sessions.save(session)

@@ -189,6 +189,10 @@ class SessionManager:
             "updated_at": now,
             "auto_title": bool(auto_title),
             "pinned": False,
+            "title_source": "default" if auto_title else "manual",
+            "title_locked": not bool(auto_title),
+            "title_auto_attempts": 0,
+            "title_last_auto_message_count": 0,
         }
         sessions = entry.get("sessions")
         if not isinstance(sessions, list):
@@ -348,6 +352,9 @@ class SessionManager:
             "updated_at": meta.get("updated_at"),
             "auto_title": bool(meta.get("auto_title", True)),
             "pinned": bool(meta.get("pinned", False)),
+            "title_source": str(meta.get("title_source") or "default"),
+            "title_locked": bool(meta.get("title_locked", False)),
+            "title_auto_attempts": int(meta.get("title_auto_attempts", 0) or 0),
             "active": True,
         }
         return session, descriptor
@@ -372,6 +379,12 @@ class SessionManager:
                     "updated_at": item.get("updated_at"),
                     "auto_title": bool(item.get("auto_title", True)),
                     "pinned": bool(item.get("pinned", False)),
+                    "title_source": str(item.get("title_source") or "default"),
+                    "title_locked": bool(item.get("title_locked", False)),
+                    "title_auto_attempts": int(item.get("title_auto_attempts", 0) or 0),
+                    "title_last_auto_message_count": int(
+                        item.get("title_last_auto_message_count", 0) or 0
+                    ),
                     "active": sid == active_id,
                 }
             )
@@ -442,6 +455,9 @@ class SessionManager:
             "updated_at": meta.get("updated_at"),
             "auto_title": bool(meta.get("auto_title", True)),
             "pinned": bool(meta.get("pinned", False)),
+            "title_source": str(meta.get("title_source") or "default"),
+            "title_locked": bool(meta.get("title_locked", False)),
+            "title_auto_attempts": int(meta.get("title_auto_attempts", 0) or 0),
             "active": bool(switch_to),
         }
         return result
@@ -464,6 +480,9 @@ class SessionManager:
             "updated_at": meta.get("updated_at"),
             "auto_title": bool(meta.get("auto_title", True)),
             "pinned": bool(meta.get("pinned", False)),
+            "title_source": str(meta.get("title_source") or "default"),
+            "title_locked": bool(meta.get("title_locked", False)),
+            "title_auto_attempts": int(meta.get("title_auto_attempts", 0) or 0),
             "active": True,
         }
 
@@ -474,6 +493,8 @@ class SessionManager:
         new_title: str,
         *,
         auto_title: bool = False,
+        source: str | None = None,
+        lock_title: bool | None = None,
     ) -> dict[str, Any]:
         """Rename a session."""
         entry = self._ensure_conversation(conversation_key)
@@ -486,6 +507,11 @@ class SessionManager:
         normalized = self._normalize_title(new_title)
         meta["title"] = normalized
         meta["auto_title"] = bool(auto_title)
+        meta["title_source"] = source or ("auto" if auto_title else "manual")
+        if lock_title is None:
+            meta["title_locked"] = not bool(auto_title)
+        else:
+            meta["title_locked"] = bool(lock_title)
         meta["updated_at"] = self._iso_now()
         self._save_index(index)
 
@@ -502,6 +528,9 @@ class SessionManager:
             "updated_at": meta.get("updated_at"),
             "auto_title": bool(meta.get("auto_title", False)),
             "pinned": bool(meta.get("pinned", False)),
+            "title_source": str(meta.get("title_source") or "default"),
+            "title_locked": bool(meta.get("title_locked", False)),
+            "title_auto_attempts": int(meta.get("title_auto_attempts", 0) or 0),
             "active": str(entry.get("active_session_id", "")) == sid,
         }
 
@@ -531,6 +560,9 @@ class SessionManager:
             "updated_at": meta.get("updated_at"),
             "auto_title": bool(meta.get("auto_title", True)),
             "pinned": bool(meta.get("pinned", False)),
+            "title_source": str(meta.get("title_source") or "default"),
+            "title_locked": bool(meta.get("title_locked", False)),
+            "title_auto_attempts": int(meta.get("title_auto_attempts", 0) or 0),
             "active": str(entry.get("active_session_id", "")) == sid,
         }
 
@@ -558,6 +590,32 @@ class SessionManager:
             "active_session_id": snapshot.get("active_session_id"),
             "query": query,
             "sessions": filtered,
+        }
+
+    def note_auto_title_attempt(
+        self,
+        conversation_key: str,
+        session_id: str,
+        *,
+        message_count: int,
+    ) -> dict[str, Any]:
+        entry = self._ensure_conversation(conversation_key)
+        index = self._load_index()
+        sid = (session_id or "").strip()
+        meta = self._find_meta(entry, sid)
+        if meta is None:
+            raise KeyError(f"Session not found: {sid}")
+
+        attempts = int(meta.get("title_auto_attempts", 0) or 0) + 1
+        meta["title_auto_attempts"] = attempts
+        meta["title_last_auto_message_count"] = max(0, int(message_count))
+        meta["updated_at"] = self._iso_now()
+        self._save_index(index)
+
+        return {
+            "id": sid,
+            "title_auto_attempts": attempts,
+            "title_last_auto_message_count": int(meta["title_last_auto_message_count"]),
         }
 
     def delete_session(self, conversation_key: str, session_id: str) -> dict[str, Any]:
