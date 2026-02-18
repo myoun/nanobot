@@ -120,6 +120,7 @@ class AgentLoop:
         mcp_servers: dict | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
+
         self.bus = bus
         self.provider = provider
         self.workspace = workspace
@@ -147,7 +148,7 @@ class AgentLoop:
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
         )
-        
+
         self._running = False
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
@@ -179,7 +180,8 @@ class AgentLoop:
                     "Privileged execution is enabled in config but unsupported on non-Unix runtime; ignoring."
                 )
         self._register_default_tools()
-    
+        self._process_lock = asyncio.Lock()
+
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         # File tools (restrict to workspace if configured)
@@ -188,19 +190,22 @@ class AgentLoop:
         self.tools.register(WriteFileTool(allowed_dir=allowed_dir))
         self.tools.register(EditFileTool(allowed_dir=allowed_dir))
         self.tools.register(ListDirTool(allowed_dir=allowed_dir))
-        
+
         # Shell tool
-        self.tools.register(ExecTool(
-            working_dir=str(self.workspace),
-            timeout=self.exec_config.timeout,
-            restrict_to_workspace=self.restrict_to_workspace,
-            privileged_enabled=self.exec_config.privileged_enabled,
-            approval_store=self._approval_store,
-        ))
-        
+        self.tools.register(
+            ExecTool(
+                working_dir=str(self.workspace),
+                timeout=self.exec_config.timeout,
+                restrict_to_workspace=self.restrict_to_workspace,
+                privileged_enabled=self.exec_config.privileged_enabled,
+                approval_store=self._approval_store,
+            )
+        )
+
         # Web tools
         # OpenAI Codex provider has native web search via Responses API tools.
         from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+
         if not isinstance(self.provider, OpenAICodexProvider):
             self.tools.register(WebSearchTool(api_key=self.brave_api_key))
         self.tools.register(WebFetchTool())
@@ -209,25 +214,26 @@ class AgentLoop:
         # Progress-report tool (text updates to current chat)
         report_tool = ReportToUserTool(send_callback=self.bus.publish_outbound)
         self.tools.register(report_tool)
-        
+
         # Message tool
         message_tool = MessageTool(send_callback=self.bus.publish_outbound)
         self.tools.register(message_tool)
-        
+
         # Spawn tool (for subagents)
         spawn_tool = SpawnTool(manager=self.subagents)
         self.tools.register(spawn_tool)
-        
+
         # Cron tool (for scheduling)
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
-    
+
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
         if self._mcp_connected or not self._mcp_servers:
             return
         self._mcp_connected = True
         from nanobot.agent.tools.mcp import connect_mcp_servers
+
         self._mcp_stack = AsyncExitStack()
         await self._mcp_stack.__aenter__()
         await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
@@ -512,7 +518,7 @@ class AgentLoop:
 
     async def _classify_request_mode(self, session: Session, user_text: str) -> tuple[str, str]:
         recent_lines: list[str] = []
-        for msg in session.messages[-self._MODE_CLASSIFIER_MAX_HISTORY:]:
+        for msg in session.messages[-self._MODE_CLASSIFIER_MAX_HISTORY :]:
             role = str(msg.get("role") or "").upper()
             content = str(msg.get("content") or "").strip()
             if not content:
@@ -570,11 +576,17 @@ class AgentLoop:
             return mode_value, reason
         except Exception as e:
             previous = str(session.metadata.get("last_request_mode") or "").strip().upper()
-            fallback = previous if previous in {self._REQUEST_MODE_DO, self._REQUEST_MODE_CHAT} else self._REQUEST_MODE_CHAT
+            fallback = (
+                previous
+                if previous in {self._REQUEST_MODE_DO, self._REQUEST_MODE_CHAT}
+                else self._REQUEST_MODE_CHAT
+            )
             return fallback, f"classifier fallback ({type(e).__name__})"
 
     def _has_task_execution_tools(self) -> bool:
-        task_tools = [name for name in self.tools.tool_names if name not in self._NON_PROGRESS_TOOLS]
+        task_tools = [
+            name for name in self.tools.tool_names if name not in self._NON_PROGRESS_TOOLS
+        ]
         return bool(task_tools)
 
     @staticmethod
@@ -638,7 +650,9 @@ class AgentLoop:
         return [*messages, {"role": "assistant", "content": prefill_prompt}]
 
     @staticmethod
-    def _merge_outbound_metadata(base: dict[str, Any] | None, llm_metadata: dict[str, Any]) -> dict[str, Any]:
+    def _merge_outbound_metadata(
+        base: dict[str, Any] | None, llm_metadata: dict[str, Any]
+    ) -> dict[str, Any]:
         merged = dict(base or {})
         if not llm_metadata:
             return merged
@@ -712,15 +726,14 @@ class AgentLoop:
                     {
                         "id": tc.id,
                         "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)
-                        }
+                        "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
                     }
                     for tc in response.tool_calls
                 ]
                 messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
+                    messages,
+                    response.content,
+                    tool_call_dicts,
                     reasoning_content=response.reasoning_content,
                 )
 
@@ -755,9 +768,7 @@ class AgentLoop:
                         completion_requested = True
                         completion_payload = self._extract_completion_payload(tool_call.arguments)
                         completion_answer = (
-                            completion_payload["final_answer"]
-                            if completion_payload
-                            else None
+                            completion_payload["final_answer"] if completion_payload else None
                         )
                         completion_schema_ok = self._tool_result_success(tool_call.name, result)
                         if not completion_answer:
@@ -784,28 +795,45 @@ class AgentLoop:
                 if completion_answer:
                     if not completion_schema_ok:
                         logger.warning("complete_task rejected: invalid payload schema")
-                        messages.append({"role": "user", "content": self._ACTION_RETRY_REASON_INVALID_COMPLETE_PAYLOAD})
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": self._ACTION_RETRY_REASON_INVALID_COMPLETE_PAYLOAD,
+                            }
+                        )
                         continue
                     if do_mode and not self._completion_has_required_evidence(completion_payload):
-                        logger.warning("complete_task rejected: missing required evidence/actions in DO mode")
-                        messages.append({"role": "user", "content": self._ACTION_RETRY_REASON_MISSING_EVIDENCE})
+                        logger.warning(
+                            "complete_task rejected: missing required evidence/actions in DO mode"
+                        )
+                        messages.append(
+                            {"role": "user", "content": self._ACTION_RETRY_REASON_MISSING_EVIDENCE}
+                        )
                         continue
                     if do_mode and not (meaningful_tool_succeeded or has_external_progress):
-                        logger.warning("complete_task rejected: DO mode completion without verified external progress")
-                        messages.append({"role": "user", "content": self._ACTION_RETRY_REASON_NO_PROGRESS})
+                        logger.warning(
+                            "complete_task rejected: DO mode completion without verified external progress"
+                        )
+                        messages.append(
+                            {"role": "user", "content": self._ACTION_RETRY_REASON_NO_PROGRESS}
+                        )
                         continue
                     if external_tool_attempted and not meaningful_tool_attempted:
                         logger.warning(
                             "complete_task rejected: only report_to_user/non-meaningful tools observed"
                         )
-                        messages.append({"role": "user", "content": self._ACTION_RETRY_REASON_REPORT_ONLY})
+                        messages.append(
+                            {"role": "user", "content": self._ACTION_RETRY_REASON_REPORT_ONLY}
+                        )
                         continue
                     final_content = completion_answer
                     break
                 if completion_requested:
                     followup_nudge = self._COMPLETION_REJECT_NUDGE
                     if do_mode:
-                        followup_nudge += " In TASK_REQUEST mode include non-empty evidence/actions_taken."
+                        followup_nudge += (
+                            " In TASK_REQUEST mode include non-empty evidence/actions_taken."
+                        )
                     messages.append({"role": "user", "content": followup_nudge})
                 else:
                     continue_nudge = (
@@ -813,11 +841,15 @@ class AgentLoop:
                         "Call complete_task(final_answer=...) only when fully done."
                     )
                     if do_mode:
-                        continue_nudge += " Keep executing tools and gather concrete evidence before completion."
-                    messages.append({
-                        "role": "user",
-                        "content": continue_nudge,
-                    })
+                        continue_nudge += (
+                            " Keep executing tools and gather concrete evidence before completion."
+                        )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": continue_nudge,
+                        }
+                    )
             else:
                 assistant_text = (response.content or "").strip()
                 if assistant_text:
@@ -843,7 +875,9 @@ class AgentLoop:
                         logger.warning(
                             "Rejected text-only completion payload in DO mode; evidence-bearing complete_task required"
                         )
-                        messages.append({"role": "user", "content": self._ACTION_RETRY_REASON_MISSING_EVIDENCE})
+                        messages.append(
+                            {"role": "user", "content": self._ACTION_RETRY_REASON_MISSING_EVIDENCE}
+                        )
                     else:
                         logger.warning(
                             "Recovered final_answer from no-tool text payload; finalizing turn"
@@ -909,24 +943,24 @@ class AgentLoop:
 
         while self._running:
             try:
-                msg = await asyncio.wait_for(
-                    self.bus.consume_inbound(),
-                    timeout=1.0
-                )
+                msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
                 try:
-                    response = await self._process_message(msg)
+                    async with self._process_lock:
+                        response = await self._process_message(msg)
                     if response:
                         await self.bus.publish_outbound(response)
                 except Exception as e:
                     logger.error(f"Error processing message: {e}")
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content=f"Sorry, I encountered an error: {str(e)}"
-                    ))
+                    await self.bus.publish_outbound(
+                        OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content=f"Sorry, I encountered an error: {str(e)}",
+                        )
+                    )
             except asyncio.TimeoutError:
                 continue
-    
+
     async def close_mcp(self) -> None:
         """Close MCP connections."""
         if self._mcp_stack:
@@ -940,28 +974,30 @@ class AgentLoop:
         """Stop the agent loop."""
         self._running = False
         logger.info("Agent loop stopping")
-    
-    async def _process_message(self, msg: InboundMessage, session_key: str | None = None) -> OutboundMessage | None:
+
+    async def _process_message(
+        self, msg: InboundMessage, session_key: str | None = None
+    ) -> OutboundMessage | None:
         """
         Process a single inbound message.
-        
+
         Args:
             msg: The inbound message to process.
             session_key: Override session key (used by process_direct).
-        
+
         Returns:
             The response message, or None if no response needed.
         """
         # System messages route back via chat_id ("channel:chat_id")
         if msg.channel == "system":
             return await self._process_system_message(msg)
-        
+
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {preview}")
-        
+
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
-        
+
         # Handle slash commands
         cmd = msg.content.strip().lower()
         cmd_token = cmd.split()[0] if cmd else ""
@@ -979,29 +1015,33 @@ class AgentLoop:
                 await self._consolidate_memory(temp_session, archive_all=True)
 
             asyncio.create_task(_consolidate_and_cleanup())
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="New session started. Memory consolidation in progress.")
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="New session started. Memory consolidation in progress.",
+            )
         if cmd_name == "/help":
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content=(
-                                      "🐈 nanobot commands:\n"
-                                      "/new — Start a new conversation\n"
-                                      "/help — Show available commands\n"
-                                      "/approve — Approve pending privileged request\n"
-                                      "/deny — Deny pending privileged request"
-                                  ))
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    "🐈 nanobot commands:\n"
+                    "/new — Start a new conversation\n"
+                    "/help — Show available commands\n"
+                    "/approve — Approve pending privileged request\n"
+                    "/deny — Deny pending privileged request"
+                ),
+            )
         if cmd_name == "/approve":
             return await self._handle_privileged_approval(msg=msg, session=session, approve=True)
         if cmd_name == "/deny":
             return await self._handle_privileged_approval(msg=msg, session=session, approve=False)
-        
+
         if len(session.messages) > self.memory_window:
             asyncio.create_task(self._consolidate_memory(session))
 
         request_mode, mode_reason = await self._classify_request_mode(session, msg.content)
-        logger.info(
-            f"Request mode for {msg.channel}:{msg.chat_id}: {request_mode} ({mode_reason})"
-        )
+        logger.info(f"Request mode for {msg.channel}:{msg.chat_id}: {request_mode} ({mode_reason})")
         if request_mode == self._REQUEST_MODE_DO and not self._has_task_execution_tools():
             final_content = self._DO_MODE_NO_TOOL_RESPONSE
             session.add_message("user", msg.content)
@@ -1030,17 +1070,18 @@ class AgentLoop:
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
-        
+
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
-        
+
         session.add_message("user", msg.content)
-        session.add_message("assistant", final_content,
-                            tools_used=tools_used if tools_used else None)
+        session.add_message(
+            "assistant", final_content, tools_used=tools_used if tools_used else None
+        )
         session.metadata["last_request_mode"] = request_mode
         session.metadata["last_request_mode_reason"] = mode_reason
         self.sessions.save(session)
-        
+
         outbound_metadata = self._merge_outbound_metadata(msg.metadata, llm_metadata)
 
         return OutboundMessage(
@@ -1049,16 +1090,16 @@ class AgentLoop:
             content=final_content,
             metadata=outbound_metadata,  # Pass through for channels and include LLM traces.
         )
-    
+
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a system message (e.g., subagent announce).
-        
+
         The chat_id field contains "original_channel:original_chat_id" to route
         the response back to the correct destination.
         """
         logger.info(f"Processing system message from {msg.sender_id}")
-        
+
         # Parse origin from chat_id (format: "channel:chat_id")
         if ":" in msg.chat_id:
             parts = msg.chat_id.split(":", 1)
@@ -1068,7 +1109,7 @@ class AgentLoop:
             # Fallback
             origin_channel = "cli"
             origin_chat_id = msg.chat_id
-        
+
         session_key = f"{origin_channel}:{origin_chat_id}"
         session = self.sessions.get_or_create(session_key)
         self._set_tool_context(origin_channel, origin_chat_id, msg.sender_id)
@@ -1082,18 +1123,18 @@ class AgentLoop:
 
         if final_content is None:
             final_content = "Background task completed."
-        
+
         session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
         session.add_message("assistant", final_content)
         self.sessions.save(session)
-        
+
         return OutboundMessage(
             channel=origin_channel,
             chat_id=origin_chat_id,
             content=final_content,
             metadata=self._merge_outbound_metadata(msg.metadata, llm_metadata),
         )
-    
+
     async def _consolidate_memory(self, session, archive_all: bool = False) -> None:
         """Consolidate old messages into MEMORY.md + HISTORY.md.
 
@@ -1106,29 +1147,39 @@ class AgentLoop:
         if archive_all:
             old_messages = session.messages
             keep_count = 0
-            logger.info(f"Memory consolidation (archive_all): {len(session.messages)} total messages archived")
+            logger.info(
+                f"Memory consolidation (archive_all): {len(session.messages)} total messages archived"
+            )
         else:
             keep_count = self.memory_window // 2
             if len(session.messages) <= keep_count:
-                logger.debug(f"Session {session.key}: No consolidation needed (messages={len(session.messages)}, keep={keep_count})")
+                logger.debug(
+                    f"Session {session.key}: No consolidation needed (messages={len(session.messages)}, keep={keep_count})"
+                )
                 return
 
             messages_to_process = len(session.messages) - session.last_consolidated
             if messages_to_process <= 0:
-                logger.debug(f"Session {session.key}: No new messages to consolidate (last_consolidated={session.last_consolidated}, total={len(session.messages)})")
+                logger.debug(
+                    f"Session {session.key}: No new messages to consolidate (last_consolidated={session.last_consolidated}, total={len(session.messages)})"
+                )
                 return
 
-            old_messages = session.messages[session.last_consolidated:-keep_count]
+            old_messages = session.messages[session.last_consolidated : -keep_count]
             if not old_messages:
                 return
-            logger.info(f"Memory consolidation started: {len(session.messages)} total, {len(old_messages)} new to consolidate, {keep_count} keep")
+            logger.info(
+                f"Memory consolidation started: {len(session.messages)} total, {len(old_messages)} new to consolidate, {keep_count} keep"
+            )
 
         lines = []
         for m in old_messages:
             if not m.get("content"):
                 continue
             tools = f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
-            lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
+            lines.append(
+                f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}"
+            )
         conversation = "\n".join(lines)
         current_memory = memory.read_long_term()
 
@@ -1149,7 +1200,10 @@ Respond with ONLY valid JSON, no markdown fences."""
         try:
             response = await self.provider.chat(
                 messages=[
-                    {"role": "system", "content": "You are a memory consolidation agent. Respond only with valid JSON."},
+                    {
+                        "role": "system",
+                        "content": "You are a memory consolidation agent. Respond only with valid JSON.",
+                    },
                     {"role": "user", "content": prompt},
                 ],
                 model=self.model,
@@ -1162,7 +1216,9 @@ Respond with ONLY valid JSON, no markdown fences."""
                 text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
             result = json_repair.loads(text)
             if not isinstance(result, dict):
-                logger.warning(f"Memory consolidation: unexpected response type, skipping. Response: {text[:200]}")
+                logger.warning(
+                    f"Memory consolidation: unexpected response type, skipping. Response: {text[:200]}"
+                )
                 return
 
             if entry := result.get("history_entry"):
@@ -1175,7 +1231,9 @@ Respond with ONLY valid JSON, no markdown fences."""
                 session.last_consolidated = 0
             else:
                 session.last_consolidated = len(session.messages) - keep_count
-            logger.info(f"Memory consolidation done: {len(session.messages)} messages, last_consolidated={session.last_consolidated}")
+            logger.info(
+                f"Memory consolidation done: {len(session.messages)} messages, last_consolidated={session.last_consolidated}"
+            )
         except Exception as e:
             logger.error(f"Memory consolidation failed: {e}")
 
@@ -1188,13 +1246,13 @@ Respond with ONLY valid JSON, no markdown fences."""
     ) -> str:
         """
         Process a message directly (for CLI or cron usage).
-        
+
         Args:
             content: The message content.
             session_key: Session identifier (overrides channel:chat_id for session lookup).
             channel: Source channel (for tool context routing).
             chat_id: Source chat ID (for tool context routing).
-        
+
         Returns:
             The agent's response.
         """
@@ -1215,10 +1273,6 @@ Respond with ONLY valid JSON, no markdown fences."""
     ) -> OutboundMessage | None:
         """Process a message directly and return the full outbound payload."""
         await self._connect_mcp()
-        msg = InboundMessage(
-            channel=channel,
-            sender_id="user",
-            chat_id=chat_id,
-            content=content
-        )
-        return await self._process_message(msg, session_key=session_key)
+        msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
+        async with self._process_lock:
+            return await self._process_message(msg, session_key=session_key)

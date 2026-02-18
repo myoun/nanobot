@@ -157,6 +157,40 @@ Connect nanobot to your favorite chat platform.
 | **Slack** | Bot token + App-Level token |
 | **Email** | IMAP/SMTP credentials |
 | **QQ** | App ID + App Secret |
+| **Web** | Built-in browser UI (enable `channels.web`) |
+
+<details>
+<summary><b>Web Chat (Built-in)</b></summary>
+
+Use the built-in browser UI served by the gateway.
+
+**1. Configure**
+
+```json
+{
+  "channels": {
+    "web": {
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 18790
+    }
+  }
+}
+```
+
+**2. Run gateway**
+
+```bash
+uv run nanobot gateway --port 18790
+```
+
+**3. Open in browser**
+
+```text
+http://127.0.0.1:18790/
+```
+
+</details>
 
 <details>
 <summary><b>Telegram</b> (Recommended)</summary>

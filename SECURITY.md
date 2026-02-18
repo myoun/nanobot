@@ -99,6 +99,11 @@ File operations have path traversal protection, but:
 - Set `bridgeToken` in config to enable shared-secret authentication between Python and Node.js
 - Keep authentication data in `~/.nanobot/whatsapp-auth` secure (mode 0700)
 
+**Web Channel:**
+- Built-in web chat should stay on localhost (`host: 127.0.0.1`) by default.
+- If you expose beyond localhost, require both `channels.web.token` and a strict `channels.web.allowOrigins` list.
+- For internet-facing deployments, run behind a reverse proxy that terminates TLS.
+
 ### 6. Dependency Security
 
 **Critical**: Keep dependencies updated!
@@ -180,6 +185,7 @@ For production use:
 - Enable audit logging
 - Regular security reviews
 - Monitor for unusual activity
+- Keep web chat bound to localhost unless you have explicit network controls and origin restrictions
 
 ### 9. Data Privacy
 

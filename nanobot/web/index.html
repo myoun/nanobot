@@ -1,0 +1,744 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nanobot web</title>
+  <style>
+    :root {
+      --bg0: #f3f6f8;
+      --bg1: #e9f2f7;
+      --surface: #ffffff;
+      --ink: #1b2a35;
+      --muted: #5f7281;
+      --line: #d9e2e8;
+      --accent: #0f8fb8;
+      --accent-2: #0b6e8d;
+      --ok: #18a55a;
+      --warn: #d68c00;
+      --err: #c43838;
+      --radius: 14px;
+      --shadow: 0 16px 40px rgba(9, 41, 66, 0.10);
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: radial-gradient(circle at 20% -20%, #d7ecf8, transparent 45%), linear-gradient(160deg, var(--bg0), var(--bg1));
+      font-family: Georgia, "Times New Roman", serif;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+    }
+    .shell {
+      width: min(980px, 100%);
+      height: min(90vh, 860px);
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: calc(var(--radius) + 6px);
+      box-shadow: var(--shadow);
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      overflow: hidden;
+    }
+    .top {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, #fcfeff, #f8fbfd);
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+    .brand h1 {
+      margin: 0;
+      font-size: 20px;
+      letter-spacing: 0.2px;
+    }
+    .conn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--muted);
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+      font-size: 13px;
+    }
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      background: var(--warn);
+      box-shadow: 0 0 0 2px rgba(214, 140, 0, 0.2);
+    }
+    .dot.ok {
+      background: var(--ok);
+      box-shadow: 0 0 0 2px rgba(24, 165, 90, 0.2);
+    }
+    .meta {
+      color: var(--muted);
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: end;
+    }
+    button {
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--ink);
+      border-radius: 10px;
+      padding: 8px 10px;
+      font-size: 13px;
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+      cursor: pointer;
+    }
+    button:hover { border-color: #bacad4; }
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    button.primary:hover { background: var(--accent-2); border-color: var(--accent-2); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .messages {
+      overflow: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      background: linear-gradient(180deg, #fcfdff, #f9fbfc);
+    }
+    .msg {
+      max-width: min(85ch, 92%);
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: #fff;
+      white-space: pre-wrap;
+      line-height: 1.44;
+      font-size: 15px;
+      animation: appear 180ms ease-out;
+    }
+    .msg p { margin: 0; }
+    .msg p + p { margin-top: 0.6em; }
+    .msg h1, .msg h2, .msg h3, .msg h4, .msg h5, .msg h6 {
+      margin: 0 0 0.5em;
+      line-height: 1.25;
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+    }
+    .msg h1 { font-size: 1.35em; }
+    .msg h2 { font-size: 1.2em; }
+    .msg h3 { font-size: 1.08em; }
+    .msg ul, .msg ol { margin: 0.5em 0 0.5em 1.2em; padding: 0; }
+    .msg li + li { margin-top: 0.24em; }
+    .msg blockquote {
+      margin: 0.5em 0;
+      padding: 0.2em 0.8em;
+      border-left: 3px solid #b8c9d4;
+      color: #3f5565;
+      background: #f6fafc;
+    }
+    .msg pre {
+      margin: 0.6em 0;
+      padding: 10px;
+      overflow: auto;
+      border-radius: 8px;
+      background: #0f1b22;
+      color: #e5f4ff;
+      border: 1px solid #223543;
+      white-space: pre;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .msg code {
+      padding: 0.08em 0.35em;
+      border-radius: 6px;
+      background: #edf3f7;
+      border: 1px solid #d5e1e8;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 0.9em;
+    }
+    .msg pre code {
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: inherit;
+      font-size: inherit;
+    }
+    .msg hr {
+      border: 0;
+      border-top: 1px solid var(--line);
+      margin: 0.8em 0;
+    }
+    .msg a {
+      color: var(--accent-2);
+      text-decoration: underline;
+      text-underline-offset: 2px;
+      overflow-wrap: anywhere;
+    }
+    .msg[data-role="user"] {
+      margin-left: auto;
+      background: #eef8ff;
+      border-color: #cfe8f7;
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+    }
+    .msg[data-role="assistant"] {
+      margin-right: auto;
+    }
+    .msg[data-role="progress"] {
+      margin-right: auto;
+      background: #fffaf0;
+      border-color: #f1dfb2;
+      color: #6c4b00;
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+      font-size: 13px;
+    }
+    .msg[data-role="error"] {
+      margin-right: auto;
+      background: #fff3f3;
+      border-color: #f2c7c7;
+      color: #8c2424;
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+      font-size: 13px;
+    }
+    .composer {
+      border-top: 1px solid var(--line);
+      padding: 12px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      background: #ffffff;
+    }
+    textarea {
+      width: 100%;
+      min-height: 64px;
+      max-height: 220px;
+      resize: vertical;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+      font: 15px/1.4 Georgia, "Times New Roman", serif;
+      color: var(--ink);
+      background: #fff;
+    }
+    textarea:focus {
+      outline: none;
+      border-color: #9ec8dd;
+      box-shadow: 0 0 0 3px rgba(15, 143, 184, 0.12);
+    }
+    .hint {
+      grid-column: 1 / -1;
+      color: var(--muted);
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+      font-size: 12px;
+      min-height: 18px;
+    }
+    @keyframes appear {
+      from { opacity: 0; transform: translateY(4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @media (max-width: 720px) {
+      .shell { height: 95vh; }
+      .top { grid-template-columns: 1fr; }
+      .actions { justify-content: start; }
+      .msg { max-width: 100%; }
+      .composer { grid-template-columns: 1fr; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .msg { animation: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="top">
+      <div class="brand">
+        <h1>nanobot web</h1>
+        <div class="conn"><span id="conn-dot" class="dot"></span><span id="conn-text">connecting</span></div>
+        <div class="meta">session: <span id="sid-text">-</span></div>
+      </div>
+      <div class="actions">
+        <button id="new-chat-btn" type="button">New Chat</button>
+        <button id="reconnect-btn" type="button">Reconnect</button>
+      </div>
+    </div>
+
+    <div id="messages" class="messages" aria-live="polite"></div>
+
+    <div class="composer">
+      <textarea id="composer" placeholder="Send a message to nanobot"></textarea>
+      <button id="send-btn" class="primary" type="button">Send</button>
+      <div id="hint" class="hint"></div>
+    </div>
+  </div>
+
+  <script>
+    const store = window.localStorage;
+    const els = {
+      messages: document.getElementById("messages"),
+      composer: document.getElementById("composer"),
+      sendBtn: document.getElementById("send-btn"),
+      hint: document.getElementById("hint"),
+      connDot: document.getElementById("conn-dot"),
+      connText: document.getElementById("conn-text"),
+      sidText: document.getElementById("sid-text"),
+      newChatBtn: document.getElementById("new-chat-btn"),
+      reconnectBtn: document.getElementById("reconnect-btn")
+    };
+
+    const MAX_MESSAGES = 200;
+    let ws = null;
+    let reconnectTimer = null;
+    let reconnectAttempt = 0;
+    let manuallyClosed = false;
+    let busy = false;
+    let progressNode = null;
+
+    function bootstrapTokenFromUrl() {
+      const url = new URL(window.location.href);
+      const token = (url.searchParams.get("token") || "").trim();
+      if (!token) {
+        return;
+      }
+      store.setItem("nanobot_token", token);
+      url.searchParams.delete("token");
+      window.history.replaceState({}, "", url.pathname + (url.search || "") + (url.hash || ""));
+    }
+
+    function sid() {
+      let value = store.getItem("nanobot_sid");
+      if (!value) {
+        value = Math.random().toString(36).slice(2, 14);
+        store.setItem("nanobot_sid", value);
+      }
+      return value;
+    }
+
+    function setConn(connected, text) {
+      els.connText.textContent = text;
+      els.connDot.classList.toggle("ok", connected);
+      updateSendState();
+    }
+
+    function nearBottom() {
+      const m = els.messages;
+      return m.scrollHeight - m.scrollTop - m.clientHeight < 80;
+    }
+
+    function pushMessage(role, text) {
+      const autoscroll = nearBottom();
+      const node = document.createElement("div");
+      node.className = "msg";
+      node.dataset.role = role;
+      setMessageContent(node, role, text);
+      els.messages.appendChild(node);
+      while (els.messages.children.length > MAX_MESSAGES) {
+        els.messages.removeChild(els.messages.firstChild);
+      }
+      if (autoscroll) {
+        els.messages.scrollTop = els.messages.scrollHeight;
+      }
+      return node;
+    }
+
+    function showProgress(text) {
+      if (!progressNode || !progressNode.isConnected) {
+        progressNode = pushMessage("progress", text);
+      } else {
+        progressNode.textContent = text;
+      }
+    }
+
+    function clearProgress() {
+      progressNode = null;
+    }
+
+    function hint(text) {
+      els.hint.textContent = text || "";
+    }
+
+    function escapeHtml(value) {
+      return String(value || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/\"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function escapeAttribute(value) {
+      return String(value || "")
+        .replace(/&/g, "&amp;")
+        .replace(/\"/g, "&quot;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+
+    function sanitizeUrl(raw) {
+      const input = String(raw || "").trim();
+      if (!input) {
+        return "";
+      }
+      try {
+        const parsed = new URL(input, window.location.origin);
+        const protocol = parsed.protocol.toLowerCase();
+        if (protocol === "http:" || protocol === "https:") {
+          return parsed.toString();
+        }
+      } catch {}
+      return "";
+    }
+
+    function renderInlineMarkdown(raw) {
+      let text = escapeHtml(raw);
+      const codeTokens = [];
+      text = text.replace(/`([^`\n]+)`/g, (_m, code) => {
+        const token = `@@NBCT${codeTokens.length}@@`;
+        codeTokens.push(`<code>${code}</code>`);
+        return token;
+      });
+
+      text = text.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_m, label, href) => {
+        const safe = sanitizeUrl(href);
+        if (!safe) {
+          return `${label} (${href})`;
+        }
+        return `<a href="${escapeAttribute(safe)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+      });
+
+      text = text
+        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+        .replace(/~~([^~]+)~~/g, "<del>$1</del>")
+        .replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, "$1<em>$2</em>")
+        .replace(/(^|[^_])_([^_]+)_(?!_)/g, "$1<em>$2</em>");
+
+      text = text.replace(/@@NBCT(\d+)@@/g, (m, idx) => {
+        const replacement = codeTokens[Number(idx)];
+        return replacement === undefined ? m : replacement;
+      });
+      return text;
+    }
+
+    function markdownToHtml(raw) {
+      const lines = String(raw || "").replace(/\r\n?/g, "\n").split("\n");
+      const blocks = [];
+      let paragraph = [];
+      let listType = "";
+      let listItems = [];
+      let inCode = false;
+      let codeLines = [];
+
+      function flushParagraph() {
+        if (!paragraph.length) {
+          return;
+        }
+        const body = paragraph.map(renderInlineMarkdown).join("<br>");
+        blocks.push(`<p>${body}</p>`);
+        paragraph = [];
+      }
+
+      function flushList() {
+        if (!listItems.length) {
+          return;
+        }
+        const tag = listType === "ol" ? "ol" : "ul";
+        const body = listItems.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("");
+        blocks.push(`<${tag}>${body}</${tag}>`);
+        listItems = [];
+        listType = "";
+      }
+
+      function flushCode() {
+        if (!inCode) {
+          return;
+        }
+        blocks.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+        codeLines = [];
+        inCode = false;
+      }
+
+      for (const line of lines) {
+        const fence = line.match(/^```[a-zA-Z0-9_-]*\s*$/);
+        if (fence) {
+          flushParagraph();
+          flushList();
+          if (inCode) {
+            flushCode();
+          } else {
+            inCode = true;
+            codeLines = [];
+          }
+          continue;
+        }
+
+        if (inCode) {
+          codeLines.push(line);
+          continue;
+        }
+
+        if (!line.trim()) {
+          flushParagraph();
+          flushList();
+          continue;
+        }
+
+        if (/^(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line.trim())) {
+          flushParagraph();
+          flushList();
+          blocks.push("<hr>");
+          continue;
+        }
+
+        const heading = line.match(/^(#{1,6})\s+(.*)$/);
+        if (heading) {
+          flushParagraph();
+          flushList();
+          const level = heading[1].length;
+          blocks.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
+          continue;
+        }
+
+        const quote = line.match(/^>\s?(.*)$/);
+        if (quote) {
+          flushParagraph();
+          flushList();
+          blocks.push(`<blockquote>${renderInlineMarkdown(quote[1])}</blockquote>`);
+          continue;
+        }
+
+        const ordered = line.match(/^\d+\.\s+(.*)$/);
+        if (ordered) {
+          flushParagraph();
+          if (listType && listType !== "ol") {
+            flushList();
+          }
+          listType = "ol";
+          listItems.push(ordered[1]);
+          continue;
+        }
+
+        const unordered = line.match(/^[-*+]\s+(.*)$/);
+        if (unordered) {
+          flushParagraph();
+          if (listType && listType !== "ul") {
+            flushList();
+          }
+          listType = "ul";
+          listItems.push(unordered[1]);
+          continue;
+        }
+
+        if (listItems.length) {
+          flushList();
+        }
+        paragraph.push(line);
+      }
+
+      flushCode();
+      flushParagraph();
+      flushList();
+
+      if (!blocks.length) {
+        return `<p>${renderInlineMarkdown(String(raw || ""))}</p>`;
+      }
+      return blocks.join("");
+    }
+
+    function setMessageContent(node, role, text) {
+      const value = String(text || "");
+      if (role === "assistant") {
+        node.innerHTML = markdownToHtml(value);
+        return;
+      }
+      node.textContent = value;
+    }
+
+    function wsUrl() {
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const token = store.getItem("nanobot_token") || "";
+      const q = new URLSearchParams({ sid: sid() });
+      if (token) {
+        q.set("token", token);
+      }
+      return `${proto}//${window.location.host}/ws?${q.toString()}`;
+    }
+
+    function scheduleReconnect() {
+      if (manuallyClosed) {
+        return;
+      }
+      const delays = [500, 1000, 2000, 5000, 10000];
+      const delay = delays[Math.min(reconnectAttempt, delays.length - 1)];
+      reconnectAttempt += 1;
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connect, delay);
+      hint(`reconnecting in ${Math.round(delay / 1000)}s`);
+    }
+
+    function updateSendState() {
+      const connected = ws && ws.readyState === WebSocket.OPEN;
+      const text = els.composer.value.trim();
+      els.sendBtn.disabled = !connected || !text || busy;
+    }
+
+    function reconnectNow(resetSession) {
+      manuallyClosed = true;
+      clearTimeout(reconnectTimer);
+      const previous = ws;
+      ws = null;
+      if (resetSession) {
+        store.removeItem("nanobot_sid");
+      }
+      if (previous) {
+        try {
+          previous.close();
+        } catch {}
+      }
+      busy = false;
+      connect();
+    }
+
+    function connect() {
+      const s = sid();
+      els.sidText.textContent = s;
+      manuallyClosed = false;
+      setConn(false, "connecting");
+      let socket = null;
+      try {
+        socket = new WebSocket(wsUrl());
+      } catch (err) {
+        hint("failed to create websocket");
+        scheduleReconnect();
+        return;
+      }
+      ws = socket;
+
+      socket.onopen = () => {
+        if (ws !== socket) {
+          return;
+        }
+        reconnectAttempt = 0;
+        hint("");
+        setConn(true, "connected");
+      };
+
+      socket.onclose = () => {
+        if (ws !== socket) {
+          return;
+        }
+        ws = null;
+        setConn(false, "disconnected");
+        busy = false;
+        updateSendState();
+        scheduleReconnect();
+      };
+
+      socket.onerror = () => {
+        if (ws !== socket) {
+          return;
+        }
+        hint("connection error");
+      };
+
+      socket.onmessage = (ev) => {
+        if (ws !== socket) {
+          return;
+        }
+        let payload = null;
+        try {
+          payload = JSON.parse(ev.data);
+        } catch {
+          pushMessage("error", "received invalid server payload");
+          return;
+        }
+        const type = String(payload.type || "");
+        if (type === "hello") {
+          if (payload.sid) {
+            store.setItem("nanobot_sid", String(payload.sid));
+            els.sidText.textContent = String(payload.sid);
+          }
+          return;
+        }
+        if (type === "progress_update") {
+          showProgress(payload.text || "working");
+          return;
+        }
+        if (type === "assistant_message") {
+          clearProgress();
+          pushMessage("assistant", payload.text || "");
+          busy = false;
+          updateSendState();
+          hint("");
+          return;
+        }
+        if (type === "error") {
+          if (payload.code === "busy") {
+            hint("agent is still working on your previous message");
+          } else {
+            hint(payload.text || "request failed");
+          }
+          pushMessage("error", payload.text || payload.code || "error");
+          busy = false;
+          updateSendState();
+          return;
+        }
+      };
+    }
+
+    function send() {
+      const text = els.composer.value.trim();
+      if (!text) {
+        return;
+      }
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        hint("not connected");
+        return;
+      }
+      ws.send(JSON.stringify({ type: "user_message", text }));
+      pushMessage("user", text);
+      els.composer.value = "";
+      busy = true;
+      hint("waiting for response...");
+      updateSendState();
+      els.composer.focus();
+    }
+
+    els.sendBtn.addEventListener("click", send);
+    els.composer.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" && !ev.shiftKey) {
+        ev.preventDefault();
+        send();
+      }
+    });
+    els.composer.addEventListener("input", updateSendState);
+
+    els.reconnectBtn.addEventListener("click", () => {
+      reconnectNow(false);
+    });
+
+    els.newChatBtn.addEventListener("click", () => {
+      els.messages.innerHTML = "";
+      clearProgress();
+      reconnectNow(true);
+    });
+
+    bootstrapTokenFromUrl();
+    connect();
+    updateSendState();
+  </script>
+</body>
+</html>
