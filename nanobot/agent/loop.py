@@ -277,7 +277,12 @@ class AgentLoop:
                 split = self.sessions.split_composed_key(session_key) if session_key else None
                 if split is not None:
                     origin_session_id = split[1]
-                spawn_tool.set_context(channel, chat_id, session_id=origin_session_id)
+                spawn_tool.set_context(
+                    channel,
+                    chat_id,
+                    session_id=origin_session_id,
+                    session_key=session_key,
+                )
 
         if cron_tool := self.tools.get("cron"):
             if isinstance(cron_tool, CronTool):
@@ -320,6 +325,35 @@ class AgentLoop:
             sid = nanobot_block.get("session_id")
             if isinstance(sid, str) and sid.strip():
                 return sid.strip()
+
+        return None
+
+    @staticmethod
+    def _extract_requested_session_key(metadata: dict[str, Any] | None) -> str | None:
+        if not isinstance(metadata, dict):
+            return None
+
+        direct = metadata.get("session_key")
+        if isinstance(direct, str) and direct.strip():
+            return direct.strip()
+
+        session_block = metadata.get("session")
+        if isinstance(session_block, dict):
+            key = session_block.get("key")
+            if isinstance(key, str) and key.strip():
+                return key.strip()
+
+        web_block = metadata.get("web")
+        if isinstance(web_block, dict):
+            key = web_block.get("session_key")
+            if isinstance(key, str) and key.strip():
+                return key.strip()
+
+        nanobot_block = metadata.get("_nanobot")
+        if isinstance(nanobot_block, dict):
+            key = nanobot_block.get("session_key")
+            if isinstance(key, str) and key.strip():
+                return key.strip()
 
         return None
 
@@ -1905,17 +1939,33 @@ class AgentLoop:
             origin_chat_id = msg.chat_id
 
         conversation_key = self._conversation_key(origin_channel, origin_chat_id)
-        requested_session_id = self._extract_requested_session_id(msg.metadata)
-        try:
-            session, descriptor = self.sessions.get_or_create_for_conversation(
-                conversation_key,
-                requested_session_id=requested_session_id,
-            )
-        except KeyError:
-            logger.warning(
-                "System callback referenced unknown session id; falling back to active session"
-            )
-            session, descriptor = self.sessions.get_or_create_for_conversation(conversation_key)
+        requested_session_key = self._extract_requested_session_key(msg.metadata)
+        if requested_session_key:
+            split = self.sessions.split_composed_key(requested_session_key)
+            if split is not None and split[0] != conversation_key:
+                logger.warning(
+                    "System callback session key conversation mismatch; falling back to active session"
+                )
+                requested_session_key = None
+
+        if requested_session_key:
+            session = self.sessions.get_or_create(requested_session_key)
+            descriptor: dict[str, Any] = {"id": "", "key": requested_session_key}
+            split = self.sessions.split_composed_key(requested_session_key)
+            if split is not None:
+                descriptor["id"] = split[1]
+        else:
+            requested_session_id = self._extract_requested_session_id(msg.metadata)
+            try:
+                session, descriptor = self.sessions.get_or_create_for_conversation(
+                    conversation_key,
+                    requested_session_id=requested_session_id,
+                )
+            except KeyError:
+                logger.warning(
+                    "System callback referenced unknown session id; falling back to active session"
+                )
+                session, descriptor = self.sessions.get_or_create_for_conversation(conversation_key)
         self._set_tool_context(
             origin_channel,
             origin_chat_id,

@@ -5,7 +5,7 @@ import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -312,6 +312,91 @@ async def test_fixed_session_switch_command_is_blocked(tmp_path: Path) -> None:
 
     after = loop.sessions.list_conversation_sessions(conversation_key)
     assert after["active_session_id"] == before["active_session_id"]
+
+
+@pytest.mark.asyncio
+async def test_system_callback_with_fixed_session_key_stays_in_fixed_session(
+    tmp_path: Path,
+) -> None:
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=_NoopProvider(),
+        workspace=tmp_path,
+    )
+    loop._run_agent_loop = AsyncMock(return_value=("callback summary", [], {}))
+
+    fixed_key = "cli:direct"
+    fixed_session = loop.sessions.get_or_create(fixed_key)
+    fixed_session.add_message("user", "prior")
+    loop.sessions.save(fixed_session)
+
+    conversation_key = "cli:direct"
+    _, descriptor = loop.sessions.get_or_create_for_conversation(conversation_key)
+    conversation_session_key = str(descriptor.get("key") or "")
+    conversation_session = loop.sessions.get_or_create(conversation_session_key)
+    conversation_session.add_message("assistant", "conversation marker")
+    loop.sessions.save(conversation_session)
+
+    response = await loop._process_message(
+        InboundMessage(
+            channel="system",
+            sender_id="subagent",
+            chat_id="cli:direct",
+            content="subagent payload",
+            metadata={"session_key": fixed_key},
+        )
+    )
+
+    assert response is not None
+    assert response.channel == "cli"
+    assert response.chat_id == "direct"
+    assert response.content == "callback summary"
+
+    fixed_after = loop.sessions.get_or_create(fixed_key)
+    assert any(
+        msg.get("role") == "user" and "[System: subagent]" in str(msg.get("content") or "")
+        for msg in fixed_after.messages
+    )
+    assert any(
+        msg.get("role") == "assistant" and msg.get("content") == "callback summary"
+        for msg in fixed_after.messages
+    )
+
+    conversation_after = loop.sessions.get_or_create(conversation_session_key)
+    assert any(msg.get("content") == "conversation marker" for msg in conversation_after.messages)
+    assert not any(
+        msg.get("role") == "user" and "[System: subagent]" in str(msg.get("content") or "")
+        for msg in conversation_after.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_fixed_tool_context_passes_session_key_to_spawn_manager(tmp_path: Path) -> None:
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=_NoopProvider(),
+        workspace=tmp_path,
+    )
+    loop.subagents.spawn = AsyncMock(return_value="started")
+
+    loop._set_tool_context(
+        channel="cli",
+        chat_id="direct",
+        sender_id="user",
+        session_key="cli:direct",
+    )
+
+    spawn_tool = loop.tools.get("spawn")
+    assert spawn_tool is not None
+    result = await spawn_tool.execute(task="test")
+    assert result == "started"
+
+    loop.subagents.spawn.assert_awaited_once()
+    await_args = loop.subagents.spawn.await_args
+    assert await_args is not None
+    kwargs = await_args.kwargs
+    assert kwargs["origin_session_key"] == "cli:direct"
+    assert kwargs["origin_session_id"] == ""
 
 
 @pytest.mark.asyncio
