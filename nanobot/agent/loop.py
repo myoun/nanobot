@@ -1331,9 +1331,13 @@ Respond with ONLY valid JSON, no markdown fences."""
         """Process a message directly and return the full outbound payload."""
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
+
+        async def _noop_progress(_: str) -> None:
+            return
+
         async with self._process_lock:
             return await self._process_message(
                 msg,
                 session_key=session_key,
-                on_progress=on_progress,
+                on_progress=on_progress if on_progress is not None else _noop_progress,
             )
