@@ -245,8 +245,19 @@ class WebChannel(BaseChannel):
                     await self._send_error(websocket, sid, ERR_RATE_LIMIT, "rate limit exceeded")
                     continue
 
-                self._pending.add(sid)
                 selected_session_id = coerce_text(data.get(KEY_SESSION_ID))
+                if selected_session_id and self._session_manager is not None:
+                    conversation_key = self._conversation_key_for_sid(sid)
+                    snapshot = self._session_manager.list_conversation_sessions(conversation_key)
+                    known_session = any(
+                        isinstance(item, dict) and str(item.get("id") or "") == selected_session_id
+                        for item in snapshot.get("sessions", [])
+                    )
+                    if not known_session:
+                        await self._send_error(websocket, sid, ERR_BAD_MESSAGE, "unknown session")
+                        continue
+
+                self._pending.add(sid)
                 metadata: dict[str, Any] = {"web": {"sid": sid}}
                 if selected_session_id:
                     metadata["web"]["session_id"] = selected_session_id

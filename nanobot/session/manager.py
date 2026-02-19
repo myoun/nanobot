@@ -305,14 +305,7 @@ class SessionManager:
         target_id = self._normalize_session_id(requested_session_id)
         if target_id:
             if self._find_meta(entry, target_id) is None:
-                self._append_meta(
-                    entry,
-                    conversation_key,
-                    target_id,
-                    title=self._DEFAULT_TITLE,
-                    auto_title=True,
-                )
-                changed = True
+                raise KeyError(f"Session not found: {target_id}")
             if entry.get("active_session_id") != target_id:
                 entry["active_session_id"] = target_id
                 changed = True

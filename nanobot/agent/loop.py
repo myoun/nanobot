@@ -1651,10 +1651,25 @@ class AgentLoop:
             session = self.sessions.get_or_create(session_key)
         else:
             requested_session_id = self._extract_requested_session_id(msg.metadata)
-            session, descriptor = self.sessions.get_or_create_for_conversation(
-                conversation_key,
-                requested_session_id=requested_session_id,
-            )
+            try:
+                session, descriptor = self.sessions.get_or_create_for_conversation(
+                    conversation_key,
+                    requested_session_id=requested_session_id,
+                )
+            except KeyError:
+                error_text = "Unknown session. Refresh sessions and try again."
+                error_metadata = dict(msg.metadata)
+                snapshot = self.sessions.list_conversation_sessions(conversation_key)
+                error_metadata = self._merge_outbound_metadata(
+                    error_metadata,
+                    self._session_state_metadata(snapshot),
+                )
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=error_text,
+                    metadata=error_metadata,
+                )
             resolved_session_id = str(descriptor.get("id") or "")
 
         # Handle slash commands
@@ -1804,10 +1819,16 @@ class AgentLoop:
 
         conversation_key = self._conversation_key(origin_channel, origin_chat_id)
         requested_session_id = self._extract_requested_session_id(msg.metadata)
-        session, descriptor = self.sessions.get_or_create_for_conversation(
-            conversation_key,
-            requested_session_id=requested_session_id,
-        )
+        try:
+            session, descriptor = self.sessions.get_or_create_for_conversation(
+                conversation_key,
+                requested_session_id=requested_session_id,
+            )
+        except KeyError:
+            logger.warning(
+                "System callback referenced unknown session id; falling back to active session"
+            )
+            session, descriptor = self.sessions.get_or_create_for_conversation(conversation_key)
         self._set_tool_context(
             origin_channel,
             origin_chat_id,
