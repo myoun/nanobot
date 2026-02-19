@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta, timezone
 import json
-from pathlib import Path
 import uuid
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from nanobot.utils.helpers import ensure_dir
 
@@ -34,6 +34,7 @@ def _from_iso(raw: str | None) -> datetime | None:
 class ApprovalRequest:
     request_id: str
     session_key: str
+    origin_session_key: str | None
     channel: str
     chat_id: str
     requester_id: str
@@ -66,6 +67,7 @@ class ApprovalStore:
         self,
         *,
         session_key: str,
+        origin_session_key: str | None,
         channel: str,
         chat_id: str,
         requester_id: str,
@@ -85,6 +87,7 @@ class ApprovalStore:
         req = ApprovalRequest(
             request_id=f"apr_{uuid.uuid4().hex[:10]}",
             session_key=session_key,
+            origin_session_key=origin_session_key,
             channel=channel,
             chat_id=chat_id,
             requester_id=requester_id,
@@ -153,13 +156,16 @@ class ApprovalStore:
         return ApprovalRequest(
             request_id=str(item.get("request_id", "")),
             session_key=str(item.get("session_key", "")),
+            origin_session_key=(str(item.get("origin_session_key", "")).strip() or None),
             channel=str(item.get("channel", "")),
             chat_id=str(item.get("chat_id", "")),
             requester_id=str(item.get("requester_id", "")),
             command=str(item.get("command", "")),
             working_dir=str(item.get("working_dir", "")),
             action=str(item.get("action", "")),
-            action_args=item.get("action_args", {}) if isinstance(item.get("action_args"), dict) else {},
+            action_args=item.get("action_args", {})
+            if isinstance(item.get("action_args"), dict)
+            else {},
             status=str(item.get("status", "")),
             created_at=str(item.get("created_at", "")),
             expires_at=str(item.get("expires_at", "")),
@@ -200,4 +206,3 @@ class ApprovalStore:
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.path)
-

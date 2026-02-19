@@ -1,32 +1,32 @@
 """Agent loop: the core processing engine."""
 
 import asyncio
-from contextlib import AsyncExitStack
 import json
-import json_repair
 import os
-from pathlib import Path
 import re
 import shlex
-from typing import Any, TYPE_CHECKING
+from contextlib import AsyncExitStack
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
+import json_repair
 from loguru import logger
 
+from nanobot.agent.context import ContextBuilder
+from nanobot.agent.memory import MemoryStore
+from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tools.complete import CompleteTaskTool
+from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.message import MessageTool
+from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.report import ReportToUserTool
+from nanobot.agent.tools.shell import ExecTool
+from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
-from nanobot.agent.context import ContextBuilder
-from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
-from nanobot.agent.tools.shell import ExecTool
-from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
-from nanobot.agent.tools.complete import CompleteTaskTool
-from nanobot.agent.tools.message import MessageTool
-from nanobot.agent.tools.report import ReportToUserTool
-from nanobot.agent.tools.spawn import SpawnTool
-from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.memory import MemoryStore
-from nanobot.agent.subagent import SubagentManager
 from nanobot.security.approval_store import ApprovalStore
 from nanobot.security.privileged_client import PrivilegedClient
 from nanobot.session.manager import Session, SessionManager
@@ -246,11 +246,22 @@ class AgentLoop:
         await self._mcp_stack.__aenter__()
         await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
 
-    def _set_tool_context(self, channel: str, chat_id: str, sender_id: str = "") -> None:
+    def _set_tool_context(
+        self,
+        channel: str,
+        chat_id: str,
+        sender_id: str = "",
+        session_key: str = "",
+    ) -> None:
         """Update context for all tools that need routing info."""
         if exec_tool := self.tools.get("exec"):
             if isinstance(exec_tool, ExecTool):
-                exec_tool.set_context(channel, chat_id, sender_id)
+                exec_tool.set_context(
+                    channel,
+                    chat_id,
+                    sender_id,
+                    session_key=session_key,
+                )
 
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
@@ -262,7 +273,11 @@ class AgentLoop:
 
         if spawn_tool := self.tools.get("spawn"):
             if isinstance(spawn_tool, SpawnTool):
-                spawn_tool.set_context(channel, chat_id)
+                origin_session_id = ""
+                split = self.sessions.split_composed_key(session_key) if session_key else None
+                if split is not None:
+                    origin_session_id = split[1]
+                spawn_tool.set_context(channel, chat_id, session_id=origin_session_id)
 
         if cron_tool := self.tools.get("cron"):
             if isinstance(cron_tool, CronTool):
@@ -915,6 +930,11 @@ class AgentLoop:
                 content="Only the original requester can approve or deny this privileged request.",
             )
 
+        target_session = session
+        origin_session_key = str(pending.origin_session_key or "").strip()
+        if origin_session_key:
+            target_session = self.sessions.get_or_create(origin_session_key)
+
         if not approve:
             self._approval_store.resolve(
                 session_key,
@@ -922,9 +942,9 @@ class AgentLoop:
                 resolver_id=msg.sender_id,
                 result_preview="Denied by user",
             )
-            session.add_message("user", msg.content)
-            session.add_message("assistant", "Privileged request denied.")
-            self.sessions.save(session)
+            target_session.add_message("user", msg.content)
+            target_session.add_message("assistant", "Privileged request denied.")
+            self.sessions.save(target_session)
             return OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
@@ -978,9 +998,9 @@ class AgentLoop:
             result_preview=preview,
         )
         if not ok:
-            session.add_message("user", msg.content)
-            session.add_message("assistant", preview)
-            self.sessions.save(session)
+            target_session.add_message("user", msg.content)
+            target_session.add_message("assistant", preview)
+            self.sessions.save(target_session)
             return OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
@@ -999,9 +1019,14 @@ class AgentLoop:
             "Continue the original user request in this chat using these results. "
             "If the task is complete, call complete_task(final_answer=...)."
         )
-        self._set_tool_context(msg.channel, msg.chat_id, msg.sender_id)
+        self._set_tool_context(
+            msg.channel,
+            msg.chat_id,
+            msg.sender_id,
+            target_session.key,
+        )
         initial_messages = self.context.build_messages(
-            history=session.get_history(max_messages=self.memory_window),
+            history=target_session.get_history(max_messages=self.memory_window),
             current_message=followup_event,
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -1014,13 +1039,13 @@ class AgentLoop:
         if not final_content:
             final_content = preview
 
-        session.add_message("user", msg.content)
-        session.add_message(
+        target_session.add_message("user", msg.content)
+        target_session.add_message(
             "assistant",
             final_content,
             tools_used=tools_used if tools_used else None,
         )
-        self.sessions.save(session)
+        self.sessions.save(target_session)
 
         return OutboundMessage(
             channel=msg.channel,
@@ -1704,7 +1729,12 @@ class AgentLoop:
                 metadata=outbound_metadata,
             )
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.sender_id)
+        self._set_tool_context(
+            msg.channel,
+            msg.chat_id,
+            msg.sender_id,
+            session.key,
+        )
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
             current_message=msg.content,
@@ -1778,7 +1808,12 @@ class AgentLoop:
             conversation_key,
             requested_session_id=requested_session_id,
         )
-        self._set_tool_context(origin_channel, origin_chat_id, msg.sender_id)
+        self._set_tool_context(
+            origin_channel,
+            origin_chat_id,
+            msg.sender_id,
+            session.key,
+        )
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
             current_message=msg.content,

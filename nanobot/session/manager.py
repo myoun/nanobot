@@ -98,6 +98,13 @@ class SessionManager:
         return conversation_key, session_id
 
     @staticmethod
+    def _normalize_session_id(session_id: str | None) -> str:
+        sid = (session_id or "").strip()
+        if not sid or "#" in sid:
+            return ""
+        return sid
+
+    @staticmethod
     def _iso_now() -> str:
         return datetime.now().isoformat()
 
@@ -295,7 +302,7 @@ class SessionManager:
         index = self._load_index()
         changed = False
 
-        target_id = (requested_session_id or "").strip()
+        target_id = self._normalize_session_id(requested_session_id)
         if target_id:
             if self._find_meta(entry, target_id) is None:
                 self._append_meta(
@@ -466,7 +473,7 @@ class SessionManager:
         """Switch active session in a conversation."""
         entry = self._ensure_conversation(conversation_key)
         index = self._load_index()
-        sid = (session_id or "").strip()
+        sid = self._normalize_session_id(session_id)
         meta = self._find_meta(entry, sid)
         if meta is None:
             raise KeyError(f"Session not found: {sid}")
@@ -499,7 +506,7 @@ class SessionManager:
         """Rename a session."""
         entry = self._ensure_conversation(conversation_key)
         index = self._load_index()
-        sid = (session_id or "").strip()
+        sid = self._normalize_session_id(session_id)
         meta = self._find_meta(entry, sid)
         if meta is None:
             raise KeyError(f"Session not found: {sid}")
@@ -543,7 +550,7 @@ class SessionManager:
     ) -> dict[str, Any]:
         entry = self._ensure_conversation(conversation_key)
         index = self._load_index()
-        sid = (session_id or "").strip()
+        sid = self._normalize_session_id(session_id)
         meta = self._find_meta(entry, sid)
         if meta is None:
             raise KeyError(f"Session not found: {sid}")
@@ -601,7 +608,7 @@ class SessionManager:
     ) -> dict[str, Any]:
         entry = self._ensure_conversation(conversation_key)
         index = self._load_index()
-        sid = (session_id or "").strip()
+        sid = self._normalize_session_id(session_id)
         meta = self._find_meta(entry, sid)
         if meta is None:
             raise KeyError(f"Session not found: {sid}")
@@ -626,7 +633,7 @@ class SessionManager:
         """
         entry = self._ensure_conversation(conversation_key)
         index = self._load_index()
-        sid = (session_id or "").strip()
+        sid = self._normalize_session_id(session_id)
         sessions = [s for s in entry.get("sessions", []) if isinstance(s, dict)]
         target = self._find_meta(entry, sid)
         if target is None:
@@ -712,7 +719,7 @@ class SessionManager:
     def restore_session(self, conversation_key: str, session_id: str) -> dict[str, Any]:
         entry = self._ensure_conversation(conversation_key)
         index = self._load_index()
-        sid = (session_id or "").strip()
+        sid = self._normalize_session_id(session_id)
 
         deleted_sessions = entry.get("deleted_sessions")
         if not isinstance(deleted_sessions, list):

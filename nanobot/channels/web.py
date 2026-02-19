@@ -26,11 +26,11 @@ from nanobot.channels.web_protocol import (
     KEY_CODE,
     KEY_HISTORY,
     KEY_QUERY,
-    KEY_SESSIONS,
     KEY_SESSION_ID,
-    KEY_TITLE,
+    KEY_SESSIONS,
     KEY_SID,
     KEY_TEXT,
+    KEY_TITLE,
     KEY_TS,
     KEY_TYPE,
     TYPE_ASSISTANT_MESSAGE,
@@ -372,6 +372,10 @@ class WebChannel(BaseChannel):
     async def _handle_session_action(self, websocket: Any, sid: str, data: dict[str, Any]) -> None:
         if self._session_manager is None:
             await self._send_error(websocket, sid, ERR_BAD_MESSAGE, "session manager unavailable")
+            return
+
+        if sid in self._pending:
+            await self._send_error(websocket, sid, ERR_BUSY, "request already in progress")
             return
 
         action = coerce_text(data.get(KEY_ACTION)).lower()

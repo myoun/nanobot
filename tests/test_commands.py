@@ -1,7 +1,7 @@
-import shutil
 import asyncio
 import contextlib
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -12,12 +12,12 @@ import pytest
 import websockets
 from typer.testing import CliRunner
 
-from nanobot.cli.commands import app
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.discord import DiscordChannel
 from nanobot.channels.telegram import TelegramChannel
 from nanobot.channels.web import WebChannel
+from nanobot.cli.commands import app
 from nanobot.config.schema import DiscordConfig, TelegramConfig, WebConfig
 from nanobot.session.manager import SessionManager
 
@@ -227,6 +227,65 @@ async def test_web_channel_busy_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_web_channel_rejects_session_action_while_pending(tmp_path: Path) -> None:
+    bus = MessageBus()
+    session_manager = SessionManager(tmp_path)
+    channel = WebChannel(
+        WebConfig(enabled=True, host="127.0.0.1", port=0),
+        bus,
+        session_manager=session_manager,
+    )
+    await channel.start()
+
+    running = True
+
+    async def slow_agent() -> None:
+        while running:
+            inbound = await bus.consume_inbound()
+            await asyncio.sleep(0.2)
+            await bus.publish_outbound(
+                OutboundMessage(
+                    channel="web",
+                    chat_id=inbound.chat_id,
+                    content=f"echo:{inbound.content}",
+                )
+            )
+
+    async def outbound_dispatcher() -> None:
+        while running:
+            outbound = await bus.consume_outbound()
+            await channel.send(outbound)
+
+    agent_task = asyncio.create_task(slow_agent())
+    dispatch_task = asyncio.create_task(outbound_dispatcher())
+
+    try:
+        ws_url = f"ws://127.0.0.1:{channel.bound_port}/ws?sid=session-action-busy"
+        async with websockets.connect(ws_url) as ws:
+            _hello = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+
+            await ws.send(json.dumps({"type": "user_message", "text": "first"}))
+            await ws.send(json.dumps({"type": "session_action", "action": "list"}))
+
+            got_busy = False
+            for _ in range(12):
+                payload = json.loads(await asyncio.wait_for(ws.recv(), timeout=2.0))
+                if payload.get("type") == "error" and payload.get("code") == "busy":
+                    got_busy = True
+                    break
+            assert got_busy
+    finally:
+        running = False
+        agent_task.cancel()
+        dispatch_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await agent_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await dispatch_task
+        await channel.stop()
+
+
+@pytest.mark.asyncio
 async def test_web_channel_session_actions(tmp_path: Path) -> None:
     bus = MessageBus()
     session_manager = SessionManager(tmp_path)
@@ -393,6 +452,25 @@ def test_conversation_session_lifecycle(tmp_path: Path) -> None:
     snapshot = manager.list_conversation_sessions(conversation_key)
     assert len(snapshot["sessions"]) == 2
     assert snapshot["active_session_id"] == second_id
+
+
+def test_session_id_with_delimiter_is_rejected(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    conversation_key = "web:delimiter"
+
+    _, initial = manager.get_or_create_for_conversation(conversation_key)
+    initial_id = str(initial["id"])
+    assert initial_id
+
+    _, resolved = manager.get_or_create_for_conversation(
+        conversation_key,
+        requested_session_id=f"{initial_id}#bad",
+    )
+    assert resolved["id"] == initial_id
+
+    snapshot = manager.list_conversation_sessions(conversation_key)
+    assert all("#" not in str(item.get("id") or "") for item in snapshot["sessions"])
+    assert len(snapshot["sessions"]) == 1
 
 
 def test_delete_last_session_creates_replacement(tmp_path: Path) -> None:
