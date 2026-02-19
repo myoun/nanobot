@@ -286,6 +286,45 @@ async def test_web_channel_rejects_session_action_while_pending(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_web_channel_rejects_unknown_user_message_session_id(tmp_path: Path) -> None:
+    bus = MessageBus()
+    session_manager = SessionManager(tmp_path)
+    channel = WebChannel(
+        WebConfig(enabled=True, host="127.0.0.1", port=0),
+        bus,
+        session_manager=session_manager,
+    )
+    await channel.start()
+
+    try:
+        ws_url = f"ws://127.0.0.1:{channel.bound_port}/ws?sid=unknown-session-id"
+        async with websockets.connect(ws_url) as ws:
+            _hello = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+
+            await ws.send(json.dumps({"type": "session_action", "action": "list"}))
+            listed = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+            assert listed["type"] == "sessions_state"
+            active_id = str(listed.get("active_session_id") or "")
+            assert active_id
+
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "user_message",
+                        "text": "hello",
+                        "session_id": active_id + "-stale",
+                    }
+                )
+            )
+            rejected = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+            assert rejected["type"] == "error"
+            assert rejected.get("code") == "bad_message"
+            assert rejected.get("text") == "unknown session"
+    finally:
+        await channel.stop()
+
+
+@pytest.mark.asyncio
 async def test_web_channel_session_actions(tmp_path: Path) -> None:
     bus = MessageBus()
     session_manager = SessionManager(tmp_path)
@@ -471,6 +510,30 @@ def test_session_id_with_delimiter_is_rejected(tmp_path: Path) -> None:
     snapshot = manager.list_conversation_sessions(conversation_key)
     assert all("#" not in str(item.get("id") or "") for item in snapshot["sessions"])
     assert len(snapshot["sessions"]) == 1
+
+
+def test_unknown_requested_session_id_is_rejected_without_resurrection(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    conversation_key = "web:restore-guard"
+
+    _, initial = manager.get_or_create_for_conversation(conversation_key)
+    deleted_id = str(initial["id"])
+    assert deleted_id
+
+    manager.delete_session(conversation_key, deleted_id)
+    deleted_before = manager.list_deleted_sessions(conversation_key)
+    assert any(item.get("id") == deleted_id for item in deleted_before.get("deleted_sessions", []))
+
+    with pytest.raises(KeyError):
+        manager.get_or_create_for_conversation(
+            conversation_key,
+            requested_session_id=deleted_id,
+        )
+
+    snapshot = manager.list_conversation_sessions(conversation_key)
+    assert all(item.get("id") != deleted_id for item in snapshot.get("sessions", []))
+    deleted_after = manager.list_deleted_sessions(conversation_key)
+    assert any(item.get("id") == deleted_id for item in deleted_after.get("deleted_sessions", []))
 
 
 def test_delete_last_session_creates_replacement(tmp_path: Path) -> None:
