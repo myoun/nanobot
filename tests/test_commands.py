@@ -12,16 +12,36 @@ import pytest
 import websockets
 from typer.testing import CliRunner
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.agent.loop import AgentLoop
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.discord import DiscordChannel
 from nanobot.channels.telegram import TelegramChannel
 from nanobot.channels.web import WebChannel
 from nanobot.cli.commands import app
 from nanobot.config.schema import DiscordConfig, TelegramConfig, WebConfig
+from nanobot.providers.base import LLMProvider, LLMResponse
 from nanobot.session.manager import SessionManager
 
 runner = CliRunner()
+
+
+class _NoopProvider(LLMProvider):
+    def __init__(self):
+        super().__init__(api_key=None, api_base=None)
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+    ) -> LLMResponse:
+        raise AssertionError("chat should not be called for fixed-session command tests")
+
+    def get_default_model(self) -> str:
+        return "test-model"
 
 
 @pytest.fixture
@@ -224,6 +244,74 @@ async def test_web_channel_busy_error() -> None:
             assert got_busy
     finally:
         await channel.stop()
+
+
+@pytest.mark.asyncio
+async def test_fixed_new_does_not_mutate_conversation_sessions(tmp_path: Path) -> None:
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=_NoopProvider(),
+        workspace=tmp_path,
+    )
+
+    fixed_key = "cli:direct"
+    fixed_session = loop.sessions.get_or_create(fixed_key)
+    fixed_session.add_message("user", "hello")
+    fixed_session.add_message("assistant", "world")
+    loop.sessions.save(fixed_session)
+
+    conversation_key = "cli:direct"
+    loop.sessions.get_or_create_for_conversation(conversation_key)
+    before = loop.sessions.list_conversation_sessions(conversation_key)
+
+    response = await loop._process_message(
+        InboundMessage(
+            channel="cli",
+            sender_id="user",
+            chat_id="direct",
+            content="/new",
+        ),
+        session_key=fixed_key,
+    )
+
+    assert response is not None
+    assert "Cleared fixed session history" in response.content
+    assert loop.sessions.get_or_create(fixed_key).messages == []
+
+    after = loop.sessions.list_conversation_sessions(conversation_key)
+    assert after["active_session_id"] == before["active_session_id"]
+    assert len(after["sessions"]) == len(before["sessions"])
+
+
+@pytest.mark.asyncio
+async def test_fixed_session_switch_command_is_blocked(tmp_path: Path) -> None:
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=_NoopProvider(),
+        workspace=tmp_path,
+    )
+
+    fixed_key = "cli:direct"
+    conversation_key = "cli:direct"
+    loop.sessions.get_or_create_for_conversation(conversation_key)
+    target = loop.sessions.create_session(conversation_key, title="other", switch_to=False)
+    before = loop.sessions.list_conversation_sessions(conversation_key)
+
+    response = await loop._process_message(
+        InboundMessage(
+            channel="cli",
+            sender_id="user",
+            chat_id="direct",
+            content=f"/session switch {target['id']}",
+        ),
+        session_key=fixed_key,
+    )
+
+    assert response is not None
+    assert "unavailable in fixed-session mode" in response.content
+
+    after = loop.sessions.list_conversation_sessions(conversation_key)
+    assert after["active_session_id"] == before["active_session_id"]
 
 
 @pytest.mark.asyncio

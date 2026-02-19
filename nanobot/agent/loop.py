@@ -738,6 +738,73 @@ class AgentLoop:
             ),
         )
 
+    def _handle_fixed_session_command(
+        self,
+        *,
+        msg: InboundMessage,
+        cmd_name: str,
+        session: Session,
+    ) -> OutboundMessage | None:
+        if cmd_name not in {"/new", "/sessions", "/session"}:
+            return None
+
+        if cmd_name == "/new":
+            session.clear()
+            self.sessions.save(session)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    f"Cleared fixed session history for '{session.key}'.\n"
+                    "Use a different session key to switch to another thread."
+                ),
+            )
+
+        if cmd_name == "/sessions":
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    "Fixed-session mode active.\n"
+                    f"Current session key: {session.key}\n"
+                    "Conversation session listing is unavailable in this mode."
+                ),
+            )
+
+        tokens = self._parse_command_tokens(msg.content)
+        if len(tokens) < 2:
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    "Fixed-session mode commands:\n"
+                    "/session current\n"
+                    "/new\n"
+                    "Use a different session key to switch threads."
+                ),
+            )
+
+        action = tokens[1].lower()
+        if action in {"current", "active", "list", "ls"}:
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    "Fixed-session mode active.\n"
+                    f"Current session key: {session.key}\n"
+                    "Switch/create/list by conversation is unavailable in this mode."
+                ),
+            )
+
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=(
+                "This /session action is unavailable in fixed-session mode.\n"
+                "Use /new to clear current history or pass a different session key."
+            ),
+        )
+
     @classmethod
     def _normalize_generated_title(cls, raw_title: str) -> str:
         text = (raw_title or "").strip()
@@ -1677,15 +1744,26 @@ class AgentLoop:
         cmd_token = cmd.split()[0] if cmd else ""
         cmd_name = cmd_token.split("@", 1)[0]
         if cmd_name == "/help":
-            help_text = (
-                "nanobot commands:\n"
-                "/new - Start and switch to a new session\n"
-                "/sessions - List sessions in this chat\n"
-                "/session ... - Manage sessions (list/current/new/switch/rename/delete)\n"
-                "/help - Show available commands\n"
-                "/approve - Approve pending privileged request\n"
-                "/deny - Deny pending privileged request"
-            )
+            if session_key is None:
+                help_text = (
+                    "nanobot commands:\n"
+                    "/new - Start and switch to a new session\n"
+                    "/sessions - List sessions in this chat\n"
+                    "/session ... - Manage sessions (list/current/new/switch/rename/delete)\n"
+                    "/help - Show available commands\n"
+                    "/approve - Approve pending privileged request\n"
+                    "/deny - Deny pending privileged request"
+                )
+            else:
+                help_text = (
+                    "nanobot commands (fixed-session mode):\n"
+                    "/new - Clear current fixed session history\n"
+                    "/sessions - Show fixed session status\n"
+                    "/session current - Show current fixed session key\n"
+                    "/help - Show available commands\n"
+                    "/approve - Approve pending privileged request\n"
+                    "/deny - Deny pending privileged request"
+                )
             help_metadata = dict(msg.metadata)
             if session_key is None:
                 snapshot = self.sessions.list_conversation_sessions(conversation_key)
@@ -1704,11 +1782,20 @@ class AgentLoop:
         if cmd_name == "/deny":
             return await self._handle_privileged_approval(msg=msg, session=session, approve=False)
 
-        if session_cmd_response := self._handle_session_command(
-            msg=msg,
-            cmd_name=cmd_name,
-            conversation_key=conversation_key,
-        ):
+        if session_key is None:
+            session_cmd_response = self._handle_session_command(
+                msg=msg,
+                cmd_name=cmd_name,
+                conversation_key=conversation_key,
+            )
+        else:
+            session_cmd_response = self._handle_fixed_session_command(
+                msg=msg,
+                cmd_name=cmd_name,
+                session=session,
+            )
+
+        if session_cmd_response:
             return session_cmd_response
 
         if len(session.messages) > self.memory_window:
