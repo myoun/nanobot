@@ -7,7 +7,7 @@ import json_repair
 import os
 from pathlib import Path
 import re
-from typing import Any, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
 from loguru import logger
 
@@ -670,18 +670,36 @@ class AgentLoop:
         merged["_nanobot"] = nanobot_meta
         return merged
 
+    @staticmethod
+    def _strip_think(text: str | None) -> str | None:
+        if not text:
+            return None
+        return re.sub(r"<think>[\s\S]*?</think>", "", text).strip() or None
+
+    @staticmethod
+    def _tool_hint(tool_calls: list) -> str:
+        def _fmt(tc) -> str:
+            val = next(iter(tc.arguments.values()), None) if tc.arguments else None
+            if not isinstance(val, str):
+                return tc.name
+            return f'{tc.name}("{val[:40]}...")' if len(val) > 40 else f'{tc.name}("{val}")'
+
+        return ", ".join(_fmt(tc) for tc in tool_calls)
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
         *,
         initial_external_progress: bool = False,
         request_mode: str = _REQUEST_MODE_CHAT,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str], dict[str, Any]]:
         """
         Run the agent iteration loop.
 
         Args:
             initial_messages: Starting messages for the LLM conversation.
+            on_progress: Optional callback for intermediate progress updates.
 
         Returns:
             Tuple of (final_content, list_of_tools_used, llm_metadata).
@@ -718,10 +736,20 @@ class AgentLoop:
             web_search_trace.extend(round_web_search_trace)
             has_external_progress = successful_external_actions > 0 or bool(web_search_trace)
             if response.finish_reason == "error":
-                final_content = response.content
+                final_content = self._strip_think(response.content) or response.content
                 break
 
             if response.has_tool_calls:
+                if on_progress:
+                    progress_text = self._strip_think(response.content) or self._tool_hint(
+                        response.tool_calls
+                    )
+                    if progress_text:
+                        try:
+                            await on_progress(progress_text)
+                        except Exception as e:
+                            logger.debug(f"Progress callback failed: {e}")
+
                 tool_call_dicts = [
                     {
                         "id": tc.id,
@@ -851,7 +879,7 @@ class AgentLoop:
                         }
                     )
             else:
-                assistant_text = (response.content or "").strip()
+                assistant_text = self._strip_think(response.content) or ""
                 if assistant_text:
                     last_nonempty_no_tool_text = assistant_text
                     no_tool_text_rounds += 1
@@ -976,7 +1004,10 @@ class AgentLoop:
         logger.info("Agent loop stopping")
 
     async def _process_message(
-        self, msg: InboundMessage, session_key: str | None = None
+        self,
+        msg: InboundMessage,
+        session_key: str | None = None,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """
         Process a single inbound message.
@@ -984,6 +1015,7 @@ class AgentLoop:
         Args:
             msg: The inbound message to process.
             session_key: Override session key (used by process_direct).
+            on_progress: Optional callback for intermediate progress output.
 
         Returns:
             The response message, or None if no response needed.
@@ -1063,13 +1095,32 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
         )
+
+        async def _bus_progress(content: str) -> None:
+            progress_text = self._strip_think(content)
+            if not progress_text:
+                return
+            progress_metadata = dict(msg.metadata or {})
+            progress_metadata["is_progress_update"] = True
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=progress_text,
+                    metadata=progress_metadata,
+                )
+            )
+
         final_content, tools_used, llm_metadata = await self._run_agent_loop(
             initial_messages,
             request_mode=request_mode,
+            on_progress=on_progress or _bus_progress,
         )
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
+        else:
+            final_content = self._strip_think(final_content) or final_content
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
@@ -1123,6 +1174,8 @@ class AgentLoop:
 
         if final_content is None:
             final_content = "Background task completed."
+        else:
+            final_content = self._strip_think(final_content) or final_content
 
         session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
         session.add_message("assistant", final_content)
@@ -1243,6 +1296,7 @@ Respond with ONLY valid JSON, no markdown fences."""
         session_key: str = "cli:direct",
         channel: str = "cli",
         chat_id: str = "direct",
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
         """
         Process a message directly (for CLI or cron usage).
@@ -1252,6 +1306,7 @@ Respond with ONLY valid JSON, no markdown fences."""
             session_key: Session identifier (overrides channel:chat_id for session lookup).
             channel: Source channel (for tool context routing).
             chat_id: Source chat ID (for tool context routing).
+            on_progress: Optional callback for intermediate progress output.
 
         Returns:
             The agent's response.
@@ -1261,6 +1316,7 @@ Respond with ONLY valid JSON, no markdown fences."""
             session_key=session_key,
             channel=channel,
             chat_id=chat_id,
+            on_progress=on_progress,
         )
         return response.content if response else ""
 
@@ -1270,9 +1326,14 @@ Respond with ONLY valid JSON, no markdown fences."""
         session_key: str = "cli:direct",
         channel: str = "cli",
         chat_id: str = "direct",
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the full outbound payload."""
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         async with self._process_lock:
-            return await self._process_message(msg, session_key=session_key)
+            return await self._process_message(
+                msg,
+                session_key=session_key,
+                on_progress=on_progress,
+            )

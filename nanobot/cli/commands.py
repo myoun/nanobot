@@ -766,11 +766,21 @@ def agent(
         # Animated spinner is safe to use with prompt_toolkit input handling
         return console.status("[dim]nanobot is thinking...[/dim]", spinner="dots")
 
+    async def _cli_progress(content: str) -> None:
+        progress_text = (content or "").strip()
+        if not progress_text:
+            return
+        console.print(f"  [dim]↳ {progress_text}[/dim]")
+
     if message:
         # Single message mode
         async def run_once():
             with _thinking_ctx():
-                outbound = await agent_loop.process_direct_message(message, session_id)
+                outbound = await agent_loop.process_direct_message(
+                    message,
+                    session_id,
+                    on_progress=_cli_progress,
+                )
             _print_agent_response(
                 outbound.content if outbound else "",
                 render_markdown=markdown,
@@ -810,7 +820,9 @@ def agent(
 
                         with _thinking_ctx():
                             outbound = await agent_loop.process_direct_message(
-                                user_input, session_id
+                                user_input,
+                                session_id,
+                                on_progress=_cli_progress,
                             )
                         _print_agent_response(
                             outbound.content if outbound else "",
