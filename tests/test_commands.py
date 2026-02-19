@@ -433,6 +433,46 @@ async def test_web_channel_session_actions(tmp_path: Path) -> None:
         await channel.stop()
 
 
+@pytest.mark.asyncio
+async def test_web_channel_metadata_sessions_state_omits_history(tmp_path: Path) -> None:
+    session_manager = SessionManager(tmp_path)
+    channel = WebChannel(
+        WebConfig(enabled=True, host="127.0.0.1", port=0),
+        MessageBus(),
+        session_manager=session_manager,
+    )
+
+    sid = "state-light"
+    conversation_key = f"web:{sid}"
+    session, _ = session_manager.get_or_create_for_conversation(conversation_key)
+    session.add_message("user", "hello")
+    session.add_message("assistant", "world")
+    session_manager.save(session)
+    snapshot = session_manager.list_conversation_sessions(conversation_key)
+
+    class DummyWS:
+        def __init__(self):
+            self.sent: list[dict[str, Any]] = []
+
+        async def send(self, payload: str) -> None:
+            self.sent.append(cast(dict[str, Any], json.loads(payload)))
+
+    ws = DummyWS()
+    channel._connections[sid].add(cast(Any, ws))
+
+    await channel.send(
+        OutboundMessage(
+            channel="web",
+            chat_id=sid,
+            content="ok",
+            metadata={"_nanobot": {"session_state": snapshot}},
+        )
+    )
+
+    sessions_payload = next(item for item in ws.sent if item.get("type") == "sessions_state")
+    assert "history" not in sessions_payload
+
+
 def test_conversation_session_lifecycle(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
     conversation_key = "web:abc"
@@ -598,8 +638,14 @@ async def test_telegram_sessions_callback_switch_and_panel(tmp_path: Path) -> No
             self.text = text
             self.reply_markup = reply_markup
 
+    authorized_user = SimpleNamespace(id=101, username="allowed")
+
     msg = DummyReplyMessage(chat_id=100)
-    update = SimpleNamespace(message=msg, effective_chat=SimpleNamespace(id=100))
+    update = SimpleNamespace(
+        message=msg,
+        effective_chat=SimpleNamespace(id=100),
+        effective_user=authorized_user,
+    )
     await channel._on_sessions_command(cast(Any, update), cast(Any, SimpleNamespace()))
     assert "Session switcher" in msg.text
     assert msg.reply_markup is not None
@@ -615,16 +661,17 @@ async def test_telegram_sessions_callback_switch_and_panel(tmp_path: Path) -> No
             self.reply_markup = reply_markup
 
     class DummyQuery:
-        def __init__(self, data: str, message: DummyQueryMessage):
+        def __init__(self, data: str, message: DummyQueryMessage, from_user: Any):
             self.data = data
             self.message = message
+            self.from_user = from_user
             self.answered = False
 
         async def answer(self) -> None:
             self.answered = True
 
     query_message = DummyQueryMessage(chat_id=100)
-    query = DummyQuery(f"nbs:sw:{first_id}:0", query_message)
+    query = DummyQuery(f"nbs:sw:{first_id}:0", query_message, authorized_user)
     callback_update = SimpleNamespace(callback_query=query)
     await channel._on_session_callback(
         cast(Any, callback_update),
@@ -634,6 +681,84 @@ async def test_telegram_sessions_callback_switch_and_panel(tmp_path: Path) -> No
     assert snapshot["active_session_id"] == first_id
     assert query.answered is True
     assert "Switched:" in query_message.text
+
+
+@pytest.mark.asyncio
+async def test_telegram_sessions_controls_require_allowlist(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="dummy-token", allow_from=["100"]),
+        MessageBus(),
+        session_manager=manager,
+    )
+    conversation_key = "telegram:100"
+
+    _, first = manager.get_or_create_for_conversation(conversation_key)
+    first_id = str(first["id"])
+    second = manager.create_session(conversation_key, title="Second", switch_to=True)
+    second_id = str(second["id"])
+    assert second_id != first_id
+
+    class DummyReplyMessage:
+        def __init__(self, chat_id: int):
+            self.chat_id = chat_id
+            self.text = ""
+            self.reply_markup = None
+
+        async def reply_text(self, text: str, reply_markup: Any | None = None) -> None:
+            self.text = text
+            self.reply_markup = reply_markup
+
+    unauthorized_user = SimpleNamespace(id=200, username="intruder")
+    command_msg = DummyReplyMessage(chat_id=100)
+    command_update = SimpleNamespace(
+        message=command_msg,
+        effective_user=unauthorized_user,
+        effective_chat=SimpleNamespace(id=100),
+    )
+
+    await channel._on_sessions_command(cast(Any, command_update), cast(Any, SimpleNamespace()))
+    assert command_msg.text == ""
+    assert command_msg.reply_markup is None
+
+    class DummyQueryMessage:
+        def __init__(self, chat_id: int):
+            self.chat_id = chat_id
+            self.text = ""
+            self.reply_markup = None
+
+        async def edit_text(self, text: str, reply_markup: Any | None = None) -> None:
+            self.text = text
+            self.reply_markup = reply_markup
+
+    class DummyQuery:
+        def __init__(self, data: str, message: DummyQueryMessage, from_user: Any):
+            self.data = data
+            self.message = message
+            self.from_user = from_user
+            self.answered = False
+            self.answer_text = None
+            self.show_alert = False
+
+        async def answer(self, text: str | None = None, show_alert: bool = False) -> None:
+            self.answered = True
+            self.answer_text = text
+            self.show_alert = show_alert
+
+    query_message = DummyQueryMessage(chat_id=100)
+    query = DummyQuery(f"nbs:sw:{first_id}:0", query_message, unauthorized_user)
+    callback_update = SimpleNamespace(callback_query=query)
+    await channel._on_session_callback(
+        cast(Any, callback_update),
+        cast(Any, SimpleNamespace()),
+    )
+
+    snapshot = manager.list_conversation_sessions(conversation_key)
+    assert snapshot["active_session_id"] == second_id
+    assert query.answered is True
+    assert query.answer_text == "You are not allowed to use this bot."
+    assert query.show_alert is True
+    assert query_message.text == ""
 
 
 @pytest.mark.asyncio

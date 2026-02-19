@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import mimetypes
-from pathlib import Path
 import re
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -332,6 +332,8 @@ class TelegramChannel(BaseChannel):
     ) -> None:
         if not update.message:
             return
+        if not self._is_user_allowed(update.effective_user):
+            return
         if self._session_manager is None:
             await self._forward_command(update, context)
             return
@@ -342,6 +344,13 @@ class TelegramChannel(BaseChannel):
     ) -> None:
         query = update.callback_query
         if query is None:
+            return
+
+        if not self._is_user_allowed(getattr(query, "from_user", None)):
+            try:
+                await query.answer(text="You are not allowed to use this bot.", show_alert=True)
+            except Exception:
+                pass
             return
 
         try:
@@ -638,6 +647,15 @@ class TelegramChannel(BaseChannel):
         """Build sender_id with username for allowlist matching."""
         sid = str(user.id)
         return f"{sid}|{user.username}" if user.username else sid
+
+    def _is_user_allowed(self, user: Any | None) -> bool:
+        if user is None:
+            return False
+        sender_id = self._sender_id(user)
+        allowed = self.is_allowed(sender_id)
+        if not allowed:
+            logger.warning(f"Access denied for telegram user {sender_id} on session controls")
+        return allowed
 
     async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Forward slash commands to the bus for unified handling in AgentLoop."""

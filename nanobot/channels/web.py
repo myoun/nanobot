@@ -131,7 +131,7 @@ class WebChannel(BaseChannel):
 
         session_state = self._extract_session_state(msg.metadata)
         if session_state:
-            await self._broadcast_sessions_state(sid, session_state)
+            await self._broadcast_sessions_state(sid, session_state, include_history=False)
 
         if payload_type == TYPE_ASSISTANT_MESSAGE:
             self._pending.discard(sid)
@@ -295,17 +295,25 @@ class WebChannel(BaseChannel):
         state = nanobot_meta.get("session_state")
         return state if isinstance(state, dict) else None
 
-    async def _broadcast_sessions_state(self, sid: str, snapshot: dict[str, Any]) -> None:
-        snapshot = self._normalize_sessions_snapshot(sid, snapshot)
+    async def _broadcast_sessions_state(
+        self,
+        sid: str,
+        snapshot: dict[str, Any],
+        *,
+        include_history: bool = True,
+    ) -> None:
+        snapshot = self._normalize_sessions_snapshot(sid, snapshot, include_history=include_history)
         payload = {
             KEY_TYPE: TYPE_SESSIONS_STATE,
             KEY_SID: sid,
             KEY_TS: int(time.time()),
             "active_session_id": snapshot.get("active_session_id"),
             KEY_SESSIONS: snapshot.get("sessions", []),
-            KEY_HISTORY: snapshot.get("history", []),
             KEY_QUERY: snapshot.get("query", ""),
         }
+        history = snapshot.get("history")
+        if isinstance(history, list):
+            payload[KEY_HISTORY] = history
         dead: list[Any] = []
         for ws in list(self._connections.get(sid, set())):
             try:
@@ -318,11 +326,15 @@ class WebChannel(BaseChannel):
                 self._connections[sid].discard(ws)
 
     def _normalize_sessions_snapshot(
-        self, sid: str, snapshot: dict[str, Any] | None
+        self,
+        sid: str,
+        snapshot: dict[str, Any] | None,
+        *,
+        include_history: bool = True,
     ) -> dict[str, Any]:
         incoming = dict(snapshot or {})
         if self._session_manager is None:
-            if not isinstance(incoming.get("history"), list):
+            if include_history and not isinstance(incoming.get("history"), list):
                 incoming["history"] = []
             return incoming
 
@@ -340,8 +352,9 @@ class WebChannel(BaseChannel):
             "active_session_id": full_snapshot.get("active_session_id", ""),
             "sessions": sessions,
             "query": query,
-            "history": self._active_session_history(full_snapshot),
         }
+        if include_history:
+            current["history"] = self._active_session_history(full_snapshot)
         return current
 
     def _active_session_history(self, snapshot: dict[str, Any]) -> list[dict[str, Any]]:
