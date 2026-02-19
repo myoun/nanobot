@@ -14,6 +14,7 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import DiscordConfig
+from nanobot.session.manager import SessionManager
 
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
@@ -24,15 +25,355 @@ class DiscordChannel(BaseChannel):
     """Discord channel using Gateway websocket."""
 
     name = "discord"
+    _SESSION_CB_PREFIX = "nbs"
+    _SESSION_PAGE_SIZE = 20
+    _SESSION_TITLE_MAX_LEN = 80
 
-    def __init__(self, config: DiscordConfig, bus: MessageBus):
+    def __init__(
+        self,
+        config: DiscordConfig,
+        bus: MessageBus,
+        session_manager: SessionManager | None = None,
+    ):
         super().__init__(config, bus)
         self.config: DiscordConfig = config
+        self._session_manager = session_manager
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._seq: int | None = None
         self._heartbeat_task: asyncio.Task | None = None
         self._typing_tasks: dict[str, asyncio.Task] = {}
         self._http: httpx.AsyncClient | None = None
+
+    @staticmethod
+    def _conversation_key(channel_id: str) -> str:
+        return f"discord:{channel_id}"
+
+    @classmethod
+    def _session_pages(cls, total_items: int) -> int:
+        if total_items <= 0:
+            return 1
+        return (total_items + cls._SESSION_PAGE_SIZE - 1) // cls._SESSION_PAGE_SIZE
+
+    @classmethod
+    def _short_session_title(cls, title: str) -> str:
+        raw = " ".join((title or "").split()).strip()
+        if not raw:
+            raw = "New chat"
+        if len(raw) <= cls._SESSION_TITLE_MAX_LEN:
+            return raw
+        return raw[: cls._SESSION_TITLE_MAX_LEN - 1].rstrip() + "..."
+
+    @staticmethod
+    def _parse_int(raw: str, default: int = 0) -> int:
+        try:
+            return int(raw)
+        except Exception:
+            return default
+
+    def _build_sessions_components(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        owner_id: str,
+        page: int,
+    ) -> list[dict[str, Any]]:
+        sessions = snapshot.get("sessions")
+        if not isinstance(sessions, list):
+            sessions = []
+
+        total_pages = self._session_pages(len(sessions))
+        normalized_page = min(max(0, page), total_pages - 1)
+        start = normalized_page * self._SESSION_PAGE_SIZE
+        end = start + self._SESSION_PAGE_SIZE
+        visible = sessions[start:end]
+
+        options: list[dict[str, Any]] = []
+        for item in visible:
+            if not isinstance(item, dict):
+                continue
+            sid = str(item.get("id") or "")
+            if not sid:
+                continue
+            options.append(
+                {
+                    "label": self._short_session_title(str(item.get("title") or "")),
+                    "value": sid,
+                    "description": sid,
+                    "default": bool(item.get("active")),
+                }
+            )
+
+        if not options:
+            options = [
+                {
+                    "label": "No sessions",
+                    "value": "__none__",
+                    "description": "Create a session first",
+                    "default": True,
+                }
+            ]
+
+        select_row = {
+            "type": 1,
+            "components": [
+                {
+                    "type": 3,
+                    "custom_id": (f"{self._SESSION_CB_PREFIX}:sel:{owner_id}:{normalized_page}"),
+                    "placeholder": "Select a session",
+                    "min_values": 1,
+                    "max_values": 1,
+                    "options": options,
+                    "disabled": options[0]["value"] == "__none__",
+                }
+            ],
+        }
+
+        action_row = {
+            "type": 1,
+            "components": [
+                {
+                    "type": 2,
+                    "style": 1,
+                    "label": "New",
+                    "custom_id": f"{self._SESSION_CB_PREFIX}:new:{owner_id}:{normalized_page}",
+                },
+                {
+                    "type": 2,
+                    "style": 2,
+                    "label": "Refresh",
+                    "custom_id": f"{self._SESSION_CB_PREFIX}:rf:{owner_id}:{normalized_page}",
+                },
+                {
+                    "type": 2,
+                    "style": 2,
+                    "label": "Pin",
+                    "custom_id": f"{self._SESSION_CB_PREFIX}:pin:{owner_id}:{normalized_page}",
+                },
+                {
+                    "type": 2,
+                    "style": 2,
+                    "label": "Unpin",
+                    "custom_id": f"{self._SESSION_CB_PREFIX}:unpin:{owner_id}:{normalized_page}",
+                },
+            ],
+        }
+
+        nav_row = {
+            "type": 1,
+            "components": [
+                {
+                    "type": 2,
+                    "style": 2,
+                    "label": "Prev",
+                    "custom_id": (
+                        f"{self._SESSION_CB_PREFIX}:pg:{owner_id}:{max(0, normalized_page - 1)}"
+                    ),
+                    "disabled": normalized_page <= 0,
+                },
+                {
+                    "type": 2,
+                    "style": 2,
+                    "label": "Next",
+                    "custom_id": (
+                        f"{self._SESSION_CB_PREFIX}:pg:{owner_id}:{min(total_pages - 1, normalized_page + 1)}"
+                    ),
+                    "disabled": normalized_page >= total_pages - 1,
+                },
+            ],
+        }
+
+        return [select_row, action_row, nav_row]
+
+    @classmethod
+    def _render_sessions_panel_text(
+        cls,
+        snapshot: dict[str, Any],
+        *,
+        page: int,
+        notice: str | None = None,
+    ) -> str:
+        sessions = snapshot.get("sessions")
+        if not isinstance(sessions, list):
+            sessions = []
+        total_pages = cls._session_pages(len(sessions))
+        normalized_page = min(max(0, page), total_pages - 1)
+        active = next(
+            (item for item in sessions if isinstance(item, dict) and bool(item.get("active"))),
+            None,
+        )
+        active_title = cls._short_session_title(str((active or {}).get("title") or "New chat"))
+        active_id = str((active or {}).get("id") or "-")
+
+        lines = [
+            "Session switcher",
+            f"Active: {active_title} ({active_id})",
+            f"Sessions: {len(sessions)} | Page {normalized_page + 1}/{total_pages}",
+            "Use select/buttons. Pin and unpin apply to active session.",
+        ]
+        if notice:
+            lines.append(f"\n{notice}")
+        return "\n".join(lines)
+
+    async def _send_discord_json_message(
+        self,
+        *,
+        channel_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if not self._http:
+            return
+        url = f"{DISCORD_API_BASE}/channels/{channel_id}/messages"
+        headers = {"Authorization": f"Bot {self.config.token}"}
+        resp = await self._http.post(url, headers=headers, json=payload)
+        if resp.status_code >= 400:
+            logger.warning(f"Discord panel message failed: {resp.status_code} {resp.text[:200]}")
+
+    async def _send_sessions_panel_message(
+        self,
+        *,
+        channel_id: str,
+        user_id: str,
+        page: int = 0,
+        notice: str | None = None,
+    ) -> None:
+        if self._session_manager is None:
+            return
+        snapshot = self._session_manager.list_conversation_sessions(
+            self._conversation_key(channel_id)
+        )
+        text = self._render_sessions_panel_text(snapshot, page=page, notice=notice)
+        components = self._build_sessions_components(
+            snapshot,
+            owner_id=user_id,
+            page=page,
+        )
+        await self._send_discord_json_message(
+            channel_id=channel_id,
+            payload={"content": text, "components": components},
+        )
+
+    async def _respond_interaction(
+        self,
+        *,
+        interaction_id: str,
+        interaction_token: str,
+        response_type: int,
+        data: dict[str, Any],
+    ) -> None:
+        if not self._http:
+            return
+        url = f"{DISCORD_API_BASE}/interactions/{interaction_id}/{interaction_token}/callback"
+        headers = {"Authorization": f"Bot {self.config.token}"}
+        resp = await self._http.post(
+            url,
+            headers=headers,
+            json={"type": response_type, "data": data},
+        )
+        if resp.status_code >= 400:
+            logger.warning(
+                f"Discord interaction response failed: {resp.status_code} {resp.text[:200]}"
+            )
+
+    async def _handle_interaction_create(self, payload: dict[str, Any]) -> None:
+        if self._session_manager is None:
+            return
+
+        interaction_id = str(payload.get("id") or "")
+        interaction_token = str(payload.get("token") or "")
+        channel_id = str(payload.get("channel_id") or "")
+        if not interaction_id or not interaction_token or not channel_id:
+            return
+
+        user_block = (
+            ((payload.get("member") or {}).get("user"))
+            if isinstance(payload.get("member"), dict)
+            else payload.get("user")
+        ) or {}
+        actor_user_id = str((user_block or {}).get("id") or "")
+
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return
+        custom_id = str(data.get("custom_id") or "")
+        if not custom_id.startswith(f"{self._SESSION_CB_PREFIX}:"):
+            return
+
+        parts = custom_id.split(":")
+        if len(parts) < 4:
+            return
+        action = parts[1]
+        owner_id = parts[2]
+        page = self._parse_int(parts[3], default=0)
+
+        if actor_user_id and owner_id and actor_user_id != owner_id:
+            await self._respond_interaction(
+                interaction_id=interaction_id,
+                interaction_token=interaction_token,
+                response_type=4,
+                data={
+                    "content": "This panel belongs to another user.",
+                    "flags": 64,
+                },
+            )
+            return
+
+        conversation_key = self._conversation_key(channel_id)
+        notice: str | None = None
+
+        try:
+            if action == "sel":
+                values = data.get("values")
+                if isinstance(values, list) and values:
+                    selected = str(values[0])
+                    if selected != "__none__":
+                        switched = self._session_manager.switch_session(
+                            conversation_key,
+                            selected,
+                        )
+                        notice = f"Switched: {switched['title']} ({switched['id']})"
+            elif action == "new":
+                created = self._session_manager.create_session(
+                    conversation_key,
+                    title=None,
+                    switch_to=True,
+                )
+                notice = f"Started: {created['title']} ({created['id']})"
+            elif action in {"pin", "unpin"}:
+                current_snapshot = self._session_manager.list_conversation_sessions(
+                    conversation_key
+                )
+                active_id = str(current_snapshot.get("active_session_id") or "")
+                if active_id:
+                    updated = self._session_manager.set_session_pinned(
+                        conversation_key,
+                        active_id,
+                        pinned=action == "pin",
+                    )
+                    notice = (
+                        f"{'Pinned' if action == 'pin' else 'Unpinned'}: "
+                        f"{updated['title']} ({updated['id']})"
+                    )
+            elif action == "rf":
+                pass
+            elif action == "pg":
+                pass
+            else:
+                notice = "Unknown action."
+        except KeyError:
+            notice = "Session not found. Refreshing list."
+        except Exception as e:
+            logger.warning(f"Discord session interaction failed: {e}")
+            notice = "Session action failed."
+
+        snapshot = self._session_manager.list_conversation_sessions(conversation_key)
+        content = self._render_sessions_panel_text(snapshot, page=page, notice=notice)
+        components = self._build_sessions_components(snapshot, owner_id=owner_id, page=page)
+        await self._respond_interaction(
+            interaction_id=interaction_id,
+            interaction_token=interaction_token,
+            response_type=7,
+            data={"content": content, "components": components},
+        )
 
     async def start(self) -> None:
         """Start the Discord gateway connection."""
@@ -108,7 +449,9 @@ class DiscordChannel(BaseChannel):
             failed_lines = [f"[media not found: {m}]" for m in failed_media]
             text_content = "\n".join(part for part in [text_content, *failed_lines] if part)
         if skipped_media:
-            skipped_lines = [f"[media skipped: attachment limit exceeded: {m}]" for m in skipped_media]
+            skipped_lines = [
+                f"[media skipped: attachment limit exceeded: {m}]" for m in skipped_media
+            ]
             text_content = "\n".join(part for part in [text_content, *skipped_lines] if part)
 
         payload: dict[str, Any] = {}
@@ -209,6 +552,8 @@ class DiscordChannel(BaseChannel):
                 logger.info("Discord gateway READY")
             elif op == 0 and event_type == "MESSAGE_CREATE":
                 await self._handle_message_create(payload)
+            elif op == 0 and event_type == "INTERACTION_CREATE":
+                await self._handle_interaction_create(payload)
             elif op == 7:
                 # RECONNECT: exit loop to reconnect
                 logger.info("Discord gateway requested reconnect")
@@ -270,6 +615,15 @@ class DiscordChannel(BaseChannel):
         if not self.is_allowed(sender_id):
             return
 
+        stripped_content = content.strip()
+        if stripped_content == "/sessions" and self._session_manager is not None:
+            await self._send_sessions_panel_message(
+                channel_id=channel_id,
+                user_id=sender_id,
+                page=0,
+            )
+            return
+
         content_parts = [content] if content else []
         media_paths: list[str] = []
         media_dir = Path.home() / ".nanobot" / "media"
@@ -285,7 +639,9 @@ class DiscordChannel(BaseChannel):
                 continue
             try:
                 media_dir.mkdir(parents=True, exist_ok=True)
-                file_path = media_dir / f"{attachment.get('id', 'file')}_{filename.replace('/', '_')}"
+                file_path = (
+                    media_dir / f"{attachment.get('id', 'file')}_{filename.replace('/', '_')}"
+                )
                 resp = await self._http.get(url)
                 resp.raise_for_status()
                 file_path.write_bytes(resp.content)

@@ -32,14 +32,14 @@
       padding: 20px;
     }
     .shell {
-      width: min(980px, 100%);
+      width: min(1100px, 100%);
       height: min(90vh, 860px);
       background: var(--surface);
       border: 1px solid var(--line);
       border-radius: calc(var(--radius) + 6px);
       box-shadow: var(--shadow);
       display: grid;
-      grid-template-rows: auto 1fr auto;
+      grid-template-rows: auto minmax(0, 1fr) auto;
       overflow: hidden;
     }
     .top {
@@ -113,13 +113,107 @@
     }
     button.primary:hover { background: var(--accent-2); border-color: var(--accent-2); }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .content {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, #fcfdff, #f9fbfc);
+    }
+    .sessions {
+      border-right: 1px solid var(--line);
+      background: #f6fafd;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      min-height: 0;
+    }
+    .sessions-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+    }
+    .sessions-head h2 {
+      margin: 0;
+      font-size: 14px;
+      letter-spacing: 0.2px;
+      color: #294253;
+    }
+    .session-search {
+      padding: 8px;
+      border-bottom: 1px solid var(--line);
+      background: #f7fbfe;
+    }
+    .session-search input {
+      width: 100%;
+      border: 1px solid #c9d9e4;
+      border-radius: 8px;
+      padding: 6px 8px;
+      font: 13px/1.4 "Trebuchet MS", "Segoe UI", sans-serif;
+      color: #274055;
+      background: #fff;
+    }
+    .session-search input:focus {
+      outline: none;
+      border-color: #8bbad2;
+      box-shadow: 0 0 0 2px #d8edf8;
+    }
+    .session-list {
+      overflow: auto;
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .session-item {
+      border: 1px solid #d4e0e8;
+      border-radius: 10px;
+      background: #fff;
+      padding: 8px;
+      text-align: left;
+      cursor: pointer;
+      display: grid;
+      gap: 3px;
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+    }
+    .session-item .title {
+      font-size: 13px;
+      color: #1f3442;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .session-item .meta {
+      font-size: 11px;
+      color: #6a7f8d;
+    }
+    .session-item .flags {
+      font-size: 11px;
+      color: #3d6479;
+      min-height: 14px;
+    }
+    .session-item.active {
+      border-color: #8bbad2;
+      background: #ecf7fd;
+      box-shadow: inset 0 0 0 1px #bfdff0;
+    }
+    .session-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      padding: 10px;
+      border-top: 1px solid var(--line);
+    }
     .messages {
       overflow: auto;
       padding: 16px;
       display: flex;
       flex-direction: column;
       gap: 10px;
-      background: linear-gradient(180deg, #fcfdff, #f9fbfc);
+      min-height: 0;
     }
     .msg {
       max-width: min(85ch, 92%);
@@ -215,8 +309,23 @@
       font-family: "Trebuchet MS", "Segoe UI", sans-serif;
       font-size: 13px;
     }
+    .history-toolbar {
+      display: flex;
+      justify-content: center;
+      margin: 2px 0 8px;
+    }
+    .history-load {
+      border: 1px solid #c6d5df;
+      border-radius: 999px;
+      background: #f8fbfd;
+      color: #314b5d;
+      padding: 6px 12px;
+      font-size: 12px;
+      cursor: pointer;
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+    }
+    .history-load:hover { background: #eef5f9; }
     .composer {
-      border-top: 1px solid var(--line);
       padding: 12px;
       display: grid;
       grid-template-columns: 1fr auto;
@@ -255,6 +364,8 @@
       .shell { height: 95vh; }
       .top { grid-template-columns: 1fr; }
       .actions { justify-content: start; }
+      .content { grid-template-columns: 1fr; }
+      .sessions { max-height: 230px; }
       .msg { max-width: 100%; }
       .composer { grid-template-columns: 1fr; }
     }
@@ -270,14 +381,31 @@
         <h1>nanobot web</h1>
         <div class="conn"><span id="conn-dot" class="dot"></span><span id="conn-text">connecting</span></div>
         <div class="meta">session: <span id="sid-text">-</span></div>
+        <div class="meta">active: <span id="active-session-text">-</span></div>
       </div>
       <div class="actions">
-        <button id="new-chat-btn" type="button">New Chat</button>
+        <button id="new-chat-btn" type="button">Reset Browser ID</button>
         <button id="reconnect-btn" type="button">Reconnect</button>
       </div>
     </div>
 
-    <div id="messages" class="messages" aria-live="polite"></div>
+    <div class="content">
+      <aside class="sessions" aria-label="session list">
+        <div class="sessions-head">
+          <h2>Sessions</h2>
+          <button id="session-new-btn" type="button">New</button>
+        </div>
+        <div class="session-search">
+          <input id="session-search-input" type="text" placeholder="Search sessions" />
+        </div>
+        <div id="session-list" class="session-list"></div>
+        <div class="session-actions">
+          <button id="session-rename-btn" type="button">Rename</button>
+          <button id="session-delete-btn" type="button">Delete</button>
+        </div>
+      </aside>
+      <div id="messages" class="messages" aria-live="polite"></div>
+    </div>
 
     <div class="composer">
       <textarea id="composer" placeholder="Send a message to nanobot"></textarea>
@@ -296,17 +424,26 @@
       connDot: document.getElementById("conn-dot"),
       connText: document.getElementById("conn-text"),
       sidText: document.getElementById("sid-text"),
+      activeSessionText: document.getElementById("active-session-text"),
       newChatBtn: document.getElementById("new-chat-btn"),
-      reconnectBtn: document.getElementById("reconnect-btn")
+      reconnectBtn: document.getElementById("reconnect-btn"),
+      sessionList: document.getElementById("session-list"),
+      sessionNewBtn: document.getElementById("session-new-btn"),
+      sessionSearchInput: document.getElementById("session-search-input"),
+      sessionRenameBtn: document.getElementById("session-rename-btn"),
+      sessionDeleteBtn: document.getElementById("session-delete-btn")
     };
 
-    const MAX_MESSAGES = 200;
+    const HISTORY_WINDOW_STEP = 240;
     let ws = null;
     let reconnectTimer = null;
     let reconnectAttempt = 0;
     let manuallyClosed = false;
     let busy = false;
     let progressNode = null;
+    let sessionState = { active_session_id: "", sessions: [] };
+    let sessionSearchTimer = null;
+    let historyState = { all: [], start: 0 };
 
     function bootstrapTokenFromUrl() {
       const url = new URL(window.location.href);
@@ -339,20 +476,88 @@
       return m.scrollHeight - m.scrollTop - m.clientHeight < 80;
     }
 
-    function pushMessage(role, text) {
-      const autoscroll = nearBottom();
+    function createMessageNode(role, text) {
       const node = document.createElement("div");
       node.className = "msg";
       node.dataset.role = role;
       setMessageContent(node, role, text);
+      return node;
+    }
+
+    function pushMessage(role, text) {
+      const autoscroll = nearBottom();
+      const node = createMessageNode(role, text);
       els.messages.appendChild(node);
-      while (els.messages.children.length > MAX_MESSAGES) {
-        els.messages.removeChild(els.messages.firstChild);
-      }
       if (autoscroll) {
         els.messages.scrollTop = els.messages.scrollHeight;
       }
       return node;
+    }
+
+    function normalizeHistory(history) {
+      const items = Array.isArray(history) ? history : [];
+      const out = [];
+      for (const item of items) {
+        if (!item || typeof item !== "object") {
+          continue;
+        }
+        const role = String(item.role || "").trim() === "assistant" ? "assistant" : "user";
+        const content = String(item.content || "");
+        if (!content) {
+          continue;
+        }
+        out.push({ role, content });
+      }
+      return out;
+    }
+
+    function renderHistoryWindow() {
+      const list = historyState.all;
+      const fragment = document.createDocumentFragment();
+
+      if (historyState.start > 0) {
+        const toolbar = document.createElement("div");
+        toolbar.className = "history-toolbar";
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "history-load";
+        button.textContent = `Load older messages (${historyState.start})`;
+        button.addEventListener("click", () => {
+          historyState.start = Math.max(0, historyState.start - HISTORY_WINDOW_STEP);
+          renderHistoryWindow();
+        });
+        toolbar.appendChild(button);
+        fragment.appendChild(toolbar);
+      }
+
+      const visible = list.slice(historyState.start);
+      for (const item of visible) {
+        fragment.appendChild(createMessageNode(item.role, item.content));
+      }
+
+      els.messages.innerHTML = "";
+      els.messages.appendChild(fragment);
+      clearProgress();
+      els.messages.scrollTop = els.messages.scrollHeight;
+    }
+
+    function renderHistory(history) {
+      const normalized = normalizeHistory(history);
+      historyState = {
+        all: normalized,
+        start: Math.max(0, normalized.length - HISTORY_WINDOW_STEP)
+      };
+      renderHistoryWindow();
+    }
+
+    function appendHistoryTurn(role, text) {
+      const content = String(text || "");
+      if (!content) {
+        return;
+      }
+      historyState.all.push({ role, content });
+      historyState.start = Math.max(0, historyState.all.length - HISTORY_WINDOW_STEP);
+      renderHistoryWindow();
     }
 
     function showProgress(text) {
@@ -369,6 +574,104 @@
 
     function hint(text) {
       els.hint.textContent = text || "";
+    }
+
+    function activeSession() {
+      const id = String(sessionState.active_session_id || "").trim();
+      if (!id) {
+        return null;
+      }
+      const list = Array.isArray(sessionState.sessions) ? sessionState.sessions : [];
+      for (const item of list) {
+        if (item && String(item.id || "") === id) {
+          return item;
+        }
+      }
+      return null;
+    }
+
+    function renderSessions() {
+      const list = Array.isArray(sessionState.sessions) ? sessionState.sessions : [];
+      const active = String(sessionState.active_session_id || "");
+      els.sessionList.innerHTML = "";
+
+      if (!list.length) {
+        const empty = document.createElement("div");
+        empty.className = "meta";
+        empty.textContent = "No sessions yet";
+        els.sessionList.appendChild(empty);
+      }
+
+      for (const item of list) {
+        if (!item || !item.id) {
+          continue;
+        }
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "session-item" + (String(item.id) === active ? " active" : "");
+        btn.dataset.sessionId = String(item.id);
+        const title = String(item.title || "New chat");
+        const flags = [];
+        if (item.pinned) {
+          flags.push("📌 pinned");
+        }
+        if (String(item.id) === active) {
+          flags.push("active");
+        }
+        btn.innerHTML = `<span class="title">${escapeHtml(title)}</span><span class="meta">${escapeHtml(String(item.id))}</span><span class="flags">${escapeHtml(flags.join(" · "))}</span>`;
+        btn.addEventListener("click", () => {
+          if (busy) {
+            hint("wait for current response to finish before switching");
+            return;
+          }
+          if (String(item.id) === String(sessionState.active_session_id || "")) {
+            return;
+          }
+          hint("loading session...");
+          sendSessionAction("switch", { session_id: String(item.id) });
+        });
+        els.sessionList.appendChild(btn);
+      }
+
+      const current = activeSession();
+      if (current) {
+        els.activeSessionText.textContent = `${current.title} (${current.id})`;
+      } else if (sessionState.active_session_id) {
+        els.activeSessionText.textContent = `(filtered) ${sessionState.active_session_id}`;
+      } else {
+        els.activeSessionText.textContent = "-";
+      }
+      const canMutate = Boolean(current) && !busy;
+      els.sessionRenameBtn.disabled = !canMutate;
+      els.sessionDeleteBtn.disabled = !canMutate;
+    }
+
+    function applySessionState(payload) {
+      const sessions = Array.isArray(payload.sessions) ? payload.sessions : [];
+      const active = String(payload.active_session_id || "");
+      const history = Array.isArray(payload.history) ? payload.history : null;
+      const query = String(payload.query || "");
+      sessionState = {
+        active_session_id: active,
+        sessions
+      };
+      if (document.activeElement !== els.sessionSearchInput && els.sessionSearchInput.value !== query) {
+        els.sessionSearchInput.value = query;
+      }
+      renderSessions();
+      if (history !== null) {
+        renderHistory(history);
+      }
+      hint("");
+      updateSendState();
+    }
+
+    function sendSessionAction(action, extra = {}) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        hint("not connected");
+        return;
+      }
+      ws.send(JSON.stringify({ type: "session_action", action, ...extra }));
     }
 
     function escapeHtml(value) {
@@ -592,7 +895,13 @@
     function updateSendState() {
       const connected = ws && ws.readyState === WebSocket.OPEN;
       const text = els.composer.value.trim();
-      els.sendBtn.disabled = !connected || !text || busy;
+      const hasSession = Boolean(sessionState.active_session_id);
+      els.sendBtn.disabled = !connected || !hasSession || !text || busy;
+      els.sessionNewBtn.disabled = !connected || busy;
+      if (!hasSession || busy) {
+        els.sessionRenameBtn.disabled = true;
+        els.sessionDeleteBtn.disabled = true;
+      }
     }
 
     function reconnectNow(resetSession) {
@@ -634,6 +943,7 @@
         reconnectAttempt = 0;
         hint("");
         setConn(true, "connected");
+        sendSessionAction("list");
       };
 
       socket.onclose = () => {
@@ -673,13 +983,17 @@
           }
           return;
         }
+        if (type === "sessions_state") {
+          applySessionState(payload);
+          return;
+        }
         if (type === "progress_update") {
           showProgress(payload.text || "working");
           return;
         }
         if (type === "assistant_message") {
           clearProgress();
-          pushMessage("assistant", payload.text || "");
+          appendHistoryTurn("assistant", payload.text || "");
           busy = false;
           updateSendState();
           hint("");
@@ -704,12 +1018,18 @@
       if (!text) {
         return;
       }
+      const activeId = String(sessionState.active_session_id || "").trim();
+      if (!activeId) {
+        hint("select or create a session first");
+        sendSessionAction("list");
+        return;
+      }
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         hint("not connected");
         return;
       }
-      ws.send(JSON.stringify({ type: "user_message", text }));
-      pushMessage("user", text);
+      ws.send(JSON.stringify({ type: "user_message", text, session_id: activeId }));
+      appendHistoryTurn("user", text);
       els.composer.value = "";
       busy = true;
       hint("waiting for response...");
@@ -731,13 +1051,90 @@
     });
 
     els.newChatBtn.addEventListener("click", () => {
+      historyState = { all: [], start: 0 };
       els.messages.innerHTML = "";
       clearProgress();
       reconnectNow(true);
     });
 
+    els.sessionNewBtn.addEventListener("click", () => {
+      if (busy) {
+        hint("wait for current response to finish");
+        return;
+      }
+      const title = window.prompt("Optional session title (leave blank for auto title):", "") || "";
+      sendSessionAction("new", { title: title.trim() });
+    });
+
+    els.sessionRenameBtn.addEventListener("click", () => {
+      const current = activeSession();
+      if (!current) {
+        hint("no active session");
+        return;
+      }
+      const nextTitle = window.prompt("Rename session", String(current.title || ""));
+      if (nextTitle === null) {
+        return;
+      }
+      const title = String(nextTitle || "").trim();
+      if (!title) {
+        hint("title cannot be empty");
+        return;
+      }
+      sendSessionAction("rename", { session_id: String(current.id), title });
+    });
+
+    els.sessionSearchInput.addEventListener("input", () => {
+      const query = String(els.sessionSearchInput.value || "").trim();
+      if (sessionSearchTimer) {
+        clearTimeout(sessionSearchTimer);
+      }
+      sessionSearchTimer = setTimeout(() => {
+        if (query) {
+          sendSessionAction("search", { query });
+        } else {
+          sendSessionAction("list");
+        }
+      }, 180);
+    });
+
+    els.sessionList.addEventListener("contextmenu", (ev) => {
+      const target = ev.target instanceof HTMLElement ? ev.target.closest(".session-item") : null;
+      if (!target) {
+        return;
+      }
+      ev.preventDefault();
+      const sid = String(target.dataset.sessionId || "").trim();
+      if (!sid) {
+        return;
+      }
+      const session = (Array.isArray(sessionState.sessions) ? sessionState.sessions : []).find(
+        (item) => item && String(item.id || "") === sid
+      );
+      if (!session) {
+        return;
+      }
+      const shouldPin = !Boolean(session.pinned);
+      sendSessionAction(shouldPin ? "pin" : "unpin", { session_id: sid });
+      hint(shouldPin ? "pinned session" : "unpinned session");
+    });
+
+    els.sessionDeleteBtn.addEventListener("click", () => {
+      const current = activeSession();
+      if (!current) {
+        hint("no active session");
+        return;
+      }
+      const ok = window.confirm(`Delete session '${current.title}' (${current.id})?`);
+      if (!ok) {
+        return;
+      }
+      sendSessionAction("delete", { session_id: String(current.id) });
+    });
+
     bootstrapTokenFromUrl();
     connect();
+    renderSessions();
     updateSendState();
   </script>
 </body>

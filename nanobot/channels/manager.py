@@ -7,10 +7,10 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
+from nanobot.session.manager import SessionManager
 
 
 class ChannelManager:
@@ -23,9 +23,15 @@ class ChannelManager:
     - Route outbound messages
     """
 
-    def __init__(self, config: Config, bus: MessageBus):
+    def __init__(
+        self,
+        config: Config,
+        bus: MessageBus,
+        session_manager: SessionManager | None = None,
+    ):
         self.config = config
         self.bus = bus
+        self.session_manager = session_manager
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
 
@@ -43,6 +49,7 @@ class ChannelManager:
                     self.config.channels.telegram,
                     self.bus,
                     groq_api_key=self.config.providers.groq.api_key,
+                    session_manager=self.session_manager,
                 )
                 logger.info("Telegram channel enabled")
             except ImportError as e:
@@ -63,7 +70,11 @@ class ChannelManager:
             try:
                 from nanobot.channels.discord import DiscordChannel
 
-                self.channels["discord"] = DiscordChannel(self.config.channels.discord, self.bus)
+                self.channels["discord"] = DiscordChannel(
+                    self.config.channels.discord,
+                    self.bus,
+                    session_manager=self.session_manager,
+                )
                 logger.info("Discord channel enabled")
             except ImportError as e:
                 logger.warning(f"Discord channel not available: {e}")
@@ -138,6 +149,7 @@ class ChannelManager:
                 self.channels["web"] = WebChannel(
                     self.config.channels.web,
                     self.bus,
+                    session_manager=self.session_manager,
                 )
                 logger.info("Web channel enabled")
             except ImportError as e:

@@ -886,6 +886,11 @@ docker run -v ~/.nanobot:/root/.nanobot --rm nanobot agent -m "Hello!"
 docker run -v ~/.nanobot:/root/.nanobot --rm nanobot status
 ```
 
+## 🧭 Session Operations
+
+- For multi-session switching, channel-specific UX, pin/search, auto-title policy, and safe deletion/restore workflows, see:
+  - `SESSION_OPERATIONS.md`
+
 ## 📁 Project Structure
 
 ```

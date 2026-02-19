@@ -1,31 +1,32 @@
 """Agent loop: the core processing engine."""
 
 import asyncio
-from contextlib import AsyncExitStack
 import json
-import json_repair
 import os
-from pathlib import Path
 import re
-from typing import Any, TYPE_CHECKING
+import shlex
+from contextlib import AsyncExitStack
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
+import json_repair
 from loguru import logger
 
+from nanobot.agent.context import ContextBuilder
+from nanobot.agent.memory import MemoryStore
+from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tools.complete import CompleteTaskTool
+from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.message import MessageTool
+from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.report import ReportToUserTool
+from nanobot.agent.tools.shell import ExecTool
+from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
-from nanobot.agent.context import ContextBuilder
-from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
-from nanobot.agent.tools.shell import ExecTool
-from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
-from nanobot.agent.tools.complete import CompleteTaskTool
-from nanobot.agent.tools.message import MessageTool
-from nanobot.agent.tools.report import ReportToUserTool
-from nanobot.agent.tools.spawn import SpawnTool
-from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.memory import MemoryStore
-from nanobot.agent.subagent import SubagentManager
 from nanobot.security.approval_store import ApprovalStore
 from nanobot.security.privileged_client import PrivilegedClient
 from nanobot.session.manager import Session, SessionManager
@@ -96,6 +97,13 @@ class AgentLoop:
     _MAX_NO_TOOL_TEXT_ROUNDS = 3
     _MAX_NO_TOOL_EMPTY_ROUNDS = 4
     _PREFILL_FILE_CANDIDATES = ("workspace/PREFILL.md", "PREFILL.md")
+    _SESSION_TITLE_MAX_CHARS = 60
+    _SESSION_TITLE_CONTEXT_MESSAGES = 6
+    _SESSION_TITLE_MIN_USER_MESSAGES = 2
+    _SESSION_TITLE_MIN_ASSISTANT_MESSAGES = 1
+    _SESSION_TITLE_RETRY_MESSAGE_GAP = 3
+    _SESSION_TITLE_MAX_AUTO_ATTEMPTS = 3
+    _SESSION_DEFAULT_TITLE = "New chat"
     _NO_TOOL_FALLBACK = (
         "I couldn't make progress with tool execution or completion signaling. "
         "Please provide a more specific next instruction."
@@ -238,11 +246,22 @@ class AgentLoop:
         await self._mcp_stack.__aenter__()
         await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
 
-    def _set_tool_context(self, channel: str, chat_id: str, sender_id: str = "") -> None:
+    def _set_tool_context(
+        self,
+        channel: str,
+        chat_id: str,
+        sender_id: str = "",
+        session_key: str = "",
+    ) -> None:
         """Update context for all tools that need routing info."""
         if exec_tool := self.tools.get("exec"):
             if isinstance(exec_tool, ExecTool):
-                exec_tool.set_context(channel, chat_id, sender_id)
+                exec_tool.set_context(
+                    channel,
+                    chat_id,
+                    sender_id,
+                    session_key=session_key,
+                )
 
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
@@ -254,7 +273,11 @@ class AgentLoop:
 
         if spawn_tool := self.tools.get("spawn"):
             if isinstance(spawn_tool, SpawnTool):
-                spawn_tool.set_context(channel, chat_id)
+                origin_session_id = ""
+                split = self.sessions.split_composed_key(session_key) if session_key else None
+                if split is not None:
+                    origin_session_id = split[1]
+                spawn_tool.set_context(channel, chat_id, session_id=origin_session_id)
 
         if cron_tool := self.tools.get("cron"):
             if isinstance(cron_tool, CronTool):
@@ -266,6 +289,623 @@ class AgentLoop:
         if len(clean) <= max_len:
             return clean
         return clean[:max_len] + f"\n... (truncated, {len(clean) - max_len} more chars)"
+
+    @staticmethod
+    def _conversation_key(channel: str, chat_id: str) -> str:
+        return f"{channel}:{chat_id}"
+
+    @staticmethod
+    def _extract_requested_session_id(metadata: dict[str, Any] | None) -> str | None:
+        if not isinstance(metadata, dict):
+            return None
+
+        direct = metadata.get("session_id")
+        if isinstance(direct, str) and direct.strip():
+            return direct.strip()
+
+        session_block = metadata.get("session")
+        if isinstance(session_block, dict):
+            sid = session_block.get("id")
+            if isinstance(sid, str) and sid.strip():
+                return sid.strip()
+
+        web_block = metadata.get("web")
+        if isinstance(web_block, dict):
+            sid = web_block.get("session_id")
+            if isinstance(sid, str) and sid.strip():
+                return sid.strip()
+
+        nanobot_block = metadata.get("_nanobot")
+        if isinstance(nanobot_block, dict):
+            sid = nanobot_block.get("session_id")
+            if isinstance(sid, str) and sid.strip():
+                return sid.strip()
+
+        return None
+
+    @staticmethod
+    def _parse_command_tokens(raw_command: str) -> list[str]:
+        text = raw_command.strip()
+        if not text:
+            return []
+        try:
+            return shlex.split(text)
+        except ValueError:
+            return text.split()
+
+    @staticmethod
+    def _session_state_metadata(snapshot: dict[str, Any]) -> dict[str, Any]:
+        return {"session_state": snapshot}
+
+    @staticmethod
+    def _resolve_session_token(snapshot: dict[str, Any], token: str) -> str | None:
+        sessions = snapshot.get("sessions")
+        if not isinstance(sessions, list):
+            return None
+
+        cleaned = token.strip()
+        if not cleaned:
+            return None
+
+        if cleaned in {"active", "current"}:
+            active = snapshot.get("active_session_id")
+            return str(active) if isinstance(active, str) and active else None
+
+        for item in sessions:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("id", "")) == cleaned:
+                return cleaned
+
+        if cleaned.isdigit():
+            idx = int(cleaned) - 1
+            if 0 <= idx < len(sessions):
+                item = sessions[idx]
+                if isinstance(item, dict):
+                    sid = item.get("id")
+                    if isinstance(sid, str) and sid:
+                        return sid
+
+        return None
+
+    def _render_session_list_text(self, snapshot: dict[str, Any]) -> str:
+        sessions = snapshot.get("sessions")
+        if not isinstance(sessions, list) or not sessions:
+            return "No sessions in this chat yet. Use /new to create one."
+
+        lines = ["Sessions in this chat:"]
+        for idx, item in enumerate(sessions, start=1):
+            if not isinstance(item, dict):
+                continue
+            marker = "*" if bool(item.get("active")) else " "
+            pinned = "📌 " if bool(item.get("pinned", False)) else ""
+            title = str(item.get("title") or self._SESSION_DEFAULT_TITLE)
+            sid = str(item.get("id") or "")
+            lines.append(f"{idx}. [{marker}] {pinned}{title} ({sid})")
+
+        lines.append(
+            "Use /new, /session switch <id|index>, /session rename <id|index|active> <title>, /session pin <id|index>, /session unpin <id|index>, /session search <keyword>, /session trash, /session restore <id>, /session delete <id|index|active>."
+        )
+        return "\n".join(lines)
+
+    def _handle_session_command(
+        self,
+        *,
+        msg: InboundMessage,
+        cmd_name: str,
+        conversation_key: str,
+    ) -> OutboundMessage | None:
+        if cmd_name not in {"/new", "/sessions", "/session"}:
+            return None
+
+        if cmd_name == "/new":
+            created = self.sessions.create_session(conversation_key, title=None, switch_to=True)
+            snapshot = self.sessions.list_conversation_sessions(conversation_key)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    f"Started a new session: {created['title']} ({created['id']}).\n"
+                    "Use /sessions to browse or switch sessions."
+                ),
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(snapshot),
+                ),
+            )
+
+        if cmd_name == "/sessions":
+            snapshot = self.sessions.list_conversation_sessions(conversation_key)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=self._render_session_list_text(snapshot),
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(snapshot),
+                ),
+            )
+
+        tokens = self._parse_command_tokens(msg.content)
+        if len(tokens) < 2:
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    "Session commands:\n"
+                    "/session list\n"
+                    "/session current\n"
+                    "/session new [title]\n"
+                    "/session switch <id|index|active>\n"
+                    "/session rename <id|index|active> <new title>\n"
+                    "/session pin <id|index|active>\n"
+                    "/session unpin <id|index|active>\n"
+                    "/session search <keyword>\n"
+                    "/session trash\n"
+                    "/session restore <id>\n"
+                    "/session delete <id|index|active>"
+                ),
+            )
+
+        action = tokens[1].lower()
+        snapshot = self.sessions.list_conversation_sessions(conversation_key)
+
+        if action in {"list", "ls"}:
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=self._render_session_list_text(snapshot),
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(snapshot),
+                ),
+            )
+
+        if action in {"current", "active"}:
+            sid = str(snapshot.get("active_session_id") or "")
+            current = None
+            for item in snapshot.get("sessions", []):
+                if isinstance(item, dict) and str(item.get("id", "")) == sid:
+                    current = item
+                    break
+            if current is None:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="No active session.",
+                )
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=f"Current session: {current.get('title')} ({current.get('id')})",
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(snapshot),
+                ),
+            )
+
+        if action in {"new", "create"}:
+            title = " ".join(tokens[2:]).strip() or None
+            created = self.sessions.create_session(conversation_key, title=title, switch_to=True)
+            snapshot = self.sessions.list_conversation_sessions(conversation_key)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=f"Switched to new session: {created['title']} ({created['id']}).",
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(snapshot),
+                ),
+            )
+
+        if action in {"pin", "unpin"}:
+            if len(tokens) < 3:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=f"Usage: /session {action} <id|index|active>",
+                )
+            target = self._resolve_session_token(snapshot, tokens[2])
+            if not target:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Unknown session target. Run /sessions to check ids.",
+                )
+            pinned = action == "pin"
+            updated = self.sessions.set_session_pinned(
+                conversation_key,
+                target,
+                pinned=pinned,
+            )
+            snapshot = self.sessions.list_conversation_sessions(conversation_key)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    f"{'Pinned' if pinned else 'Unpinned'} session: "
+                    f"{updated['title']} ({updated['id']})."
+                ),
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(snapshot),
+                ),
+            )
+
+        if action in {"search", "find"}:
+            keyword = " ".join(tokens[2:]).strip() if len(tokens) > 2 else ""
+            if not keyword:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Usage: /session search <keyword>",
+                )
+            found = self.sessions.search_sessions(conversation_key, keyword)
+            found_sessions = found.get("sessions")
+            if not isinstance(found_sessions, list) or not found_sessions:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=f"No sessions matched '{keyword}'.",
+                    metadata=self._merge_outbound_metadata(
+                        msg.metadata,
+                        self._session_state_metadata(
+                            self.sessions.list_conversation_sessions(conversation_key)
+                        ),
+                    ),
+                )
+            lines = [f"Matches for '{keyword}':"]
+            for idx, item in enumerate(found_sessions, start=1):
+                if not isinstance(item, dict):
+                    continue
+                marker = "*" if bool(item.get("active")) else " "
+                pin = "📌 " if bool(item.get("pinned", False)) else ""
+                lines.append(f"{idx}. [{marker}] {pin}{item.get('title')} ({item.get('id')})")
+            lines.append("Use /session switch <id> to move to one result.")
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="\n".join(lines),
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(
+                        self.sessions.list_conversation_sessions(conversation_key)
+                    ),
+                ),
+            )
+
+        if action in {"trash", "deleted"}:
+            deleted = self.sessions.list_deleted_sessions(conversation_key)
+            deleted_items = deleted.get("deleted_sessions")
+            if not isinstance(deleted_items, list) or not deleted_items:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Trash is empty.",
+                )
+            lines = ["Deleted sessions:"]
+            for idx, item in enumerate(deleted_items, start=1):
+                if not isinstance(item, dict):
+                    continue
+                lines.append(
+                    f"{idx}. {item.get('title')} ({item.get('id')}) deleted at {item.get('deleted_at')}"
+                )
+            lines.append("Use /session restore <id> to recover one.")
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="\n".join(lines),
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(
+                        self.sessions.list_conversation_sessions(conversation_key)
+                    ),
+                ),
+            )
+
+        if action == "restore":
+            if len(tokens) < 3:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Usage: /session restore <id>",
+                )
+            target_id = tokens[2].strip()
+            if not target_id:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Usage: /session restore <id>",
+                )
+            try:
+                restored = self.sessions.restore_session(conversation_key, target_id)
+            except KeyError:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Deleted session not found. Use /session trash first.",
+                )
+            snapshot = self.sessions.list_conversation_sessions(conversation_key)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=f"Restored session: {restored['title']} ({restored['id']}).",
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(snapshot),
+                ),
+            )
+
+        if action in {"switch", "use"}:
+            if len(tokens) < 3:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Usage: /session switch <id|index|active>",
+                )
+            target = self._resolve_session_token(snapshot, tokens[2])
+            if not target:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Unknown session target. Run /sessions to check ids.",
+                )
+            switched = self.sessions.switch_session(conversation_key, target)
+            snapshot = self.sessions.list_conversation_sessions(conversation_key)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=f"Switched to session: {switched['title']} ({switched['id']}).",
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(snapshot),
+                ),
+            )
+
+        if action == "rename":
+            if len(tokens) < 4:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Usage: /session rename <id|index|active> <new title>",
+                )
+            target = self._resolve_session_token(snapshot, tokens[2])
+            if not target:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Unknown session target. Run /sessions to check ids.",
+                )
+            new_title = " ".join(tokens[3:]).strip()
+            if not new_title:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="New title must not be empty.",
+                )
+            renamed = self.sessions.rename_session(
+                conversation_key,
+                target,
+                new_title,
+                auto_title=False,
+            )
+            snapshot = self.sessions.list_conversation_sessions(conversation_key)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=f"Renamed session to: {renamed['title']} ({renamed['id']}).",
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(snapshot),
+                ),
+            )
+
+        if action in {"delete", "remove", "rm"}:
+            if len(tokens) < 3:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Usage: /session delete <id|index|active>",
+                )
+            target = self._resolve_session_token(snapshot, tokens[2])
+            if not target:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Unknown session target. Run /sessions to check ids.",
+                )
+            result = self.sessions.delete_session(conversation_key, target)
+            after_snapshot = self.sessions.list_conversation_sessions(conversation_key)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    f"Deleted session ({result['deleted_session_id']}). "
+                    f"Active session is now {result['active_session_id']}. "
+                    "Use /session trash to restore if needed."
+                ),
+                metadata=self._merge_outbound_metadata(
+                    msg.metadata,
+                    self._session_state_metadata(after_snapshot),
+                ),
+            )
+
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=(
+                "Unknown /session command. Use one of: list, current, new, switch, rename, pin, unpin, search, trash, restore, delete."
+            ),
+        )
+
+    @classmethod
+    def _normalize_generated_title(cls, raw_title: str) -> str:
+        text = (raw_title or "").strip()
+        if not text:
+            return ""
+
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1]
+            if "```" in text:
+                text = text.rsplit("```", 1)[0]
+            text = text.strip()
+
+        text = text.splitlines()[0].strip()
+        text = re.sub(r"^(?:title\s*[:\-]|\-|\*|\d+\.)\s*", "", text, flags=re.IGNORECASE)
+        text = text.strip("\"'` ")
+        text = " ".join(text.split())
+        return text[: cls._SESSION_TITLE_MAX_CHARS]
+
+    @classmethod
+    def _is_low_quality_generated_title(cls, title: str) -> bool:
+        normalized = " ".join((title or "").lower().split())
+        if not normalized:
+            return True
+        blocked = {
+            "new chat",
+            "chat",
+            "conversation",
+            "session",
+            "untitled",
+        }
+        if normalized in blocked:
+            return True
+        if len(normalized) < 4:
+            return True
+        words = normalized.split()
+        if len(words) == 1 and len(words[0]) < 8:
+            return True
+        return False
+
+    async def _maybe_generate_session_title(
+        self,
+        *,
+        conversation_key: str,
+        session_id: str,
+        session: Session,
+    ) -> str | None:
+        snapshot = self.sessions.list_conversation_sessions(conversation_key)
+        target: dict[str, Any] | None = None
+        for item in snapshot.get("sessions", []):
+            if isinstance(item, dict) and str(item.get("id", "")) == session_id:
+                target = item
+                break
+        if target is None:
+            return None
+        if not bool(target.get("auto_title", True)):
+            return None
+        if bool(target.get("title_locked", False)):
+            return None
+
+        attempts = int(target.get("title_auto_attempts", 0) or 0)
+        if attempts >= self._SESSION_TITLE_MAX_AUTO_ATTEMPTS:
+            return None
+
+        turns: list[dict[str, Any]] = []
+        user_count = 0
+        assistant_count = 0
+        for msg in session.messages:
+            role = str(msg.get("role") or "").strip()
+            if role not in {"user", "assistant"}:
+                continue
+            content = str(msg.get("content") or "").strip()
+            if not content:
+                continue
+            turns.append({"role": role, "content": content})
+            if role == "user":
+                user_count += 1
+            elif role == "assistant":
+                assistant_count += 1
+            if len(turns) >= self._SESSION_TITLE_CONTEXT_MESSAGES:
+                break
+        if user_count < self._SESSION_TITLE_MIN_USER_MESSAGES:
+            return None
+        if assistant_count < self._SESSION_TITLE_MIN_ASSISTANT_MESSAGES:
+            return None
+        if len(turns) < 2:
+            return None
+
+        total_messages = user_count + assistant_count
+        last_attempt_at = int(target.get("title_last_auto_message_count", 0) or 0)
+        if (
+            last_attempt_at
+            and total_messages - last_attempt_at < self._SESSION_TITLE_RETRY_MESSAGE_GAP
+        ):
+            return None
+
+        transcript = "\n".join(f"{item['role'].upper()}: {item['content'][:280]}" for item in turns)
+        prompt_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Generate a concise title for a chat session. "
+                    "Return only the title text, no quotes, max 8 words. "
+                    "Focus on the user's goal and concrete topic."
+                ),
+            },
+            {
+                "role": "user",
+                "content": "Conversation:\n" + transcript,
+            },
+        ]
+
+        try:
+            response = await self.provider.chat(
+                messages=prompt_messages,
+                tools=None,
+                model=self.model,
+                max_tokens=32,
+                temperature=0.2,
+            )
+            candidate = self._normalize_generated_title(response.content or "")
+        except Exception as e:
+            logger.debug(f"Session title generation skipped due to provider error: {e}")
+            candidate = ""
+
+        if candidate and self._is_low_quality_generated_title(candidate):
+            candidate = ""
+
+        if not candidate:
+            fallback = next(
+                (
+                    str(item.get("content") or "")
+                    for item in turns
+                    if str(item.get("role") or "") == "user"
+                ),
+                "",
+            )
+            candidate = self._normalize_generated_title(fallback)
+            if candidate and self._is_low_quality_generated_title(candidate):
+                candidate = ""
+
+        if not candidate:
+            self.sessions.note_auto_title_attempt(
+                conversation_key,
+                session_id,
+                message_count=total_messages,
+            )
+            return None
+
+        normalized_default = self._SESSION_DEFAULT_TITLE.lower()
+        if candidate.lower() == normalized_default:
+            self.sessions.note_auto_title_attempt(
+                conversation_key,
+                session_id,
+                message_count=total_messages,
+            )
+            return None
+
+        self.sessions.rename_session(
+            conversation_key,
+            session_id,
+            candidate,
+            auto_title=False,
+            source="auto",
+            lock_title=False,
+        )
+        session.metadata["title"] = candidate
+        self.sessions.save(session)
+        return candidate
 
     async def _handle_privileged_approval(
         self,
@@ -290,6 +930,11 @@ class AgentLoop:
                 content="Only the original requester can approve or deny this privileged request.",
             )
 
+        target_session = session
+        origin_session_key = str(pending.origin_session_key or "").strip()
+        if origin_session_key:
+            target_session = self.sessions.get_or_create(origin_session_key)
+
         if not approve:
             self._approval_store.resolve(
                 session_key,
@@ -297,9 +942,9 @@ class AgentLoop:
                 resolver_id=msg.sender_id,
                 result_preview="Denied by user",
             )
-            session.add_message("user", msg.content)
-            session.add_message("assistant", "Privileged request denied.")
-            self.sessions.save(session)
+            target_session.add_message("user", msg.content)
+            target_session.add_message("assistant", "Privileged request denied.")
+            self.sessions.save(target_session)
             return OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
@@ -353,9 +998,9 @@ class AgentLoop:
             result_preview=preview,
         )
         if not ok:
-            session.add_message("user", msg.content)
-            session.add_message("assistant", preview)
-            self.sessions.save(session)
+            target_session.add_message("user", msg.content)
+            target_session.add_message("assistant", preview)
+            self.sessions.save(target_session)
             return OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
@@ -374,9 +1019,14 @@ class AgentLoop:
             "Continue the original user request in this chat using these results. "
             "If the task is complete, call complete_task(final_answer=...)."
         )
-        self._set_tool_context(msg.channel, msg.chat_id, msg.sender_id)
+        self._set_tool_context(
+            msg.channel,
+            msg.chat_id,
+            msg.sender_id,
+            target_session.key,
+        )
         initial_messages = self.context.build_messages(
-            history=session.get_history(max_messages=self.memory_window),
+            history=target_session.get_history(max_messages=self.memory_window),
             current_message=followup_event,
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -389,13 +1039,13 @@ class AgentLoop:
         if not final_content:
             final_content = preview
 
-        session.add_message("user", msg.content)
-        session.add_message(
+        target_session.add_message("user", msg.content)
+        target_session.add_message(
             "assistant",
             final_content,
             tools_used=tools_used if tools_used else None,
         )
-        self.sessions.save(session)
+        self.sessions.save(target_session)
 
         return OutboundMessage(
             channel=msg.channel,
@@ -995,47 +1645,56 @@ class AgentLoop:
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {preview}")
 
-        key = session_key or msg.session_key
-        session = self.sessions.get_or_create(key)
+        conversation_key = self._conversation_key(msg.channel, msg.chat_id)
+        resolved_session_id = ""
+        if session_key is not None:
+            session = self.sessions.get_or_create(session_key)
+        else:
+            requested_session_id = self._extract_requested_session_id(msg.metadata)
+            session, descriptor = self.sessions.get_or_create_for_conversation(
+                conversation_key,
+                requested_session_id=requested_session_id,
+            )
+            resolved_session_id = str(descriptor.get("id") or "")
 
         # Handle slash commands
         cmd = msg.content.strip().lower()
         cmd_token = cmd.split()[0] if cmd else ""
         cmd_name = cmd_token.split("@", 1)[0]
-        if cmd_name == "/new":
-            # Capture messages before clearing (avoid race condition with background task)
-            messages_to_archive = session.messages.copy()
-            session.clear()
-            self.sessions.save(session)
-            self.sessions.invalidate(session.key)
-
-            async def _consolidate_and_cleanup():
-                temp_session = Session(key=session.key)
-                temp_session.messages = messages_to_archive
-                await self._consolidate_memory(temp_session, archive_all=True)
-
-            asyncio.create_task(_consolidate_and_cleanup())
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content="New session started. Memory consolidation in progress.",
-            )
         if cmd_name == "/help":
+            help_text = (
+                "nanobot commands:\n"
+                "/new - Start and switch to a new session\n"
+                "/sessions - List sessions in this chat\n"
+                "/session ... - Manage sessions (list/current/new/switch/rename/delete)\n"
+                "/help - Show available commands\n"
+                "/approve - Approve pending privileged request\n"
+                "/deny - Deny pending privileged request"
+            )
+            help_metadata = dict(msg.metadata)
+            if session_key is None:
+                snapshot = self.sessions.list_conversation_sessions(conversation_key)
+                help_metadata = self._merge_outbound_metadata(
+                    help_metadata,
+                    self._session_state_metadata(snapshot),
+                )
             return OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
-                content=(
-                    "🐈 nanobot commands:\n"
-                    "/new — Start a new conversation\n"
-                    "/help — Show available commands\n"
-                    "/approve — Approve pending privileged request\n"
-                    "/deny — Deny pending privileged request"
-                ),
+                content=help_text,
+                metadata=help_metadata,
             )
         if cmd_name == "/approve":
             return await self._handle_privileged_approval(msg=msg, session=session, approve=True)
         if cmd_name == "/deny":
             return await self._handle_privileged_approval(msg=msg, session=session, approve=False)
+
+        if session_cmd_response := self._handle_session_command(
+            msg=msg,
+            cmd_name=cmd_name,
+            conversation_key=conversation_key,
+        ):
+            return session_cmd_response
 
         if len(session.messages) > self.memory_window:
             asyncio.create_task(self._consolidate_memory(session))
@@ -1049,13 +1708,33 @@ class AgentLoop:
             session.metadata["last_request_mode"] = request_mode
             session.metadata["last_request_mode_reason"] = mode_reason
             self.sessions.save(session)
+            if resolved_session_id:
+                await self._maybe_generate_session_title(
+                    conversation_key=conversation_key,
+                    session_id=resolved_session_id,
+                    session=session,
+                )
+
+            outbound_metadata = dict(msg.metadata)
+            if session_key is None:
+                snapshot = self.sessions.list_conversation_sessions(conversation_key)
+                outbound_metadata = self._merge_outbound_metadata(
+                    outbound_metadata,
+                    self._session_state_metadata(snapshot),
+                )
             return OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
                 content=final_content,
+                metadata=outbound_metadata,
             )
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.sender_id)
+        self._set_tool_context(
+            msg.channel,
+            msg.chat_id,
+            msg.sender_id,
+            session.key,
+        )
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
             current_message=msg.content,
@@ -1082,13 +1761,26 @@ class AgentLoop:
         session.metadata["last_request_mode_reason"] = mode_reason
         self.sessions.save(session)
 
+        if resolved_session_id:
+            await self._maybe_generate_session_title(
+                conversation_key=conversation_key,
+                session_id=resolved_session_id,
+                session=session,
+            )
+
         outbound_metadata = self._merge_outbound_metadata(msg.metadata, llm_metadata)
+        if session_key is None:
+            snapshot = self.sessions.list_conversation_sessions(conversation_key)
+            outbound_metadata = self._merge_outbound_metadata(
+                outbound_metadata,
+                self._session_state_metadata(snapshot),
+            )
 
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content,
-            metadata=outbound_metadata,  # Pass through for channels and include LLM traces.
+            metadata=outbound_metadata,
         )
 
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
@@ -1110,9 +1802,18 @@ class AgentLoop:
             origin_channel = "cli"
             origin_chat_id = msg.chat_id
 
-        session_key = f"{origin_channel}:{origin_chat_id}"
-        session = self.sessions.get_or_create(session_key)
-        self._set_tool_context(origin_channel, origin_chat_id, msg.sender_id)
+        conversation_key = self._conversation_key(origin_channel, origin_chat_id)
+        requested_session_id = self._extract_requested_session_id(msg.metadata)
+        session, descriptor = self.sessions.get_or_create_for_conversation(
+            conversation_key,
+            requested_session_id=requested_session_id,
+        )
+        self._set_tool_context(
+            origin_channel,
+            origin_chat_id,
+            msg.sender_id,
+            session.key,
+        )
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
             current_message=msg.content,
@@ -1128,11 +1829,25 @@ class AgentLoop:
         session.add_message("assistant", final_content)
         self.sessions.save(session)
 
+        if sid := str(descriptor.get("id") or ""):
+            await self._maybe_generate_session_title(
+                conversation_key=conversation_key,
+                session_id=sid,
+                session=session,
+            )
+
+        outbound_metadata = self._merge_outbound_metadata(msg.metadata, llm_metadata)
+        snapshot = self.sessions.list_conversation_sessions(conversation_key)
+        outbound_metadata = self._merge_outbound_metadata(
+            outbound_metadata,
+            self._session_state_metadata(snapshot),
+        )
+
         return OutboundMessage(
             channel=origin_channel,
             chat_id=origin_chat_id,
             content=final_content,
-            metadata=self._merge_outbound_metadata(msg.metadata, llm_metadata),
+            metadata=outbound_metadata,
         )
 
     async def _consolidate_memory(self, session, archive_all: bool = False) -> None:
