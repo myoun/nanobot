@@ -741,14 +741,18 @@ class AgentLoop:
 
             if response.has_tool_calls:
                 if on_progress:
-                    progress_text = self._strip_think(response.content) or self._tool_hint(
-                        response.tool_calls
-                    )
-                    if progress_text:
-                        try:
-                            await on_progress(progress_text)
-                        except Exception as e:
-                            logger.debug(f"Progress callback failed: {e}")
+                    progress_tool_calls = [
+                        tc for tc in response.tool_calls if tc.name not in self._NON_PROGRESS_TOOLS
+                    ]
+                    if progress_tool_calls:
+                        progress_text = self._strip_think(response.content) or self._tool_hint(
+                            progress_tool_calls
+                        )
+                        if progress_text:
+                            try:
+                                await on_progress(progress_text)
+                            except Exception as e:
+                                logger.debug(f"Progress callback failed: {e}")
 
                 tool_call_dicts = [
                     {
