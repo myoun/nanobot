@@ -96,6 +96,10 @@ class AgentLoop:
     _MAX_NO_TOOL_TEXT_ROUNDS = 3
     _MAX_NO_TOOL_EMPTY_ROUNDS = 4
     _PREFILL_FILE_CANDIDATES = ("workspace/PREFILL.md", "PREFILL.md")
+    _SESSION_TRACE_MESSAGES_KEY = "_session_trace_messages"
+    _SESSION_TRACE_MAX_EVENTS = 40
+    _SESSION_TRACE_RESULT_MAX_CHARS = 1200
+    _PROGRESS_HINT_HIDE_TOOLS = {"exec"}
     _NO_TOOL_FALLBACK = (
         "I couldn't make progress with tool execution or completion signaling. "
         "Please provide a more specific next instruction."
@@ -386,10 +390,12 @@ class AgentLoop:
             initial_external_progress=True,
             request_mode=self._REQUEST_MODE_DO,
         )
+        session_trace_messages = llm_metadata.pop(self._SESSION_TRACE_MESSAGES_KEY, None)
         if not final_content:
             final_content = preview
 
         session.add_message("user", msg.content)
+        self._append_session_trace_messages(session, session_trace_messages)
         session.add_message(
             "assistant",
             final_content,
@@ -676,15 +682,52 @@ class AgentLoop:
             return None
         return re.sub(r"<think>[\s\S]*?</think>", "", text).strip() or None
 
+    def _append_session_trace_messages(
+        self,
+        session: Session,
+        trace_messages: list[dict[str, Any]] | None,
+    ) -> None:
+        """Persist structured assistant/tool trace messages into session history."""
+        if not isinstance(trace_messages, list) or not trace_messages:
+            return
+
+        for item in trace_messages:
+            if not isinstance(item, dict):
+                continue
+
+            role = item.get("role")
+            if role == "assistant":
+                content = item.get("content")
+                text = content if isinstance(content, str) else ""
+                tool_calls = item.get("tool_calls")
+                if isinstance(tool_calls, list) and tool_calls:
+                    session.add_message("assistant", text, tool_calls=tool_calls)
+                elif text:
+                    session.add_message("assistant", text)
+                continue
+
+            if role != "tool":
+                continue
+
+            tool_call_id = item.get("tool_call_id")
+            if not isinstance(tool_call_id, str) or not tool_call_id:
+                continue
+            content = item.get("content")
+            text = content if isinstance(content, str) else str(content or "")
+            kwargs: dict[str, Any] = {"tool_call_id": tool_call_id}
+            tool_name = item.get("name")
+            if isinstance(tool_name, str) and tool_name:
+                kwargs["name"] = tool_name
+            session.add_message("tool", text, **kwargs)
+
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
-        def _fmt(tc) -> str:
-            val = next(iter(tc.arguments.values()), None) if tc.arguments else None
-            if not isinstance(val, str):
-                return tc.name
-            return f'{tc.name}("{val[:40]}...")' if len(val) > 40 else f'{tc.name}("{val}")'
-
-        return ", ".join(_fmt(tc) for tc in tool_calls)
+        names: list[str] = []
+        for tc in tool_calls:
+            name = getattr(tc, "name", None)
+            if isinstance(name, str) and name and name not in names:
+                names.append(name)
+        return ", ".join(names)
 
     async def _run_agent_loop(
         self,
@@ -710,6 +753,8 @@ class AgentLoop:
         final_content = None
         tools_used: list[str] = []
         web_search_trace: list[dict[str, Any]] = []
+        session_trace_messages: list[dict[str, Any]] = []
+        trace_messages_omitted = 0
         successful_external_actions = 1 if initial_external_progress else 0
         external_tool_attempted = False
         meaningful_tool_attempted = False
@@ -717,6 +762,7 @@ class AgentLoop:
         no_tool_text_rounds = 0
         no_tool_empty_rounds = 0
         last_nonempty_no_tool_text = ""
+        last_progress_text = ""
         agent_browser_used = False
         agent_browser_closed = False
         prefill_prompt = self._load_prefill_prompt()
@@ -745,12 +791,20 @@ class AgentLoop:
                         tc for tc in response.tool_calls if tc.name not in self._NON_PROGRESS_TOOLS
                     ]
                     if progress_tool_calls:
-                        progress_text = self._strip_think(response.content) or self._tool_hint(
-                            progress_tool_calls
-                        )
+                        progress_text = self._strip_think(response.content)
+                        if not progress_text:
+                            visible_hint_calls = [
+                                tc
+                                for tc in progress_tool_calls
+                                if tc.name not in self._PROGRESS_HINT_HIDE_TOOLS
+                            ]
+                            progress_text = self._tool_hint(visible_hint_calls)
                         if progress_text:
                             try:
-                                await on_progress(progress_text)
+                                normalized = " ".join(progress_text.split())
+                                if normalized != last_progress_text:
+                                    last_progress_text = normalized
+                                    await on_progress(progress_text)
                             except Exception as e:
                                 logger.debug(f"Progress callback failed: {e}")
 
@@ -768,6 +822,22 @@ class AgentLoop:
                     tool_call_dicts,
                     reasoning_content=response.reasoning_content,
                 )
+                trace_tool_call_dicts = [
+                    tc for tc in tool_call_dicts
+                    if ((tc.get("function") or {}).get("name") != self._COMPLETE_TOOL_NAME)
+                ]
+                if trace_tool_call_dicts:
+                    if len(session_trace_messages) < self._SESSION_TRACE_MAX_EVENTS:
+                        trace_content = self._strip_think(response.content) or ""
+                        session_trace_messages.append(
+                            {
+                                "role": "assistant",
+                                "content": trace_content,
+                                "tool_calls": trace_tool_call_dicts,
+                            }
+                        )
+                    else:
+                        trace_messages_omitted += 1
 
                 completion_answer: str | None = None
                 completion_requested = False
@@ -792,6 +862,24 @@ class AgentLoop:
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+                    if tool_call.name != self._COMPLETE_TOOL_NAME:
+                        result_clean = self._strip_think(result) or result
+                        result_preview = self._truncate_preview(
+                            str(result_clean),
+                            max_len=self._SESSION_TRACE_RESULT_MAX_CHARS,
+                        )
+                        if len(session_trace_messages) < self._SESSION_TRACE_MAX_EVENTS:
+                            session_trace_messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tool_call.id,
+                                    "name": tool_call.name,
+                                    "content": result_preview,
+                                }
+                            )
+                        else:
+                            trace_messages_omitted += 1
+
                     pending_approval_notice = self._pending_approval_message(tool_call.name, result)
                     if pending_approval_notice:
                         logger.info(f"Tool result: {tool_call.name} -> pending_approval")
@@ -963,6 +1051,15 @@ class AgentLoop:
         llm_metadata: dict[str, Any] = {}
         if web_search_trace:
             llm_metadata["web_search_trace"] = web_search_trace
+        if session_trace_messages:
+            if trace_messages_omitted > 0 and len(session_trace_messages) < self._SESSION_TRACE_MAX_EVENTS:
+                session_trace_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": f"(tool trace truncated: {trace_messages_omitted} events omitted)",
+                    }
+                )
+            llm_metadata[self._SESSION_TRACE_MESSAGES_KEY] = session_trace_messages
         llm_metadata["request_mode"] = request_mode
 
         return final_content, tools_used, llm_metadata
@@ -1120,6 +1217,7 @@ class AgentLoop:
             request_mode=request_mode,
             on_progress=on_progress or _bus_progress,
         )
+        session_trace_messages = llm_metadata.pop(self._SESSION_TRACE_MESSAGES_KEY, None)
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
@@ -1130,8 +1228,11 @@ class AgentLoop:
         logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
 
         session.add_message("user", msg.content)
+        self._append_session_trace_messages(session, session_trace_messages)
         session.add_message(
-            "assistant", final_content, tools_used=tools_used if tools_used else None
+            "assistant",
+            final_content,
+            tools_used=tools_used if tools_used else None,
         )
         session.metadata["last_request_mode"] = request_mode
         session.metadata["last_request_mode_reason"] = mode_reason
@@ -1175,6 +1276,7 @@ class AgentLoop:
             chat_id=origin_chat_id,
         )
         final_content, _, llm_metadata = await self._run_agent_loop(initial_messages)
+        session_trace_messages = llm_metadata.pop(self._SESSION_TRACE_MESSAGES_KEY, None)
 
         if final_content is None:
             final_content = "Background task completed."
@@ -1182,7 +1284,11 @@ class AgentLoop:
             final_content = self._strip_think(final_content) or final_content
 
         session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
-        session.add_message("assistant", final_content)
+        self._append_session_trace_messages(session, session_trace_messages)
+        session.add_message(
+            "assistant",
+            final_content,
+        )
         self.sessions.save(session)
 
         return OutboundMessage(
@@ -1231,6 +1337,8 @@ class AgentLoop:
 
         lines = []
         for m in old_messages:
+            if str(m.get("role", "")).lower() == "tool":
+                continue
             if not m.get("content"):
                 continue
             tools = f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
