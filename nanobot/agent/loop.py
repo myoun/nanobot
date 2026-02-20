@@ -52,9 +52,17 @@ class AgentLoop:
     _REPORT_TOOL_NAME = "report_to_user"
     _REQUEST_MODE_DO = "DO"
     _REQUEST_MODE_CHAT = "CHAT"
+    _REQUEST_INTENT_TASK = "TASK"
+    _REQUEST_INTENT_CONTROL = "CONTROL"
+    _REQUEST_INTENT_META = "META"
+    _REQUEST_INTENT_CASUAL = "CASUAL"
+    _REQUEST_EXEC_REQUIRED = "REQUIRED"
+    _REQUEST_EXEC_OPTIONAL = "OPTIONAL"
+    _REQUEST_EXEC_FORBIDDEN = "FORBIDDEN"
     _NON_PROGRESS_TOOLS = {_COMPLETE_TOOL_NAME, _REPORT_TOOL_NAME}
     _MODE_CLASSIFIER_MAX_HISTORY = 10
     _MODE_CLASSIFIER_ITEM_MAX_CHARS = 220
+    _MODE_CLASSIFIER_MAX_CAPABILITY_ITEMS = 30
     _DO_MODE_NO_TOOL_RESPONSE = (
         "This request requires real tool execution, but no task-execution tools are currently available. "
         "I can provide a patch/command plan only; runtime execution must be enabled first."
@@ -81,7 +89,7 @@ class AgentLoop:
         "then call complete_task with required fields final_answer/artifacts/evidence/actions_taken."
     )
     _ACTION_RETRY_REASON_MISSING_EVIDENCE = (
-        "Retry reason: complete_task in TASK_REQUEST mode requires non-empty `evidence` and `actions_taken`. "
+        "Retry reason: complete_task in execution=REQUIRED mode requires non-empty `evidence` and `actions_taken`. "
         "Include concrete execution evidence (command/tool outputs) and real actions performed."
     )
     _ACTION_RETRY_REASON_INVALID_COMPLETE_PAYLOAD = (
@@ -522,7 +530,17 @@ class AgentLoop:
             return collapsed[: cls._MODE_CLASSIFIER_ITEM_MAX_CHARS - 3] + "..."
         return collapsed
 
-    async def _classify_request_mode(self, session: Session, user_text: str) -> tuple[str, str]:
+    @staticmethod
+    def _looks_like_explicit_action_request(text: str) -> bool:
+        lowered = text.lower()
+        patterns = [
+            r"\b(play|run|execute|open|send|search|fetch|read|write|edit|fix|build|implement|install|deploy|restart|schedule|verify)\b",
+            r"(노래|음악).*(틀어|재생|play)",
+            r"(실행|돌려|켜|열어|보내|찾아|가져와|수정|고쳐|설치|배포|재시작|등록|확인)(줘|해|해줘)?",
+        ]
+        return any(re.search(p, lowered) for p in patterns)
+
+    async def _classify_request_mode(self, session: Session, user_text: str) -> tuple[str, str, str, str]:
         recent_lines: list[str] = []
         for msg in session.messages[-self._MODE_CLASSIFIER_MAX_HISTORY :]:
             role = str(msg.get("role") or "").upper()
@@ -532,22 +550,62 @@ class AgentLoop:
             recent_lines.append(f"{role}: {self._compact_mode_line(content)}")
 
         conversation = "\n".join(recent_lines) if recent_lines else "(none)"
+        previous_mode = str(session.metadata.get("last_request_mode") or "").strip().upper()
+        previous_intent = str(session.metadata.get("last_request_intent") or "").strip().upper()
+        previous_execution = str(session.metadata.get("last_request_execution") or "").strip().upper()
+        previous_routing = (
+            f"mode={previous_mode or 'N/A'}, "
+            f"intent={previous_intent or 'N/A'}, "
+            f"execution={previous_execution or 'N/A'}"
+        )
+        available_tools = sorted(self.tools.tool_names)
+        if len(available_tools) > self._MODE_CLASSIFIER_MAX_CAPABILITY_ITEMS:
+            omitted = len(available_tools) - self._MODE_CLASSIFIER_MAX_CAPABILITY_ITEMS
+            available_tools = [
+                *available_tools[: self._MODE_CLASSIFIER_MAX_CAPABILITY_ITEMS],
+                f"... ({omitted} more tools)",
+            ]
+        tools_block = "\n".join(f"- {name}" for name in available_tools) if available_tools else "- (none)"
+
+        available_skills: list[str] = []
+        try:
+            skill_rows = self.context.skills.list_skills(filter_unavailable=True)
+            available_skills = sorted(
+                {str(row.get("name")).strip() for row in skill_rows if str(row.get("name", "")).strip()}
+            )
+        except Exception:
+            available_skills = []
+        if len(available_skills) > self._MODE_CLASSIFIER_MAX_CAPABILITY_ITEMS:
+            omitted = len(available_skills) - self._MODE_CLASSIFIER_MAX_CAPABILITY_ITEMS
+            available_skills = [
+                *available_skills[: self._MODE_CLASSIFIER_MAX_CAPABILITY_ITEMS],
+                f"... ({omitted} more skills)",
+            ]
+        skills_block = "\n".join(f"- {name}" for name in available_skills) if available_skills else "- (none)"
+
         classifier_messages = [
             {
                 "role": "system",
                 "content": (
-                    "Classify the current turn for orchestration. "
-                    "Return JSON only with keys: mode, reason. "
-                    "mode must be DO or CHAT.\n"
-                    "- DO: user requests concrete execution/build/fix/search/run/verification work, "
-                    "or gives a follow-up control command that should continue an active task.\n"
-                    "- CHAT: user asks conceptual questions, policy discussion, meta feedback, or casual conversation."
+                    "Classify the current turn for orchestration using two axes. "
+                    "Return JSON only with keys: intent, execution, reason.\n"
+                    "intent must be one of TASK, CONTROL, META, CASUAL.\n"
+                    "execution must be one of REQUIRED, OPTIONAL, FORBIDDEN.\n"
+                    "- REQUIRED: faithful completion requires one or more real tool actions.\n"
+                    "- OPTIONAL: answer can be completed without tools; tools may be used only if needed.\n"
+                    "- FORBIDDEN: do not run tools; reply directly.\n"
+                    "- Decide execution by task nature, not by confidence in success.\n"
+                    "- If the user requests a concrete external action (e.g., play music, send message, execute command, fetch live data), choose REQUIRED even when capability is unclear.\n"
+                    "- If the user gives a control command while an active task is ongoing, set intent=CONTROL and execution=REQUIRED."
                 ),
             },
             {
                 "role": "user",
                 "content": (
                     f"Recent conversation:\n{conversation}\n\n"
+                    f"Previous routing:\n{previous_routing}\n\n"
+                    f"Available tools:\n{tools_block}\n\n"
+                    f"Available skills:\n{skills_block}\n\n"
                     f"Current user message:\n{user_text}\n\n"
                     "Respond with JSON only."
                 ),
@@ -574,20 +632,74 @@ class AgentLoop:
             if not isinstance(parsed, dict):
                 raise ValueError("classifier response is not a JSON object")
 
-            mode_value = str(parsed.get("mode") or "").strip().upper()
-            if mode_value not in {self._REQUEST_MODE_DO, self._REQUEST_MODE_CHAT}:
-                raise ValueError(f"unknown mode: {mode_value}")
+            intent_value = str(parsed.get("intent") or "").strip().upper()
+            if intent_value not in {
+                self._REQUEST_INTENT_TASK,
+                self._REQUEST_INTENT_CONTROL,
+                self._REQUEST_INTENT_META,
+                self._REQUEST_INTENT_CASUAL,
+            }:
+                raise ValueError(f"unknown intent: {intent_value}")
 
-            reason = str(parsed.get("reason") or "").strip() or "classifier decision"
-            return mode_value, reason
-        except Exception as e:
-            previous = str(session.metadata.get("last_request_mode") or "").strip().upper()
-            fallback = (
-                previous
-                if previous in {self._REQUEST_MODE_DO, self._REQUEST_MODE_CHAT}
+            execution_value = str(parsed.get("execution") or "").strip().upper()
+            if execution_value not in {
+                self._REQUEST_EXEC_REQUIRED,
+                self._REQUEST_EXEC_OPTIONAL,
+                self._REQUEST_EXEC_FORBIDDEN,
+            }:
+                raise ValueError(f"unknown execution: {execution_value}")
+
+            mode_value = (
+                self._REQUEST_MODE_DO
+                if execution_value == self._REQUEST_EXEC_REQUIRED
                 else self._REQUEST_MODE_CHAT
             )
-            return fallback, f"classifier fallback ({type(e).__name__})"
+            reason = str(parsed.get("reason") or "").strip() or "classifier decision"
+            if (
+                execution_value != self._REQUEST_EXEC_REQUIRED
+                and self._looks_like_explicit_action_request(user_text)
+            ):
+                execution_value = self._REQUEST_EXEC_REQUIRED
+                mode_value = self._REQUEST_MODE_DO
+                if intent_value in {self._REQUEST_INTENT_META, self._REQUEST_INTENT_CASUAL}:
+                    intent_value = self._REQUEST_INTENT_TASK
+                reason = f"{reason}; heuristic override: explicit action request"
+            return mode_value, reason, intent_value, execution_value
+        except Exception as e:
+            fallback_mode = (
+                previous_mode
+                if previous_mode in {self._REQUEST_MODE_DO, self._REQUEST_MODE_CHAT}
+                else self._REQUEST_MODE_CHAT
+            )
+            fallback_intent = (
+                previous_intent
+                if previous_intent in {
+                    self._REQUEST_INTENT_TASK,
+                    self._REQUEST_INTENT_CONTROL,
+                    self._REQUEST_INTENT_META,
+                    self._REQUEST_INTENT_CASUAL,
+                }
+                else self._REQUEST_INTENT_META
+            )
+            fallback_execution = (
+                previous_execution
+                if previous_execution in {
+                    self._REQUEST_EXEC_REQUIRED,
+                    self._REQUEST_EXEC_OPTIONAL,
+                    self._REQUEST_EXEC_FORBIDDEN,
+                }
+                else (
+                    self._REQUEST_EXEC_REQUIRED
+                    if fallback_mode == self._REQUEST_MODE_DO
+                    else self._REQUEST_EXEC_OPTIONAL
+                )
+            )
+            return (
+                fallback_mode,
+                f"classifier fallback ({type(e).__name__})",
+                fallback_intent,
+                fallback_execution,
+            )
 
     def _has_task_execution_tools(self) -> bool:
         task_tools = [
@@ -952,7 +1064,7 @@ class AgentLoop:
                     followup_nudge = self._COMPLETION_REJECT_NUDGE
                     if do_mode:
                         followup_nudge += (
-                            " In TASK_REQUEST mode include non-empty evidence/actions_taken."
+                            " In execution=REQUIRED mode include non-empty evidence/actions_taken."
                         )
                     messages.append({"role": "user", "content": followup_nudge})
                 else:
@@ -1173,19 +1285,35 @@ class AgentLoop:
         if len(session.messages) > self.memory_window:
             asyncio.create_task(self._consolidate_memory(session))
 
-        request_mode, mode_reason = await self._classify_request_mode(session, msg.content)
-        logger.info(f"Request mode for {msg.channel}:{msg.chat_id}: {request_mode} ({mode_reason})")
+        request_mode, mode_reason, request_intent, request_execution = await self._classify_request_mode(
+            session, msg.content
+        )
+        logger.info(
+            f"Request routing for {msg.channel}:{msg.chat_id}: "
+            f"mode={request_mode}, intent={request_intent}, execution={request_execution} ({mode_reason})"
+        )
         if request_mode == self._REQUEST_MODE_DO and not self._has_task_execution_tools():
             final_content = self._DO_MODE_NO_TOOL_RESPONSE
             session.add_message("user", msg.content)
             session.add_message("assistant", final_content)
             session.metadata["last_request_mode"] = request_mode
             session.metadata["last_request_mode_reason"] = mode_reason
+            session.metadata["last_request_intent"] = request_intent
+            session.metadata["last_request_execution"] = request_execution
             self.sessions.save(session)
+            outbound_metadata = self._merge_outbound_metadata(
+                msg.metadata,
+                {
+                    "request_mode": request_mode,
+                    "request_intent": request_intent,
+                    "request_execution": request_execution,
+                },
+            )
             return OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
                 content=final_content,
+                metadata=outbound_metadata,
             )
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.sender_id)
@@ -1217,6 +1345,8 @@ class AgentLoop:
             request_mode=request_mode,
             on_progress=on_progress or _bus_progress,
         )
+        llm_metadata["request_intent"] = request_intent
+        llm_metadata["request_execution"] = request_execution
         session_trace_messages = llm_metadata.pop(self._SESSION_TRACE_MESSAGES_KEY, None)
 
         if final_content is None:
@@ -1236,6 +1366,8 @@ class AgentLoop:
         )
         session.metadata["last_request_mode"] = request_mode
         session.metadata["last_request_mode_reason"] = mode_reason
+        session.metadata["last_request_intent"] = request_intent
+        session.metadata["last_request_execution"] = request_execution
         self.sessions.save(session)
 
         outbound_metadata = self._merge_outbound_metadata(msg.metadata, llm_metadata)

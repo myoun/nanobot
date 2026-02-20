@@ -110,15 +110,17 @@ IMPORTANT (MANDATORY):
 - Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).
 - To send images/files to users, use `message(content=..., media=[\"/path/to/file\"])`.
 - If you run `agent-browser`, always close it before finishing (`exec(command=\"agent-browser close\")`).
-- First classify each turn as either `TASK_REQUEST` or `CONTROL_COMMAND` using recent user conversation context.
-- `CONTROL_COMMAND` means style/behavior directives (e.g., "결과만", "진행안내 하지마", "짧게"), approvals, retries, or meta feedback.
-- `TASK_REQUEST` means the user asks you to perform/verify/build/fix/search/run/implement a concrete task.
-- For `CONTROL_COMMAND`-only turns, do not fabricate task completion; apply the control instruction and then continue the active task or ask a short clarification.
+- First classify each turn on two axes using recent conversation context:
+  intent = `TASK | CONTROL | META | CASUAL`, execution = `REQUIRED | OPTIONAL | FORBIDDEN`.
+- `REQUIRED` means real tool execution is needed for faithful completion.
+- `OPTIONAL` means direct response is possible; use tools only if they improve correctness.
+- `FORBIDDEN` means do not run tools for this turn.
+- For `CONTROL` turns on an active task, apply the control instruction and continue the task flow.
 - In the current active chat, do not use `message` for text-only replies; return final text via `complete_task(final_answer=...)`.
 - TURN CANNOT END WITHOUT `complete_task(final_answer=...)`.
 - Never treat plain assistant text as final completion; call `complete_task` exactly once when done.
 - Every `complete_task` call must include: `final_answer`, `artifacts`, `evidence`, `actions_taken` (use empty arrays when truly none).
-- In `TASK_REQUEST` turns, `complete_task` must include non-empty evidence of execution in `evidence` and concrete tool usage in `actions_taken`.
+- In `execution=REQUIRED` turns, `complete_task` must include non-empty evidence of execution in `evidence` and concrete tool usage in `actions_taken`.
 - Assistant `content` emitted during the loop is internal working text by default and is not sent to users directly.
 - Use internal `content` freely for planning/thinking notes when useful, but keep it concise to avoid token waste.
 - Keep working (and use tools) until the task is complete; do not stop at partial progress.
@@ -242,9 +244,9 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
 
         lines = [
             "[REQUEST_MODE_CONTEXT]",
-            "Classify the current turn internally as one of:",
-            "- TASK_REQUEST: concrete work to execute/implement/verify.",
-            "- CONTROL_COMMAND: behavioral/style/process directive about how to respond or continue.",
+            "Classify the current turn internally on two axes:",
+            "- intent: TASK, CONTROL, META, or CASUAL.",
+            "- execution: REQUIRED, OPTIONAL, or FORBIDDEN.",
             "Use both current message and recent user messages below.",
             "",
             "Recent user messages (oldest -> newest):",
@@ -260,8 +262,10 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
             f"Current user message: {cls._compact_line(current_message)}",
             "",
             "Decision policy:",
-            "- If CONTROL_COMMAND-only, apply it and continue active work (or ask one short clarification).",
-            "- If TASK_REQUEST, execute necessary tools and finish with complete_task.",
+            "- If execution=REQUIRED, execute necessary tools and finish with complete_task.",
+            "- If execution=OPTIONAL, direct response is allowed; use tools only when needed for correctness.",
+            "- If execution=FORBIDDEN, do not call tools and reply directly.",
+            "- If intent=CONTROL with an active task, apply control and continue that task flow.",
             "[/REQUEST_MODE_CONTEXT]",
             "",
             current_message,
