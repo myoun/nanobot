@@ -30,6 +30,13 @@ class Session:
     metadata: dict[str, Any] = field(default_factory=dict)
     last_consolidated: int = 0  # Number of messages already consolidated to files
     
+    @staticmethod
+    def _normalize_call_id(raw: Any) -> str:
+        """Normalize call IDs like `call_id|item_id` to `call_id`."""
+        if not isinstance(raw, str) or not raw:
+            return ""
+        return raw.split("|", 1)[0]
+
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
         msg = {
@@ -42,12 +49,33 @@ class Session:
         self.updated_at = datetime.now()
     
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
-        """Get recent messages in LLM format, preserving tool metadata."""
+        """Get recent messages in LLM format, preserving valid tool-call chains."""
         out: list[dict[str, Any]] = []
+        seen_call_ids: set[str] = set()
+
         for m in self.messages[-max_messages:]:
             content = m.get("content", "")
             if not isinstance(content, str):
                 content = str(content)
+
+            role = m.get("role")
+            if role == "assistant":
+                tool_calls = m.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    for tc in tool_calls:
+                        if not isinstance(tc, dict):
+                            continue
+                        call_id = self._normalize_call_id(tc.get("id"))
+                        if call_id:
+                            seen_call_ids.add(call_id)
+
+            # Drop orphan tool outputs when the matching function_call was
+            # truncated out of the history window. This prevents Responses API
+            # 400s like "No tool call found for function call output...".
+            if role == "tool":
+                call_id = self._normalize_call_id(m.get("tool_call_id"))
+                if not call_id or call_id not in seen_call_ids:
+                    continue
 
             entry: dict[str, Any] = {"role": m["role"], "content": content}
             for k in ("tool_calls", "tool_call_id", "name"):
