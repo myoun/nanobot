@@ -101,7 +101,7 @@ class AgentLoop:
         "Keep working and call complete_task only after verified progress "
         "with required fields final_answer/artifacts/evidence/actions_taken."
     )
-    _MAX_NO_TOOL_TEXT_ROUNDS = 3
+    _MAX_NO_TOOL_TEXT_ROUNDS = 5
     _MAX_NO_TOOL_EMPTY_ROUNDS = 4
     _PREFILL_FILE_CANDIDATES = ("workspace/PREFILL.md", "PREFILL.md")
     _SESSION_TRACE_MESSAGES_KEY = "_session_trace_messages"
@@ -1204,19 +1204,39 @@ class AgentLoop:
                         "LLM returned no-tool text repeatedly; finalizing latest response fallback"
                     )
                     if do_mode:
-                        final_content = self._NO_TOOL_FALLBACK
+                        final_content = last_nonempty_no_tool_text or self._NO_TOOL_FALLBACK
                     else:
                         final_content = last_nonempty_no_tool_text or self._NO_TOOL_FALLBACK
                     break
 
                 if do_mode:
+                    no_tool_round = no_tool_text_rounds + no_tool_empty_rounds
+                    reason = (
+                        "Retry reason: the previous assistant response had no tool calls "
+                        f"(no-tool round {no_tool_round})."
+                    )
+                    if assistant_text:
+                        reason += (
+                            " Last response summary: "
+                            f"{self._truncate_preview(assistant_text, max_len=220)}"
+                        )
                     nudge = (
                         self._ACTION_RETRY_REASON_NO_PROGRESS
                         if external_tool_attempted and not has_external_progress
-                        else self._ACTION_REQUEST_NUDGE
+                        else (
+                            f"{reason} "
+                            "This turn is execution=REQUIRED. Execute at least one relevant tool now. "
+                            "If blocked, call complete_task(final_answer=...) with a concise failure reason "
+                            "and the exact user action required."
+                        )
                     )
                 else:
-                    nudge = self._NO_ACTION_NUDGE
+                    no_tool_round = no_tool_text_rounds + no_tool_empty_rounds
+                    reason = (
+                        "Retry reason: the previous assistant response had no tool calls "
+                        f"(no-tool round {no_tool_round})."
+                    )
+                    nudge = f"{reason} {self._NO_ACTION_NUDGE}"
                 messages.append({"role": "user", "content": nudge})
 
         if final_content is None:
