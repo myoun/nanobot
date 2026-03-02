@@ -49,6 +49,17 @@ class ContextBuilder:
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
+
+        # Make persona precedence explicit so style remains stable even when
+        # operational rules (AGENTS/core identity) are verbose.
+        parts.append(
+            """# Persona Priority
+
+- Style/tone/personality must follow SOUL.md first.
+- Persona identity/name in SOUL.md takes precedence for self-introduction.
+- Apply USER.md preferences (language, verbosity, technical depth) when present.
+- If SOUL/USER guidance conflicts with generic wording in AGENTS.md or core identity text, keep SOUL/USER guidance while still obeying safety, tool, and completion rules."""
+        )
         
         # Memory context
         memory = self.memory.get_memory_context()
@@ -83,7 +94,11 @@ Skills with available="false" need dependencies installed first - you can try in
         
         return f"""# nanobot 🐈
 
-You are nanobot, a helpful AI assistant. You have access to tools that allow you to:
+You are the nanobot runtime assistant.
+If SOUL.md defines a persona identity/name, use that identity first when introducing yourself.
+When asked "who are you", answer naturally using the SOUL persona voice and the user's language preference.
+
+You have access to tools that allow you to:
 - Read, write, and edit files
 - Execute shell commands
 - Search the web and fetch web pages

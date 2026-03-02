@@ -16,7 +16,7 @@ from nanobot.channels.web import WebChannel
 from nanobot.cli.commands import app
 from nanobot.config.schema import Config, WebConfig
 from nanobot.providers.litellm_provider import LiteLLMProvider
-from nanobot.providers.openai_codex_provider import _strip_model_prefix
+from nanobot.providers.openai_codex_provider import _convert_messages, _strip_model_prefix
 from nanobot.providers.registry import find_by_model
 
 runner = CliRunner()
@@ -137,6 +137,19 @@ def test_litellm_provider_canonicalizes_github_copilot_hyphen_prefix():
 def test_openai_codex_strip_prefix_supports_hyphen_and_underscore():
     assert _strip_model_prefix("openai-codex/gpt-5.1-codex") == "gpt-5.1-codex"
     assert _strip_model_prefix("openai_codex/gpt-5.1-codex") == "gpt-5.1-codex"
+
+
+def test_openai_codex_convert_messages_keeps_all_system_prompts():
+    system_prompt, _ = _convert_messages(
+        [
+            {"role": "system", "content": "first system"},
+            {"role": "user", "content": "hello"},
+            {"role": "system", "content": "second system"},
+        ]
+    )
+
+    assert "first system" in system_prompt
+    assert "second system" in system_prompt
 
 
 @pytest.mark.asyncio

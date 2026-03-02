@@ -154,7 +154,7 @@ def _build_response_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, 
 
 
 def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
-    system_prompt = ""
+    system_prompts: list[str] = []
     input_items: list[dict[str, Any]] = []
 
     for idx, msg in enumerate(messages):
@@ -162,7 +162,8 @@ def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[st
         content = msg.get("content")
 
         if role == "system":
-            system_prompt = content if isinstance(content, str) else ""
+            if isinstance(content, str) and content.strip():
+                system_prompts.append(content.strip())
             continue
 
         if role == "user":
@@ -210,6 +211,7 @@ def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[st
             )
             continue
 
+    system_prompt = "\n\n---\n\n".join(system_prompts)
     return system_prompt, input_items
 
 
