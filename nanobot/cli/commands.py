@@ -462,6 +462,8 @@ def _make_provider(config: Config):
     from nanobot.providers.openai_codex_provider import OpenAICodexProvider
     from nanobot.providers.custom_provider import CustomProvider
 
+    _apply_langsmith_config(config)
+
     model = config.agents.defaults.model
     provider_name = config.get_provider_name(model)
     p = config.get_provider(model)
@@ -493,6 +495,22 @@ def _make_provider(config: Config):
         extra_headers=p.extra_headers if p else None,
         provider_name=provider_name,
     )
+
+
+def _apply_langsmith_config(config: Config) -> None:
+    """Apply LangSmith runtime settings from config.json."""
+    cfg = config.observability.langsmith
+    if not cfg.enabled:
+        return
+
+    os.environ["LANGSMITH_TRACING"] = "true"
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+    if cfg.api_key:
+        os.environ["LANGSMITH_API_KEY"] = cfg.api_key
+    if cfg.project:
+        os.environ["LANGSMITH_PROJECT"] = cfg.project
+    if cfg.endpoint:
+        os.environ["LANGSMITH_ENDPOINT"] = cfg.endpoint
 
 
 # ============================================================================

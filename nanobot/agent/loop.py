@@ -29,6 +29,7 @@ from nanobot.agent.subagent import SubagentManager
 from nanobot.security.approval_store import ApprovalStore
 from nanobot.security.privileged_client import PrivilegedClient
 from nanobot.session.manager import Session, SessionManager
+from nanobot.observability.langsmith import get_langsmith_tracer
 from nanobot.utils.helpers import get_data_path
 
 if TYPE_CHECKING:
@@ -109,6 +110,8 @@ class AgentLoop:
     _SESSION_TRACE_MAX_EVENTS = 40
     _SESSION_TRACE_RESULT_MAX_CHARS = 1200
     _PROGRESS_HINT_HIDE_TOOLS = {"exec"}
+    _TRACE_RECENT_MESSAGES_LIMIT = 8
+    _TRACE_MESSAGE_PREVIEW_MAX_CHARS = 500
     _NO_TOOL_FALLBACK = (
         "I couldn't make progress with tool execution or completion signaling. "
         "Please provide a more specific next instruction."
@@ -198,6 +201,7 @@ class AgentLoop:
                 )
         self._register_default_tools()
         self._process_lock = asyncio.Lock()
+        self._tracer = get_langsmith_tracer()
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -889,6 +893,87 @@ class AgentLoop:
                 hints.append(hint)
         return ", ".join(hints)
 
+    @staticmethod
+    def _trace_content_text(content: Any) -> str:
+        """Normalize structured content into text for trace readability."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+            return "\n".join(parts)
+        return str(content or "")
+
+    @staticmethod
+    def _strip_request_mode_context(text: str) -> str:
+        """Remove injected REQUEST_MODE_CONTEXT block from trace payloads."""
+        stripped = re.sub(
+            r"\[REQUEST_MODE_CONTEXT\][\s\S]*?\[/REQUEST_MODE_CONTEXT\]\s*",
+            "",
+            text or "",
+        ).strip()
+        return stripped or (text or "").strip()
+
+    @classmethod
+    def _extract_latest_user_message(cls, messages: list[dict[str, Any]]) -> str | None:
+        """Return latest user-authored text, without internal mode context wrappers."""
+        for message in reversed(messages):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            text = cls._trace_content_text(message.get("content"))
+            text = cls._strip_request_mode_context(text)
+            if not text:
+                continue
+            return cls._truncate_preview(text, max_len=cls._TRACE_MESSAGE_PREVIEW_MAX_CHARS)
+        return None
+
+    @classmethod
+    def _trace_message_view(cls, message: dict[str, Any]) -> dict[str, Any]:
+        role_value = message.get("role")
+        role = role_value if isinstance(role_value, str) and role_value else "unknown"
+        text = cls._trace_content_text(message.get("content"))
+        if role == "user":
+            text = cls._strip_request_mode_context(text)
+        if text:
+            text = cls._truncate_preview(text, max_len=cls._TRACE_MESSAGE_PREVIEW_MAX_CHARS)
+
+        view: dict[str, Any] = {"role": role, "content": text}
+        tool_name = message.get("name")
+        if role == "tool" and isinstance(tool_name, str) and tool_name:
+            view["name"] = tool_name
+        return view
+
+    @classmethod
+    def _build_trace_focus_input(
+        cls,
+        messages: list[dict[str, Any]],
+        *,
+        request_user_message: str | None = None,
+        recent_limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Build a trace payload focused on the latest real user request."""
+        limit = max(1, recent_limit or cls._TRACE_RECENT_MESSAGES_LIMIT)
+        recent_raw = messages[-limit:] if messages else []
+        recent_messages = [
+            cls._trace_message_view(message)
+            for message in recent_raw
+            if isinstance(message, dict)
+        ]
+        payload: dict[str, Any] = {
+            "latest_user_message": cls._extract_latest_user_message(messages),
+            "recent_messages": recent_messages,
+            "total_messages": len(messages),
+            "omitted_messages": max(0, len(messages) - len(recent_messages)),
+        }
+        if request_user_message:
+            payload["request_user_message"] = request_user_message
+        return payload
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -908,6 +993,7 @@ class AgentLoop:
             Tuple of (final_content, list_of_tools_used, llm_metadata).
         """
         messages = initial_messages
+        request_user_message = self._extract_latest_user_message(initial_messages)
         do_mode = request_mode == self._REQUEST_MODE_DO
         iteration = 0
         final_content = None
@@ -928,6 +1014,20 @@ class AgentLoop:
         agent_browser_closed = False
         prefill_prompt = self._load_prefill_prompt()
         llm_error = False
+        flow_span = self._tracer.start_span(
+            "nanobot.agent_loop",
+            run_type="chain",
+            inputs=self._build_trace_focus_input(
+                messages,
+                request_user_message=request_user_message,
+            ),
+            metadata={
+                "request_mode": request_mode,
+                "model": self.model,
+                "provider": type(self.provider).__name__,
+                "max_iterations": self.max_iterations,
+            },
+        )
 
         async def _emit_progress(content: str = "", *, tool_hint: str | None = None) -> None:
             if not on_progress:
@@ -950,14 +1050,42 @@ class AgentLoop:
             iteration += 1
 
             request_messages = self._append_prefill_tail(messages, prefill_prompt)
-            response = await self.provider.chat(
-                messages=request_messages,
-                tools=self.tools.get_definitions(),
-                model=self.model,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                reasoning_effort=self.reasoning_effort,
+            llm_span = self._tracer.start_span(
+                "llm.chat",
+                run_type="llm",
+                inputs=self._build_trace_focus_input(
+                    request_messages,
+                    request_user_message=request_user_message,
+                ),
+                metadata={"iteration": iteration, "model": self.model},
             )
+            try:
+                response = await self.provider.chat(
+                    messages=request_messages,
+                    tools=self.tools.get_definitions(),
+                    model=self.model,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    reasoning_effort=self.reasoning_effort,
+                )
+            except Exception as e:
+                llm_span.finish(error=e)
+                raise
+            llm_span.set_outputs(
+                {
+                    "content": response.content,
+                    "finish_reason": response.finish_reason,
+                    "usage": response.usage,
+                    "reasoning_content": response.reasoning_content,
+                    "thinking_blocks": response.thinking_blocks,
+                    "metadata": response.metadata,
+                    "tool_calls": [
+                        {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                        for tc in response.tool_calls
+                    ],
+                }
+            )
+            llm_span.finish()
             round_web_search_trace = self._extract_web_search_trace(response.metadata)
             web_search_trace.extend(round_web_search_trace)
             has_external_progress = successful_external_actions > 0 or bool(web_search_trace)
@@ -1044,7 +1172,19 @@ class AgentLoop:
                             agent_browser_closed = True
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    tool_span = self._tracer.start_span(
+                        f"tool.{tool_call.name}",
+                        run_type="tool",
+                        inputs=tool_call.arguments,
+                        metadata={"iteration": iteration, "tool_call_id": tool_call.id},
+                    )
+                    try:
+                        result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    except Exception as e:
+                        tool_span.finish(error=e)
+                        raise
+                    tool_span.set_outputs({"result": result})
+                    tool_span.finish()
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -1270,6 +1410,15 @@ class AgentLoop:
         if llm_error:
             llm_metadata[self._SKIP_SESSION_ASSISTANT_KEY] = True
         llm_metadata["request_mode"] = request_mode
+
+        flow_span.set_outputs(
+            {
+                "final_content": final_content,
+                "tools_used": tools_used,
+                "metadata": llm_metadata,
+            }
+        )
+        flow_span.finish()
 
         return final_content, tools_used, llm_metadata
 

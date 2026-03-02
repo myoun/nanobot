@@ -309,6 +309,21 @@ class ToolsConfig(Base):
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
+class LangSmithConfig(Base):
+    """LangSmith observability configuration."""
+
+    enabled: bool = False
+    api_key: str = ""
+    project: str = "nanobot-dev"
+    endpoint: str = ""
+
+
+class ObservabilityConfig(Base):
+    """Observability configuration."""
+
+    langsmith: LangSmithConfig = Field(default_factory=LangSmithConfig)
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
@@ -317,6 +332,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
 
     @property
     def workspace_path(self) -> Path:

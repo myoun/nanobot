@@ -161,6 +161,32 @@ nanobot agent
 
 That's it! You have a working AI assistant in 2 minutes.
 
+## 🔍 LangSmith Flow Tracing
+
+To visualize nanobot flow in LangSmith (`agent_loop -> llm.chat -> tool.*`), add this to `~/.nanobot/config.json`:
+
+```json
+{
+  "observability": {
+    "langsmith": {
+      "enabled": true,
+      "apiKey": "lsv2_...",
+      "project": "nanobot-dev"
+    }
+  }
+}
+```
+
+Optional override via environment variables:
+
+```bash
+export LANGSMITH_API_KEY="lsv2_..."
+export LANGSMITH_TRACING=true
+export LANGSMITH_PROJECT="nanobot-dev"
+```
+
+Then run nanobot normally (`nanobot agent` or `nanobot gateway`).
+
 ## 💬 Chat Apps
 
 Connect nanobot to your favorite chat platform.
