@@ -380,9 +380,43 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
 # Lookup helpers
 # ---------------------------------------------------------------------------
 
+def _normalize_provider_token(token: str) -> str:
+    """Normalize provider tokens so hyphen/underscore variants match."""
+    return token.lower().replace("-", "_")
+
+
+def _prefix_matches_spec(prefix: str, spec: ProviderSpec) -> bool:
+    """Return True when a normalized model prefix maps to a provider spec."""
+    if _normalize_provider_token(spec.name) == prefix:
+        return True
+    return any(_normalize_provider_token(kw) == prefix for kw in spec.keywords)
+
+
+def find_by_explicit_prefix(
+    model: str,
+    include_gateway_local: bool = False,
+) -> ProviderSpec | None:
+    """Match a provider from explicit model prefix, e.g. provider/model-name."""
+    model_lower = model.lower()
+    if "/" not in model_lower:
+        return None
+
+    prefix = _normalize_provider_token(model_lower.split("/", 1)[0])
+    for spec in PROVIDERS:
+        if not include_gateway_local and (spec.is_gateway or spec.is_local):
+            continue
+        if _prefix_matches_spec(prefix, spec):
+            return spec
+    return None
+
+
 def find_by_model(model: str) -> ProviderSpec | None:
     """Match a standard provider by model-name keyword (case-insensitive).
     Skips gateways/local — those are matched by api_key/api_base instead."""
+    explicit = find_by_explicit_prefix(model)
+    if explicit:
+        return explicit
+
     model_lower = model.lower()
     for spec in PROVIDERS:
         if spec.is_gateway or spec.is_local:

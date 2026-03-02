@@ -22,6 +22,7 @@ class ExecTool(Tool):
         deny_patterns: list[str] | None = None,
         allow_patterns: list[str] | None = None,
         restrict_to_workspace: bool = False,
+        path_append: str = "",
         privileged_enabled: bool = False,
         approval_store: ApprovalStore | None = None,
     ):
@@ -39,6 +40,7 @@ class ExecTool(Tool):
         ]
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
+        self.path_append = path_append
         self.privileged_enabled = privileged_enabled
         self.approval_store = approval_store
         self._default_channel = ""
@@ -100,11 +102,18 @@ class ExecTool(Tool):
 
     async def _run_command(self, command: str, cwd: str) -> str:
         try:
+            env = os.environ.copy()
+            if self.path_append:
+                current_path = env.get("PATH", "")
+                env["PATH"] = (
+                    f"{current_path}{os.pathsep}{self.path_append}" if current_path else self.path_append
+                )
             process = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
+                env=env,
             )
             
             try:

@@ -18,6 +18,30 @@ from nanobot.config.schema import DiscordConfig
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB
+MAX_MESSAGE_LEN = 2000  # Discord message character limit
+
+
+def _split_message(content: str, max_len: int = MAX_MESSAGE_LEN) -> list[str]:
+    """Split content into chunks within max_len, preferring line breaks."""
+    if not content:
+        return []
+    if len(content) <= max_len:
+        return [content]
+    chunks: list[str] = []
+    remaining = content
+    while remaining:
+        if len(remaining) <= max_len:
+            chunks.append(remaining)
+            break
+        cut = remaining[:max_len]
+        pos = cut.rfind("\n")
+        if pos <= 0:
+            pos = cut.rfind(" ")
+        if pos <= 0:
+            pos = max_len
+        chunks.append(remaining[:pos])
+        remaining = remaining[pos:].lstrip()
+    return chunks
 
 
 class DiscordChannel(BaseChannel):
@@ -111,40 +135,66 @@ class DiscordChannel(BaseChannel):
             skipped_lines = [f"[media skipped: attachment limit exceeded: {m}]" for m in skipped_media]
             text_content = "\n".join(part for part in [text_content, *skipped_lines] if part)
 
-        payload: dict[str, Any] = {}
-        if text_content:
-            payload["content"] = text_content
-
-        if msg.reply_to:
-            payload["message_reference"] = {"message_id": msg.reply_to}
-            payload["allowed_mentions"] = {"replied_user": False}
-
         headers = {"Authorization": f"Bot {self.config.token}"}
-        if not payload and not file_media:
+        if not text_content and not file_media:
             return
 
         try:
-            for attempt in range(3):
-                try:
-                    response = await self._post_message(url, headers, payload, file_media)
-                    if response.status_code == 429:
-                        try:
-                            data = response.json()
-                        except Exception:
-                            data = {}
-                        retry_after = float(data.get("retry_after", 1.0))
-                        logger.warning(f"Discord rate limited, retrying in {retry_after}s")
-                        await asyncio.sleep(retry_after)
-                        continue
-                    response.raise_for_status()
+            chunks = _split_message(text_content)
+            if file_media:
+                # Send attachments with the first chunk; follow-up chunks are plain text.
+                first_payload: dict[str, Any] = {}
+                if chunks:
+                    first_payload["content"] = chunks[0]
+                if msg.reply_to:
+                    first_payload["message_reference"] = {"message_id": msg.reply_to}
+                    first_payload["allowed_mentions"] = {"replied_user": False}
+
+                if not await self._send_payload(url, headers, first_payload, file_media):
                     return
-                except Exception as e:
-                    if attempt == 2:
-                        logger.error(f"Error sending Discord message: {e}")
-                    else:
-                        await asyncio.sleep(1)
+                chunks = chunks[1:] if chunks else []
+            else:
+                if not chunks:
+                    return
+
+            for idx, chunk in enumerate(chunks):
+                payload: dict[str, Any] = {"content": chunk}
+                if not file_media and idx == 0 and msg.reply_to:
+                    payload["message_reference"] = {"message_id": msg.reply_to}
+                    payload["allowed_mentions"] = {"replied_user": False}
+                if not await self._send_payload(url, headers, payload):
+                    break
         finally:
             await self._stop_typing(msg.chat_id)
+
+    async def _send_payload(
+        self,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        files: list[Path] | None = None,
+    ) -> bool:
+        """Send one Discord message payload with retry on rate-limit."""
+        for attempt in range(3):
+            try:
+                response = await self._post_message(url, headers, payload, files or [])
+                if response.status_code == 429:
+                    try:
+                        data = response.json()
+                    except Exception:
+                        data = {}
+                    retry_after = float(data.get("retry_after", 1.0))
+                    logger.warning(f"Discord rate limited, retrying in {retry_after}s")
+                    await asyncio.sleep(retry_after)
+                    continue
+                response.raise_for_status()
+                return True
+            except Exception as e:
+                if attempt == 2:
+                    logger.error(f"Error sending Discord message: {e}")
+                else:
+                    await asyncio.sleep(1)
+        return False
 
     async def _post_message(
         self,

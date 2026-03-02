@@ -7,7 +7,7 @@ import mimetypes
 from pathlib import Path
 import re
 from loguru import logger
-from telegram import BotCommand, Update
+from telegram import BotCommand, ReplyParameters, Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 
@@ -130,6 +130,8 @@ class TelegramChannel(BaseChannel):
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
+        self._media_group_buffers: dict[str, dict] = {}
+        self._media_group_tasks: dict[str, asyncio.Task] = {}
     
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -196,6 +198,11 @@ class TelegramChannel(BaseChannel):
         # Cancel all typing indicators
         for chat_id in list(self._typing_tasks):
             self._stop_typing(chat_id)
+
+        for task in self._media_group_tasks.values():
+            task.cancel()
+        self._media_group_tasks.clear()
+        self._media_group_buffers.clear()
         
         if self._app:
             logger.info("Stopping Telegram bot...")
@@ -222,6 +229,18 @@ class TelegramChannel(BaseChannel):
             logger.error(f"Invalid chat_id: {msg.chat_id}")
             return
 
+        reply_params: ReplyParameters | None = None
+        if self.config.reply_to_message:
+            reply_to_message_id = (msg.metadata or {}).get("message_id")
+            if reply_to_message_id is not None:
+                try:
+                    reply_params = ReplyParameters(
+                        message_id=int(reply_to_message_id),
+                        allow_sending_without_reply=True,
+                    )
+                except (TypeError, ValueError):
+                    logger.debug(f"Invalid reply target message_id: {reply_to_message_id}")
+
         text_content = (msg.content or "").strip()
         media_items = [m.strip() for m in msg.media if isinstance(m, str) and m.strip()]
 
@@ -231,7 +250,12 @@ class TelegramChannel(BaseChannel):
             first_caption = text_content[:1024] if text_content else None
             for idx, media_ref in enumerate(media_items):
                 caption = first_caption if idx == 0 and first_caption else None
-                sent = await self._send_media(chat_id, media_ref, caption=caption)
+                sent = await self._send_media(
+                    chat_id,
+                    media_ref,
+                    caption=caption,
+                    reply_parameters=reply_params,
+                )
                 if sent and caption:
                     caption_used = True
                 if not sent:
@@ -246,15 +270,30 @@ class TelegramChannel(BaseChannel):
             for chunk in _split_message(text_content):
                 try:
                     html = _markdown_to_telegram_html(chunk)
-                    await self._app.bot.send_message(chat_id=chat_id, text=html, parse_mode="HTML")
+                    await self._app.bot.send_message(
+                        chat_id=chat_id,
+                        text=html,
+                        parse_mode="HTML",
+                        reply_parameters=reply_params,
+                    )
                 except Exception as e:
                     logger.warning(f"HTML parse failed, falling back to plain text: {e}")
                     try:
-                        await self._app.bot.send_message(chat_id=chat_id, text=chunk)
+                        await self._app.bot.send_message(
+                            chat_id=chat_id,
+                            text=chunk,
+                            reply_parameters=reply_params,
+                        )
                     except Exception as e2:
                         logger.error(f"Error sending Telegram message: {e2}")
 
-    async def _send_media(self, chat_id: int, media_ref: str, caption: str | None = None) -> bool:
+    async def _send_media(
+        self,
+        chat_id: int,
+        media_ref: str,
+        caption: str | None = None,
+        reply_parameters: ReplyParameters | None = None,
+    ) -> bool:
         """Send one media item as photo/document. Supports local path and URL."""
         if not self._app:
             return False
@@ -263,9 +302,19 @@ class TelegramChannel(BaseChannel):
         try:
             if media_ref.startswith(("http://", "https://")):
                 if is_image:
-                    await self._app.bot.send_photo(chat_id=chat_id, photo=media_ref, caption=caption)
+                    await self._app.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=media_ref,
+                        caption=caption,
+                        reply_parameters=reply_parameters,
+                    )
                 else:
-                    await self._app.bot.send_document(chat_id=chat_id, document=media_ref, caption=caption)
+                    await self._app.bot.send_document(
+                        chat_id=chat_id,
+                        document=media_ref,
+                        caption=caption,
+                        reply_parameters=reply_parameters,
+                    )
                 return True
 
             path = Path(media_ref).expanduser()
@@ -275,9 +324,19 @@ class TelegramChannel(BaseChannel):
 
             with path.open("rb") as f:
                 if is_image:
-                    await self._app.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
+                    await self._app.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=f,
+                        caption=caption,
+                        reply_parameters=reply_parameters,
+                    )
                 else:
-                    await self._app.bot.send_document(chat_id=chat_id, document=f, caption=caption)
+                    await self._app.bot.send_document(
+                        chat_id=chat_id,
+                        document=f,
+                        caption=caption,
+                        reply_parameters=reply_parameters,
+                    )
             return True
         except Exception as e:
             logger.error(f"Failed to send Telegram media '{media_ref}': {e}")
@@ -403,6 +462,32 @@ class TelegramChannel(BaseChannel):
         logger.debug(f"Telegram message from {sender_id}: {content[:50]}...")
         
         str_chat_id = str(chat_id)
+
+        # Telegram media groups: buffer briefly, forward as one aggregated turn.
+        if media_group_id := getattr(message, "media_group_id", None):
+            key = f"{str_chat_id}:{media_group_id}"
+            if key not in self._media_group_buffers:
+                self._media_group_buffers[key] = {
+                    "sender_id": sender_id,
+                    "chat_id": str_chat_id,
+                    "contents": [],
+                    "media": [],
+                    "metadata": {
+                        "message_id": message.message_id,
+                        "user_id": user.id,
+                        "username": user.username,
+                        "first_name": user.first_name,
+                        "is_group": message.chat.type != "private",
+                    },
+                }
+                self._start_typing(str_chat_id)
+            buf = self._media_group_buffers[key]
+            if content and content != "[empty message]":
+                buf["contents"].append(content)
+            buf["media"].extend(media_paths)
+            if key not in self._media_group_tasks:
+                self._media_group_tasks[key] = asyncio.create_task(self._flush_media_group(key))
+            return
         
         # Start typing indicator before processing
         self._start_typing(str_chat_id)
@@ -421,6 +506,23 @@ class TelegramChannel(BaseChannel):
                 "is_group": message.chat.type != "private"
             }
         )
+
+    async def _flush_media_group(self, key: str) -> None:
+        """Wait briefly, then forward buffered media-group as one turn."""
+        try:
+            await asyncio.sleep(0.6)
+            if not (buf := self._media_group_buffers.pop(key, None)):
+                return
+            content = "\n".join(buf["contents"]) or "[empty message]"
+            await self._handle_message(
+                sender_id=buf["sender_id"],
+                chat_id=buf["chat_id"],
+                content=content,
+                media=list(dict.fromkeys(buf["media"])),
+                metadata=buf["metadata"],
+            )
+        finally:
+            self._media_group_tasks.pop(key, None)
     
     def _start_typing(self, chat_id: str) -> None:
         """Start sending 'typing...' indicator for a chat."""

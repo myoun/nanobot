@@ -35,8 +35,9 @@ class SubagentManager:
         workspace: Path,
         bus: MessageBus,
         model: str | None = None,
-        temperature: float = 0.7,
+        temperature: float = 0.3,
         max_tokens: int = 4096,
+        reasoning_effort: str | None = None,
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
@@ -48,10 +49,12 @@ class SubagentManager:
         self.model = model or provider.get_default_model()
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.reasoning_effort = reasoning_effort
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
+        self._session_tasks: dict[str, set[str]] = {}
         from nanobot.providers.openai_codex_provider import OpenAICodexProvider
         self._use_native_web_search = not isinstance(provider, OpenAICodexProvider)
     
@@ -61,6 +64,7 @@ class SubagentManager:
         label: str | None = None,
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
+        session_key: str | None = None,
     ) -> str:
         """
         Spawn a subagent to execute a task in the background.
@@ -70,6 +74,7 @@ class SubagentManager:
             label: Optional human-readable label for the task.
             origin_channel: The channel to announce results to.
             origin_chat_id: The chat ID to announce results to.
+            session_key: Optional session key for cancellation tracking.
         
         Returns:
             Status message indicating the subagent was started.
@@ -87,9 +92,18 @@ class SubagentManager:
             self._run_subagent(task_id, task, display_label, origin)
         )
         self._running_tasks[task_id] = bg_task
-        
+        if session_key:
+            self._session_tasks.setdefault(session_key, set()).add(task_id)
+
         # Cleanup when done
-        bg_task.add_done_callback(lambda _: self._running_tasks.pop(task_id, None))
+        def _cleanup(_: asyncio.Task[None]) -> None:
+            self._running_tasks.pop(task_id, None)
+            if session_key and (ids := self._session_tasks.get(session_key)):
+                ids.discard(task_id)
+                if not ids:
+                    del self._session_tasks[session_key]
+
+        bg_task.add_done_callback(_cleanup)
         
         logger.info(f"Spawned subagent [{task_id}]: {display_label}")
         return f"Subagent [{display_label}] started (id: {task_id}). I'll notify you when it completes."
@@ -116,6 +130,7 @@ class SubagentManager:
                 working_dir=str(self.workspace),
                 timeout=self.exec_config.timeout,
                 restrict_to_workspace=self.restrict_to_workspace,
+                path_append=self.exec_config.path_append,
             ))
             if self._use_native_web_search:
                 tools.register(WebSearchTool(api_key=self.brave_api_key))
@@ -142,6 +157,7 @@ class SubagentManager:
                     model=self.model,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
+                    reasoning_effort=self.reasoning_effort,
                 )
                 
                 if response.has_tool_calls:
@@ -261,3 +277,17 @@ When you have completed the task, provide a clear summary of your findings or ac
     def get_running_count(self) -> int:
         """Return the number of currently running subagents."""
         return len(self._running_tasks)
+
+    async def cancel_by_session(self, session_key: str) -> int:
+        """Cancel all subagents for the given session and return cancelled count."""
+        task_ids = list(self._session_tasks.get(session_key, set()))
+        tasks = [
+            self._running_tasks[task_id]
+            for task_id in task_ids
+            if task_id in self._running_tasks and not self._running_tasks[task_id].done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return len(tasks)

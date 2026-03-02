@@ -98,6 +98,8 @@ class ReportToUserTool(Tool):
             content=text,
             metadata={
                 "is_progress_update": True,
+                "_progress": True,
+                "_tool_hint": False,
                 "keep_typing": bool(keep_typing),
             },
         )

@@ -1,0 +1,2 @@
+"""Bundled workspace template files."""
+

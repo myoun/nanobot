@@ -73,6 +73,16 @@ class LiteLLMProvider(LLMProvider):
             resolved = env_val.replace("{api_key}", api_key)
             resolved = resolved.replace("{api_base}", effective_base)
             os.environ.setdefault(env_name, resolved)
+
+    @staticmethod
+    def _canonicalize_model_prefix(model: str, prefix: str) -> str:
+        """Canonicalize hyphen/underscore model prefixes to the provider prefix."""
+        if "/" not in model:
+            return model
+        model_prefix, remainder = model.split("/", 1)
+        if model_prefix.lower().replace("-", "_") == prefix:
+            return f"{prefix}/{remainder}"
+        return model
     
     def _resolve_model(self, model: str) -> str:
         """Resolve model name by applying provider/gateway prefixes."""
@@ -88,6 +98,7 @@ class LiteLLMProvider(LLMProvider):
         # Standard mode: auto-prefix for known providers
         spec = find_by_model(model)
         if spec and spec.litellm_prefix:
+            model = self._canonicalize_model_prefix(model, spec.litellm_prefix)
             if not any(model.startswith(s) for s in spec.skip_prefixes):
                 model = f"{spec.litellm_prefix}/{model}"
         
@@ -109,7 +120,8 @@ class LiteLLMProvider(LLMProvider):
         tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
         max_tokens: int = 4096,
-        temperature: float = 0.7,
+        temperature: float = 0.3,
+        reasoning_effort: str | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request via LiteLLM.
@@ -125,6 +137,7 @@ class LiteLLMProvider(LLMProvider):
             LLMResponse with content and/or tool calls.
         """
         model = self._resolve_model(model or self.default_model)
+        sanitized_messages = self._sanitize_empty_content(messages)
         
         # Clamp max_tokens to at least 1 — negative or zero values cause
         # LiteLLM to reject the request with "max_tokens must be at least 1".
@@ -132,10 +145,12 @@ class LiteLLMProvider(LLMProvider):
         
         kwargs: dict[str, Any] = {
             "model": model,
-            "messages": messages,
+            "messages": sanitized_messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
         
         # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
         self._apply_model_overrides(model, kwargs)
@@ -198,6 +213,7 @@ class LiteLLMProvider(LLMProvider):
             }
         
         reasoning_content = getattr(message, "reasoning_content", None)
+        thinking_blocks = getattr(message, "thinking_blocks", None)
         
         return LLMResponse(
             content=message.content,
@@ -205,6 +221,7 @@ class LiteLLMProvider(LLMProvider):
             finish_reason=choice.finish_reason or "stop",
             usage=usage,
             reasoning_content=reasoning_content,
+            thinking_blocks=thinking_blocks,
         )
     
     def get_default_model(self) -> str:

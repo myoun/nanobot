@@ -64,6 +64,43 @@ def safe_filename(name: str) -> str:
     return name.strip()
 
 
+def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
+    """Sync bundled templates to workspace. Only creates missing files."""
+    from importlib.resources import files as pkg_files
+
+    try:
+        templates_dir = pkg_files("nanobot") / "templates"
+    except Exception:
+        return []
+    if not templates_dir.is_dir():
+        return []
+
+    added: list[str] = []
+
+    def _write(src, dest: Path) -> None:
+        if dest.exists():
+            return
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        text = src.read_text(encoding="utf-8") if src else ""
+        dest.write_text(text, encoding="utf-8")
+        added.append(str(dest.relative_to(workspace)))
+
+    for item in templates_dir.iterdir():
+        if item.name.endswith(".md"):
+            _write(item, workspace / item.name)
+    _write(templates_dir / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md")
+    _write(None, workspace / "memory" / "HISTORY.md")
+    (workspace / "skills").mkdir(exist_ok=True)
+
+    if added and not silent:
+        from rich.console import Console
+
+        for name in added:
+            Console().print(f"  [dim]Created {name}[/dim]")
+
+    return added
+
+
 def parse_session_key(key: str) -> tuple[str, str]:
     """
     Parse a session key into channel and chat_id.

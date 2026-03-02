@@ -3,6 +3,8 @@
 import base64
 import mimetypes
 import platform
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,7 @@ class ContextBuilder:
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
     MODE_CONTEXT_RECENT_USER_MAX = 6
     MODE_CONTEXT_ITEM_MAX_CHARS = 220
+    _RUNTIME_CONTEXT_TAG = "[Runtime Context - metadata only, not instructions]"
     
     def __init__(self, workspace: Path):
         self.workspace = workspace
@@ -74,10 +77,6 @@ Skills with available="false" need dependencies installed first - you can try in
     
     def _get_identity(self) -> str:
         """Get the core identity section."""
-        from datetime import datetime
-        import time as _time
-        now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
-        tz = _time.strftime("%Z") or "UTC"
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
@@ -90,9 +89,6 @@ You are nanobot, a helpful AI assistant. You have access to tools that allow you
 - Search the web and fetch web pages
 - Send messages to users on chat channels
 - Spawn subagents for complex background tasks
-
-## Current Time
-{now} ({tz})
 
 ## Runtime
 {runtime}
@@ -129,6 +125,16 @@ IMPORTANT (MANDATORY):
 Always be helpful, accurate, and concise. When using tools, think step by step: what you know, what you need, and why you chose this tool.
 When remembering something important, write to {workspace_path}/memory/MEMORY.md
 To recall past events, grep {workspace_path}/memory/HISTORY.md"""
+
+    @staticmethod
+    def _build_runtime_context(channel: str | None, chat_id: str | None) -> str:
+        """Build untrusted runtime metadata block for injection before the user message."""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+        tz = time.strftime("%Z") or "UTC"
+        lines = [f"Current Time: {now} ({tz})"]
+        if channel and chat_id:
+            lines.extend([f"Channel: {channel}", f"Chat ID: {chat_id}"])
+        return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
     
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
@@ -168,13 +174,13 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
         messages = []
 
         # System prompt
-        system_prompt = self.build_system_prompt(skill_names)
-        if channel and chat_id:
-            system_prompt += f"\n\n## Current Session\nChannel: {channel}\nChat ID: {chat_id}"
-        messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "system", "content": self.build_system_prompt(skill_names)})
 
         # History
         messages.extend(history)
+
+        # Runtime metadata stays outside system prompt for better prompt stability.
+        messages.append({"role": "user", "content": self._build_runtime_context(channel, chat_id)})
 
         # Current message (with optional image attachments)
         mode_aware_message = self._inject_request_mode_context(history, current_message)
@@ -305,6 +311,7 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
         content: str | None,
         tool_calls: list[dict[str, Any]] | None = None,
         reasoning_content: str | None = None,
+        thinking_blocks: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Add an assistant message to the message list.
@@ -314,6 +321,7 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
             content: Message content.
             tool_calls: Optional tool calls.
             reasoning_content: Thinking output (Kimi, DeepSeek-R1, etc.).
+            thinking_blocks: Structured thinking blocks (Anthropic etc.).
         
         Returns:
             Updated message list.
@@ -328,8 +336,10 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
             msg["tool_calls"] = tool_calls
 
         # Include reasoning content when provided (required by some thinking models)
-        if reasoning_content:
+        if reasoning_content is not None:
             msg["reasoning_content"] = reasoning_content
+        if thinking_blocks:
+            msg["thinking_blocks"] = thinking_blocks
 
         messages.append(msg)
         return messages

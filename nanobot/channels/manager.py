@@ -195,6 +195,16 @@ class ChannelManager:
         while True:
             try:
                 msg = await asyncio.wait_for(self.bus.consume_outbound(), timeout=1.0)
+                metadata = msg.metadata or {}
+                # Prefer explicit flags first; fall back to legacy is_progress_update.
+                is_tool_hint = metadata.get("_tool_hint") is True
+                is_progress = metadata.get("_progress") is True
+                if not is_tool_hint and not is_progress:
+                    is_progress = bool(metadata.get("is_progress_update"))
+                if is_tool_hint and not self.config.channels.send_tool_hints:
+                    continue
+                if is_progress and not self.config.channels.send_progress:
+                    continue
 
                 channel = self.channels.get(msg.channel)
                 if channel:

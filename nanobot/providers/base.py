@@ -24,6 +24,7 @@ class LLMResponse:
     finish_reason: str = "stop"
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1 etc.
+    thinking_blocks: list[dict[str, Any]] | None = None  # Anthropic extended thinking
     metadata: dict[str, Any] = field(default_factory=dict)
     
     @property
@@ -46,6 +47,7 @@ class LLMResponse:
             "finish_reason": self.finish_reason,
             "usage": self.usage,
             "reasoning_content": self.reasoning_content,
+            "thinking_blocks": self.thinking_blocks,
             "metadata": self.metadata,
         }
 
@@ -61,6 +63,26 @@ class LLMProvider(ABC):
     def __init__(self, api_key: str | None = None, api_base: str | None = None):
         self.api_key = api_key
         self.api_base = api_base
+
+    @staticmethod
+    def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """
+        Normalize empty assistant content for provider compatibility.
+
+        Some backends reject empty-string assistant content, while others reject
+        assistant tool-call messages when content is omitted. We normalize both
+        cases to `content=None` for assistant turns.
+        """
+        sanitized: list[dict[str, Any]] = []
+        for message in messages:
+            msg = dict(message)
+            if msg.get("role") == "assistant":
+                if msg.get("content") == "":
+                    msg["content"] = None
+                elif "content" not in msg and msg.get("tool_calls"):
+                    msg["content"] = None
+            sanitized.append(msg)
+        return sanitized
 
     @staticmethod
     def _log_response_debug(response: LLMResponse, model: str | None = None) -> None:
@@ -79,7 +101,8 @@ class LLMProvider(ABC):
         tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
         max_tokens: int = 4096,
-        temperature: float = 0.7,
+        temperature: float = 0.3,
+        reasoning_effort: str | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request.
@@ -90,6 +113,7 @@ class LLMProvider(ABC):
             model: Model identifier (provider-specific).
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
+            reasoning_effort: Optional reasoning intensity hint (provider-specific).
         
         Returns:
             LLMResponse with content and/or tool calls.

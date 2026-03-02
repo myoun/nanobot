@@ -49,11 +49,20 @@ class Session:
         self.updated_at = datetime.now()
     
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
-        """Get recent messages in LLM format, preserving valid tool-call chains."""
+        """Get recent unconsolidated messages, aligned to a user turn and valid tool chains."""
+        unconsolidated = self.messages[self.last_consolidated:]
+        sliced = unconsolidated[-max_messages:]
+
+        # Keep history turn-aligned by starting from the first user message.
+        for i, m in enumerate(sliced):
+            if m.get("role") == "user":
+                sliced = sliced[i:]
+                break
+
         out: list[dict[str, Any]] = []
         seen_call_ids: set[str] = set()
 
-        for m in self.messages[-max_messages:]:
+        for m in sliced:
             content = m.get("content", "")
             if not isinstance(content, str):
                 content = str(content)

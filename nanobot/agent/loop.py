@@ -105,6 +105,7 @@ class AgentLoop:
     _MAX_NO_TOOL_EMPTY_ROUNDS = 4
     _PREFILL_FILE_CANDIDATES = ("workspace/PREFILL.md", "PREFILL.md")
     _SESSION_TRACE_MESSAGES_KEY = "_session_trace_messages"
+    _SKIP_SESSION_ASSISTANT_KEY = "_skip_session_assistant"
     _SESSION_TRACE_MAX_EVENTS = 40
     _SESSION_TRACE_RESULT_MAX_CHARS = 1200
     _PROGRESS_HINT_HIDE_TOOLS = {"exec"}
@@ -121,9 +122,10 @@ class AgentLoop:
         workspace: Path,
         model: str | None = None,
         max_iterations: int = 30,
-        temperature: float = 0.7,
+        temperature: float = 0.3,
         max_tokens: int = 4096,
         memory_window: int = 50,
+        reasoning_effort: str | None = None,
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         cron_service: "CronService | None" = None,
@@ -141,6 +143,7 @@ class AgentLoop:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.memory_window = memory_window
+        self.reasoning_effort = reasoning_effort
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
@@ -156,6 +159,7 @@ class AgentLoop:
             model=self.model,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+            reasoning_effort=self.reasoning_effort,
             brave_api_key=brave_api_key,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
@@ -165,6 +169,7 @@ class AgentLoop:
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
+        self._mcp_connecting = False
         try:
             approvals_path = get_data_path() / "approvals" / "requests.json"
             self._approval_store = ApprovalStore(
@@ -209,6 +214,7 @@ class AgentLoop:
                 working_dir=str(self.workspace),
                 timeout=self.exec_config.timeout,
                 restrict_to_workspace=self.restrict_to_workspace,
+                path_append=self.exec_config.path_append,
                 privileged_enabled=self.exec_config.privileged_enabled,
                 approval_store=self._approval_store,
             )
@@ -241,16 +247,34 @@ class AgentLoop:
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
-        if self._mcp_connected or not self._mcp_servers:
+        if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
             return
-        self._mcp_connected = True
+        self._mcp_connecting = True
         from nanobot.agent.tools.mcp import connect_mcp_servers
+        try:
+            self._mcp_stack = AsyncExitStack()
+            await self._mcp_stack.__aenter__()
+            await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
+            self._mcp_connected = True
+        except Exception as e:
+            logger.error("Failed to connect MCP servers (will retry next message): {}", e)
+            if self._mcp_stack:
+                try:
+                    await self._mcp_stack.aclose()
+                except Exception:
+                    pass
+                self._mcp_stack = None
+            self._mcp_connected = False
+        finally:
+            self._mcp_connecting = False
 
-        self._mcp_stack = AsyncExitStack()
-        await self._mcp_stack.__aenter__()
-        await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
-
-    def _set_tool_context(self, channel: str, chat_id: str, sender_id: str = "") -> None:
+    def _set_tool_context(
+        self,
+        channel: str,
+        chat_id: str,
+        sender_id: str = "",
+        message_id: str | None = None,
+    ) -> None:
         """Update context for all tools that need routing info."""
         if exec_tool := self.tools.get("exec"):
             if isinstance(exec_tool, ExecTool):
@@ -258,7 +282,7 @@ class AgentLoop:
 
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
-                message_tool.set_context(channel, chat_id)
+                message_tool.set_context(channel, chat_id, message_id)
 
         if report_tool := self.tools.get("report_to_user"):
             if isinstance(report_tool, ReportToUserTool):
@@ -386,7 +410,12 @@ class AgentLoop:
             "Continue the original user request in this chat using these results. "
             "If the task is complete, call complete_task(final_answer=...)."
         )
-        self._set_tool_context(msg.channel, msg.chat_id, msg.sender_id)
+        self._set_tool_context(
+            msg.channel,
+            msg.chat_id,
+            msg.sender_id,
+            msg.metadata.get("message_id"),
+        )
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
             current_message=followup_event,
@@ -399,16 +428,18 @@ class AgentLoop:
             request_mode=self._REQUEST_MODE_DO,
         )
         session_trace_messages = llm_metadata.pop(self._SESSION_TRACE_MESSAGES_KEY, None)
+        skip_session_assistant = bool(llm_metadata.pop(self._SKIP_SESSION_ASSISTANT_KEY, False))
         if not final_content:
             final_content = preview
 
         session.add_message("user", msg.content)
         self._append_session_trace_messages(session, session_trace_messages)
-        session.add_message(
-            "assistant",
-            final_content,
-            tools_used=tools_used if tools_used else None,
-        )
+        if not skip_session_assistant:
+            session.add_message(
+                "assistant",
+                final_content,
+                tools_used=tools_used if tools_used else None,
+            )
         self.sessions.save(session)
 
         return OutboundMessage(
@@ -834,12 +865,29 @@ class AgentLoop:
 
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
-        names: list[str] = []
-        for tc in tool_calls:
+        def _fmt(tc: Any) -> str:
             name = getattr(tc, "name", None)
-            if isinstance(name, str) and name and name not in names:
-                names.append(name)
-        return ", ".join(names)
+            if not isinstance(name, str) or not name:
+                return ""
+            args = getattr(tc, "arguments", None) or {}
+            if isinstance(args, list):
+                args = args[0] if args else {}
+            if not isinstance(args, dict):
+                return name
+            val = next(iter(args.values()), None)
+            if not isinstance(val, str):
+                return name
+            compact = " ".join(val.split())
+            if len(compact) > 40:
+                compact = compact[:40] + "…"
+            return f'{name}("{compact}")'
+
+        hints: list[str] = []
+        for tc in tool_calls:
+            hint = _fmt(tc)
+            if hint and hint not in hints:
+                hints.append(hint)
+        return ", ".join(hints)
 
     async def _run_agent_loop(
         self,
@@ -847,7 +895,7 @@ class AgentLoop:
         *,
         initial_external_progress: bool = False,
         request_mode: str = _REQUEST_MODE_CHAT,
-        on_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str], dict[str, Any]]:
         """
         Run the agent iteration loop.
@@ -875,9 +923,28 @@ class AgentLoop:
         no_tool_empty_rounds = 0
         last_nonempty_no_tool_text = ""
         last_progress_text = ""
+        last_tool_hint = ""
         agent_browser_used = False
         agent_browser_closed = False
         prefill_prompt = self._load_prefill_prompt()
+        llm_error = False
+
+        async def _emit_progress(content: str = "", *, tool_hint: str | None = None) -> None:
+            if not on_progress:
+                return
+            try:
+                await on_progress(content, tool_hint=tool_hint)
+                return
+            except TypeError:
+                pass
+
+            # Backward compatibility for callbacks with old signature(content).
+            text = (content or "").strip()
+            if not text and tool_hint:
+                text = tool_hint.strip()
+            if not text:
+                return
+            await on_progress(text)
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -889,12 +956,14 @@ class AgentLoop:
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
+                reasoning_effort=self.reasoning_effort,
             )
             round_web_search_trace = self._extract_web_search_trace(response.metadata)
             web_search_trace.extend(round_web_search_trace)
             has_external_progress = successful_external_actions > 0 or bool(web_search_trace)
             if response.finish_reason == "error":
                 final_content = self._strip_think(response.content) or response.content
+                llm_error = True
                 break
 
             if response.has_tool_calls:
@@ -904,21 +973,25 @@ class AgentLoop:
                     ]
                     if progress_tool_calls:
                         progress_text = self._strip_think(response.content)
-                        if not progress_text:
-                            visible_hint_calls = [
-                                tc
-                                for tc in progress_tool_calls
-                                if tc.name not in self._PROGRESS_HINT_HIDE_TOOLS
-                            ]
-                            progress_text = self._tool_hint(visible_hint_calls)
-                        if progress_text:
-                            try:
+                        visible_hint_calls = [
+                            tc
+                            for tc in progress_tool_calls
+                            if tc.name not in self._PROGRESS_HINT_HIDE_TOOLS
+                        ]
+                        tool_hint = self._tool_hint(visible_hint_calls)
+                        try:
+                            if progress_text:
                                 normalized = " ".join(progress_text.split())
                                 if normalized != last_progress_text:
                                     last_progress_text = normalized
-                                    await on_progress(progress_text)
-                            except Exception as e:
-                                logger.debug(f"Progress callback failed: {e}")
+                                    await _emit_progress(progress_text)
+                            elif tool_hint:
+                                normalized_hint = " ".join(tool_hint.split())
+                                if normalized_hint != last_tool_hint:
+                                    last_tool_hint = normalized_hint
+                                    await _emit_progress(tool_hint=tool_hint)
+                        except Exception as e:
+                            logger.debug(f"Progress callback failed: {e}")
 
                 tool_call_dicts = [
                     {
@@ -933,6 +1006,7 @@ class AgentLoop:
                     response.content,
                     tool_call_dicts,
                     reasoning_content=response.reasoning_content,
+                    thinking_blocks=response.thinking_blocks,
                 )
                 trace_tool_call_dicts = [
                     tc for tc in tool_call_dicts
@@ -1095,6 +1169,7 @@ class AgentLoop:
                     messages,
                     response.content,
                     reasoning_content=response.reasoning_content,
+                    thinking_blocks=response.thinking_blocks,
                 )
 
                 completion_from_text = (
@@ -1172,6 +1247,8 @@ class AgentLoop:
                     }
                 )
             llm_metadata[self._SESSION_TRACE_MESSAGES_KEY] = session_trace_messages
+        if llm_error:
+            llm_metadata[self._SKIP_SESSION_ASSISTANT_KEY] = True
         llm_metadata["request_mode"] = request_mode
 
         return final_content, tools_used, llm_metadata
@@ -1210,6 +1287,8 @@ class AgentLoop:
             except (RuntimeError, BaseExceptionGroup):
                 pass  # MCP SDK cancel scope cleanup is noisy but harmless
             self._mcp_stack = None
+        self._mcp_connected = False
+        self._mcp_connecting = False
 
     def stop(self) -> None:
         """Stop the agent loop."""
@@ -1220,7 +1299,7 @@ class AgentLoop:
         self,
         msg: InboundMessage,
         session_key: str | None = None,
-        on_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """
         Process a single inbound message.
@@ -1316,7 +1395,12 @@ class AgentLoop:
                 metadata=outbound_metadata,
             )
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.sender_id)
+        self._set_tool_context(
+            msg.channel,
+            msg.chat_id,
+            msg.sender_id,
+            msg.metadata.get("message_id"),
+        )
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
             current_message=msg.content,
@@ -1325,18 +1409,37 @@ class AgentLoop:
             chat_id=msg.chat_id,
         )
 
-        async def _bus_progress(content: str) -> None:
+        async def _bus_progress(content: str = "", *, tool_hint: str | None = None) -> None:
             progress_text = self._strip_think(content)
-            if not progress_text:
+            hint_text = self._strip_think(tool_hint)
+            if not progress_text and not hint_text:
                 return
-            progress_metadata = dict(msg.metadata or {})
-            progress_metadata["is_progress_update"] = True
+
+            if progress_text:
+                progress_metadata = dict(msg.metadata or {})
+                progress_metadata["is_progress_update"] = True
+                progress_metadata["_progress"] = True
+                progress_metadata["_tool_hint"] = False
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=progress_text,
+                        metadata=progress_metadata,
+                    )
+                )
+                return
+
+            hint_metadata = dict(msg.metadata or {})
+            hint_metadata["is_progress_update"] = True
+            hint_metadata["_progress"] = False
+            hint_metadata["_tool_hint"] = True
             await self.bus.publish_outbound(
                 OutboundMessage(
                     channel=msg.channel,
                     chat_id=msg.chat_id,
-                    content=progress_text,
-                    metadata=progress_metadata,
+                    content=hint_text or "",
+                    metadata=hint_metadata,
                 )
             )
 
@@ -1348,6 +1451,7 @@ class AgentLoop:
         llm_metadata["request_intent"] = request_intent
         llm_metadata["request_execution"] = request_execution
         session_trace_messages = llm_metadata.pop(self._SESSION_TRACE_MESSAGES_KEY, None)
+        skip_session_assistant = bool(llm_metadata.pop(self._SKIP_SESSION_ASSISTANT_KEY, False))
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
@@ -1359,11 +1463,12 @@ class AgentLoop:
 
         session.add_message("user", msg.content)
         self._append_session_trace_messages(session, session_trace_messages)
-        session.add_message(
-            "assistant",
-            final_content,
-            tools_used=tools_used if tools_used else None,
-        )
+        if not skip_session_assistant:
+            session.add_message(
+                "assistant",
+                final_content,
+                tools_used=tools_used if tools_used else None,
+            )
         session.metadata["last_request_mode"] = request_mode
         session.metadata["last_request_mode_reason"] = mode_reason
         session.metadata["last_request_intent"] = request_intent
@@ -1400,7 +1505,12 @@ class AgentLoop:
 
         session_key = f"{origin_channel}:{origin_chat_id}"
         session = self.sessions.get_or_create(session_key)
-        self._set_tool_context(origin_channel, origin_chat_id, msg.sender_id)
+        self._set_tool_context(
+            origin_channel,
+            origin_chat_id,
+            msg.sender_id,
+            msg.metadata.get("message_id"),
+        )
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
             current_message=msg.content,
@@ -1409,6 +1519,7 @@ class AgentLoop:
         )
         final_content, _, llm_metadata = await self._run_agent_loop(initial_messages)
         session_trace_messages = llm_metadata.pop(self._SESSION_TRACE_MESSAGES_KEY, None)
+        skip_session_assistant = bool(llm_metadata.pop(self._SKIP_SESSION_ASSISTANT_KEY, False))
 
         if final_content is None:
             final_content = "Background task completed."
@@ -1417,10 +1528,11 @@ class AgentLoop:
 
         session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
         self._append_session_trace_messages(session, session_trace_messages)
-        session.add_message(
-            "assistant",
-            final_content,
-        )
+        if not skip_session_assistant:
+            session.add_message(
+                "assistant",
+                final_content,
+            )
         self.sessions.save(session)
 
         return OutboundMessage(
@@ -1540,7 +1652,7 @@ Respond with ONLY valid JSON, no markdown fences."""
         session_key: str = "cli:direct",
         channel: str = "cli",
         chat_id: str = "direct",
-        on_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> str:
         """
         Process a message directly (for CLI or cron usage).
@@ -1570,13 +1682,13 @@ Respond with ONLY valid JSON, no markdown fences."""
         session_key: str = "cli:direct",
         channel: str = "cli",
         chat_id: str = "direct",
-        on_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the full outbound payload."""
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
 
-        async def _noop_progress(_: str) -> None:
+        async def _noop_progress(_: str = "", *, tool_hint: str | None = None) -> None:
             return
 
         async with self._process_lock:

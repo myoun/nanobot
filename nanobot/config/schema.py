@@ -30,6 +30,7 @@ class TelegramConfig(Base):
     proxy: str | None = (
         None  # HTTP/SOCKS5 proxy URL, e.g. "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
     )
+    reply_to_message: bool = False  # If true, bot replies quote the original message
 
 
 class FeishuConfig(Base):
@@ -197,6 +198,8 @@ class ChannelsConfig(Base):
     slack: SlackConfig = Field(default_factory=SlackConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
     web: WebConfig = Field(default_factory=WebConfig)
+    send_progress: bool = True
+    send_tool_hints: bool = True
 
 
 class AgentDefaults(Base):
@@ -205,9 +208,10 @@ class AgentDefaults(Base):
     workspace: str = "~/.nanobot/workspace"
     model: str = "anthropic/claude-opus-4-5"
     max_tokens: int = 8192
-    temperature: float = 0.7
+    temperature: float = 0.3
     max_tool_iterations: int = 30
     memory_window: int = 50
+    reasoning_effort: str | None = None  # low / medium / high
 
 
 class AgentsConfig(Base):
@@ -235,6 +239,7 @@ class ProvidersConfig(Base):
     groq: ProviderConfig = Field(default_factory=ProviderConfig)
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
     dashscope: ProviderConfig = Field(default_factory=ProviderConfig)  # 阿里云通义千问
+    volcengine: ProviderConfig = Field(default_factory=ProviderConfig)
     vllm: ProviderConfig = Field(default_factory=ProviderConfig)
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -247,11 +252,19 @@ class ProvidersConfig(Base):
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth)
 
 
+class HeartbeatConfig(Base):
+    """Heartbeat service configuration."""
+
+    enabled: bool = True
+    interval_s: int = 30 * 60  # 30 minutes
+
+
 class GatewayConfig(Base):
     """Gateway/server configuration."""
 
     host: str = "0.0.0.0"
     port: int = 18790
+    heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
 
 class WebSearchConfig(Base):
@@ -271,6 +284,7 @@ class ExecToolConfig(Base):
     """Shell exec tool configuration."""
 
     timeout: int = 60
+    path_append: str = ""  # Additional PATH entries appended for exec tool
     privileged_enabled: bool = False
     privileged_socket: str = "/run/nanobot-privileged.sock"
     approval_ttl_sec: int = 600
@@ -313,16 +327,25 @@ class Config(BaseSettings):
         self, model: str | None = None
     ) -> tuple["ProviderConfig | None", str | None]:
         """Match provider config and its registry name. Returns (config, spec_name)."""
-        from nanobot.providers.registry import PROVIDERS
+        from nanobot.providers.registry import PROVIDERS, find_by_explicit_prefix
 
-        model_lower = (model or self.agents.defaults.model).lower()
+        model_name = model or self.agents.defaults.model
+        model_lower = model_name.lower()
 
-        # Match by keyword (order follows PROVIDERS registry)
-        for spec in PROVIDERS:
-            p = getattr(self.providers, spec.name, None)
-            if p and any(kw in model_lower for kw in spec.keywords):
-                if spec.is_oauth or p.api_key:
-                    return p, spec.name
+        # Explicit model prefixes (provider/model) win over generic keywords.
+        explicit_spec = find_by_explicit_prefix(model_name, include_gateway_local=True)
+        if explicit_spec:
+            p = getattr(self.providers, explicit_spec.name, None)
+            if p and (explicit_spec.is_oauth or p.api_key):
+                return p, explicit_spec.name
+
+        # Match by keyword (order follows PROVIDERS registry) when no explicit prefix.
+        if not explicit_spec:
+            for spec in PROVIDERS:
+                p = getattr(self.providers, spec.name, None)
+                if p and any(kw in model_lower for kw in spec.keywords):
+                    if spec.is_oauth or p.api_key:
+                        return p, spec.name
 
         # Fallback: gateways first, then others (follows registry order)
         # OAuth providers are NOT valid fallbacks — they require explicit model selection

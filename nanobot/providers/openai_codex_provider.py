@@ -31,10 +31,12 @@ class OpenAICodexProvider(LLMProvider):
         tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
         max_tokens: int = 4096,
-        temperature: float = 0.7,
+        temperature: float = 0.3,
+        reasoning_effort: str | None = None,
     ) -> LLMResponse:
         model = model or self.default_model
-        system_prompt, input_items = _convert_messages(messages)
+        sanitized_messages = self._sanitize_empty_content(messages)
+        system_prompt, input_items = _convert_messages(sanitized_messages)
 
         token = await asyncio.to_thread(get_codex_token)
         headers = _build_headers(token.account_id, token.access)
@@ -50,7 +52,7 @@ class OpenAICodexProvider(LLMProvider):
                 "reasoning.encrypted_content",
                 "web_search_call.action.sources",
             ],
-            "prompt_cache_key": _prompt_cache_key(messages),
+            "prompt_cache_key": _prompt_cache_key(sanitized_messages),
             "tool_choice": "auto",
             "parallel_tool_calls": True,
         }
@@ -90,8 +92,9 @@ class OpenAICodexProvider(LLMProvider):
 
 
 def _strip_model_prefix(model: str) -> str:
-    if model.startswith("openai-codex/"):
-        return model.split("/", 1)[1]
+    for prefix in ("openai-codex/", "openai_codex/"):
+        if model.startswith(prefix):
+            return model[len(prefix):]
     return model
 
 
