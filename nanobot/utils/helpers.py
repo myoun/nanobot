@@ -1,5 +1,6 @@
 """Utility functions for nanobot."""
 
+import os
 from pathlib import Path
 from datetime import datetime
 
@@ -12,6 +13,9 @@ def ensure_dir(path: Path) -> Path:
 
 def get_data_path() -> Path:
     """Get the nanobot data directory (~/.nanobot)."""
+    configured = os.environ.get("NANOBOT_HOME", "").strip()
+    if configured:
+        return ensure_dir(Path(configured).expanduser())
     return ensure_dir(Path.home() / ".nanobot")
 
 
@@ -88,8 +92,6 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
     for item in templates_dir.iterdir():
         if item.name.endswith(".md"):
             _write(item, workspace / item.name)
-    _write(templates_dir / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md")
-    _write(None, workspace / "memory" / "HISTORY.md")
     (workspace / "skills").mkdir(exist_ok=True)
 
     if added and not silent:

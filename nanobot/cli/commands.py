@@ -432,7 +432,8 @@ def onboard():
                 f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)"
             )
     else:
-        save_config(Config())
+        config = Config()
+        save_config(config)
         console.print(f"[green]✓[/green] Created config at {config_path}")
 
     # Create workspace
@@ -444,6 +445,8 @@ def onboard():
 
     # Create default bootstrap files
     sync_workspace_templates(workspace)
+    _configure_codex_profile_on_onboard(config, workspace)
+    save_config(config)
 
     console.print(f"\n{__logo__} nanobot is ready!")
     console.print("\nNext steps:")
@@ -456,10 +459,34 @@ def onboard():
     )
 
 
+def _configure_codex_profile_on_onboard(config: Config, workspace: Path) -> None:
+    """Ask whether nanobot should manage a workspace-local Codex profile."""
+    from nanobot.providers.codex_profile import CodexProfileManager
+
+    manager = CodexProfileManager(workspace, profile_name=config.codex.profile_name)
+    apply_profile = typer.confirm(
+        "Apply nanobot-managed Codex profile for Codex App Server in this workspace?",
+        default=True,
+    )
+    config.codex.use_workspace_profile = apply_profile
+    if apply_profile:
+        manager.ensure_profile()
+        console.print(
+            f"[green]✓[/green] Enabled Codex workspace profile "
+            f"[cyan]{config.codex.profile_name}[/cyan]"
+        )
+        return
+
+    removed = manager.remove_managed_profile()
+    if removed:
+        console.print("[green]✓[/green] Removed nanobot-managed Codex workspace profile files")
+    else:
+        console.print("[dim]Skipped Codex workspace profile setup[/dim]")
+
+
 def _make_provider(config: Config):
     """Create the appropriate LLM provider from config."""
     from nanobot.providers.litellm_provider import LiteLLMProvider
-    from nanobot.providers.openai_codex_provider import OpenAICodexProvider
     from nanobot.providers.custom_provider import CustomProvider
 
     _apply_langsmith_config(config)
@@ -470,7 +497,22 @@ def _make_provider(config: Config):
 
     # OpenAI Codex (OAuth)
     if provider_name == "openai_codex" or model.startswith("openai-codex/"):
-        return OpenAICodexProvider(default_model=model)
+        try:
+            from nanobot.providers.openai_codex_app_server_provider import (
+                OpenAICodexAppServerProvider,
+            )
+        except ModuleNotFoundError as exc:
+            console.print(
+                "[red]Error: OpenAI Codex App Server provider is unavailable in this build.[/red]"
+            )
+            raise typer.Exit(1) from exc
+        return OpenAICodexAppServerProvider(
+            default_model=model,
+            workspace=config.workspace_path,
+            profile_name=config.codex.profile_name,
+            use_workspace_profile=config.codex.use_workspace_profile is not False,
+            sandbox=config.codex.sandbox,
+        )
 
     # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
     if provider_name == "custom":

@@ -1,6 +1,7 @@
 """Base class for agent tools."""
 
 from abc import ABC, abstractmethod
+import json
 from typing import Any
 
 
@@ -101,4 +102,48 @@ class Tool(ABC):
                 "description": self.description,
                 "parameters": self.parameters,
             },
+        }
+
+    def to_dynamic_tool_spec(self, *, defer_loading: bool = False) -> dict[str, Any]:
+        """Convert tool to Codex App Server dynamic tool spec format."""
+        spec: dict[str, Any] = {
+            "name": self.name,
+            "description": self.description,
+            "inputSchema": self.parameters,
+        }
+        if defer_loading:
+            spec["deferLoading"] = True
+        return spec
+
+    @staticmethod
+    def _to_dynamic_content_items(result: Any) -> list[dict[str, Any]]:
+        """Convert a tool result into App Server content items."""
+        if result is None:
+            return []
+
+        if isinstance(result, dict):
+            item_type = result.get("type")
+            if item_type in {"inputText", "inputImage"}:
+                return [result]
+
+        if isinstance(result, (list, tuple)):
+            items: list[dict[str, Any]] = []
+            for item in result:
+                items.extend(Tool._to_dynamic_content_items(item))
+            return items
+
+        if isinstance(result, bytes):
+            text = result.decode("utf-8", errors="replace")
+        elif isinstance(result, str):
+            text = result
+        else:
+            text = json.dumps(result, ensure_ascii=False, sort_keys=True)
+
+        return [{"type": "inputText", "text": text}]
+
+    def to_dynamic_tool_call_response(self, result: Any, *, success: bool = True) -> dict[str, Any]:
+        """Convert a tool execution result to App Server dynamic tool response format."""
+        return {
+            "contentItems": self._to_dynamic_content_items(result),
+            "success": success,
         }

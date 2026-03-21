@@ -20,6 +20,45 @@ If you're running multiple commands in one shell block, add a trap so close runs
 trap 'agent-browser close >/dev/null 2>&1 || true' EXIT
 ```
 
+## Codex / Isolated Runtime Recovery
+
+If `agent-browser` runs inside an isolated Codex runtime, do not stop at the first daemon error.
+
+Follow this recovery order:
+
+1. Verify the binary exists.
+
+```bash
+command -v agent-browser
+```
+
+2. If startup fails with a daemon/socket error, retry once with a stable home directory instead of a temp-only runtime path.
+
+```bash
+export AGENT_BROWSER_HOME="${AGENT_BROWSER_HOME:-$HOME/.agent-browser}"
+```
+
+3. If the machine already has a Playwright Chromium download, point `agent-browser` at it explicitly instead of trying to install a new browser first.
+
+```bash
+CHROME_BIN="$(find "$HOME/.cache/ms-playwright" -path '*/chrome-linux64/chrome' -type f 2>/dev/null | head -n 1)"
+if [ -n "$CHROME_BIN" ]; then
+  AGENT_BROWSER_EXECUTABLE_PATH="$CHROME_BIN" agent-browser open https://example.com
+fi
+```
+
+You can also use the documented flag form:
+
+```bash
+agent-browser --executable-path "$CHROME_BIN" open https://example.com
+```
+
+4. Only if no reusable browser binary exists should you try installation.
+
+5. If startup still fails after the explicit-browser retry, report the exact blocker and fall back to non-browser tools such as native web search or `web_fetch` when they can satisfy the request.
+
+Do not claim browser rendering worked unless `open`/`snapshot`/`get text` actually succeeded.
+
 ## Core Workflow
 
 Every browser automation follows this pattern:

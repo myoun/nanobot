@@ -176,6 +176,9 @@ class WebConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 18790
     token: str | None = None
+    allow_from: list[str] = Field(
+        default_factory=lambda: ["*"]
+    )  # Web sessions are sid-scoped; default to allow all locally.
     allow_origins: list[str] = Field(default_factory=list)
     max_message_bytes: int = 1_048_576
     max_queue_frames: int = 16
@@ -324,6 +327,14 @@ class ObservabilityConfig(Base):
     langsmith: LangSmithConfig = Field(default_factory=LangSmithConfig)
 
 
+class CodexConfig(Base):
+    """Codex runtime configuration."""
+
+    use_workspace_profile: bool | None = None
+    profile_name: str = "nanobot"
+    sandbox: str = "danger-full-access"
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
@@ -333,6 +344,7 @@ class Config(BaseSettings):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+    codex: CodexConfig = Field(default_factory=CodexConfig)
 
     @property
     def workspace_path(self) -> Path:

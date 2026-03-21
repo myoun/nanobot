@@ -32,8 +32,10 @@ You have access to:
 
 ## Memory
 
-- `memory/MEMORY.md` - long-term facts (preferences, context, relationships)
-- `memory/HISTORY.md` - append-only event log, search with grep to recall past events
+- Durable long-term memory lives under `~/.nanobot/memories/`.
+- Use the `memory` tool for durable preferences, facts, instructions, and workspace rules.
+- Do not create `workspace/memory/` and do not store durable memory under `.codex/`.
+- Session continuity belongs in session artifacts like `working_set.md`, `summary.md`, and `transcript.md`, not in ad-hoc memory files.
 
 ## Scheduled Reminders
 
@@ -43,7 +45,7 @@ nanobot cron add --name "reminder" --message "Your message" --at "YYYY-MM-DDTHH:
 ```
 Get USER_ID and CHANNEL from the current session (e.g., `8281248569` and `telegram` from `telegram:8281248569`).
 
-Do not just write reminders to MEMORY.md - that will not trigger actual notifications.
+Do not write reminders into memory files. They will not trigger actual notifications.
 
 ## Heartbeat Tasks
 
@@ -61,4 +63,3 @@ Task format examples:
 ```
 
 When the user asks you to add a recurring or periodic task, update `HEARTBEAT.md` instead of creating a one-time reminder. Keep the file small to minimize token usage.
-

@@ -65,6 +65,7 @@ class SubagentManager:
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         session_key: str | None = None,
+        session_id: str | None = None,
     ) -> str:
         """
         Spawn a subagent to execute a task in the background.
@@ -85,6 +86,8 @@ class SubagentManager:
         origin = {
             "channel": origin_channel,
             "chat_id": origin_chat_id,
+            "session_id": session_id or "",
+            "session_key": session_key or "",
         }
         
         # Create background task
@@ -232,6 +235,10 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
             sender_id="subagent",
             chat_id=f"{origin['channel']}:{origin['chat_id']}",
             content=announce_content,
+            metadata={
+                "session_id": origin.get("session_id") or None,
+                "session_key": origin.get("session_key") or None,
+            },
         )
         
         await self.bus.publish_inbound(msg)

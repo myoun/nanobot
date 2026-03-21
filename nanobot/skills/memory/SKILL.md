@@ -1,6 +1,6 @@
 ---
 name: memory
-description: Two-layer memory system with grep-based recall.
+description: Itemized long-term memory with explicit create/search/read/update workflows.
 always: true
 ---
 
@@ -8,24 +8,23 @@ always: true
 
 ## Structure
 
-- `memory/MEMORY.md` — Long-term facts (preferences, project context, relationships). Always loaded into your context.
-- `memory/HISTORY.md` — Append-only event log. NOT loaded into context. Search it with grep. Each entry starts with [YYYY-MM-DD HH:MM].
+- Durable memory lives under `~/.nanobot/memories/`.
+- Global instructions: `~/.nanobot/memories/global/instructions/*.md`
+- Global facts: `~/.nanobot/memories/global/facts/*.md`
+- Global preferences: `~/.nanobot/memories/global/preferences/*.md`
+- Workspace rules: `~/.nanobot/memories/workspaces/<workspace>/rules/*.md`
+- Workspace memory: `~/.nanobot/memories/workspaces/<workspace>/memory/*.md`
 
-## Search Past Events
+## How to Use It
 
-```bash
-grep -i "keyword" memory/HISTORY.md
-```
+- Use the `memory` tool for all durable memory changes.
+- Create: save a new durable preference, fact, instruction, or workspace rule.
+- Search/list/read: inspect existing memory before creating duplicates.
+- Update: revise an existing item by `item_id`.
 
-Use the `exec` tool to run grep. Combine patterns: `grep -iE "meeting|deadline" memory/HISTORY.md`
+## Rules
 
-## When to Update MEMORY.md
-
-Write important facts immediately using `edit_file` or `write_file`:
-- User preferences ("I prefer dark mode")
-- Project context ("The API uses OAuth2")
-- Relationships ("Alice is the project lead")
-
-## Auto-consolidation
-
-Old conversations are automatically summarized and appended to HISTORY.md when the session grows large. Long-term facts are extracted to MEMORY.md. You don't need to manage this.
+- Do not create `workspace/memory/`.
+- Do not store durable memory under `.codex/`.
+- Do not invent your own long-term memory file path when the `memory` tool can do it.
+- Session continuity belongs in `working_set.md`, `summary.md`, and `transcript.md`, not in global memory.

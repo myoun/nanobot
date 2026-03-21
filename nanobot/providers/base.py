@@ -52,6 +52,17 @@ class LLMResponse:
         }
 
 
+@dataclass
+class AppServerTurnResult:
+    """Structured result returned from a Codex App Server turn."""
+
+    thread_id: str
+    turn_id: str
+    final_text: str
+    tools_used: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
 class LLMProvider(ABC):
     """
     Abstract base class for LLM providers.
@@ -124,3 +135,21 @@ class LLMProvider(ABC):
     def get_default_model(self) -> str:
         """Get the default model for this provider."""
         pass
+
+    @property
+    def uses_app_server(self) -> bool:
+        """Whether the provider routes primary turns through Codex App Server."""
+        return False
+
+    @property
+    def supports_native_web_search(self) -> bool:
+        """Whether the provider already exposes native web search."""
+        return False
+
+    async def run_app_server_turn(self, **_: Any) -> AppServerTurnResult:
+        """Run a turn through the provider's App Server runtime."""
+        raise NotImplementedError("This provider does not support App Server turns")
+
+    async def aclose(self) -> None:
+        """Release provider resources."""
+        return None

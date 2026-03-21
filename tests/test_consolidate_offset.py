@@ -529,7 +529,7 @@ class TestConsolidationDeduplicationGuard:
     async def test_new_command_guard_prevents_concurrent_consolidation(
         self, tmp_path: Path
     ) -> None:
-        """/new command does not run consolidation concurrently with in-flight consolidation."""
+        """Fixed-session /new does not run consolidation concurrently with in-flight consolidation."""
         from nanobot.agent.loop import AgentLoop
         from nanobot.bus.events import InboundMessage
         from nanobot.bus.queue import MessageBus
@@ -545,7 +545,8 @@ class TestConsolidationDeduplicationGuard:
         loop.provider.chat = AsyncMock(return_value=LLMResponse(content="ok", tool_calls=[]))
         loop.tools.get_definitions = MagicMock(return_value=[])
 
-        session = loop.sessions.get_or_create("cli:test")
+        fixed_key = "cli:test"
+        session = loop.sessions.get_or_create(fixed_key)
         for i in range(15):
             session.add_message("user", f"msg{i}")
             session.add_message("assistant", f"resp{i}")
@@ -566,14 +567,14 @@ class TestConsolidationDeduplicationGuard:
         loop._consolidate_memory = _fake_consolidate  # type: ignore[method-assign]
 
         msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="hello")
-        await loop._process_message(msg)
+        await loop._process_message(msg, session_key=fixed_key)
 
         new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
-        await loop._process_message(new_msg)
+        await loop._process_message(new_msg, session_key=fixed_key)
         await asyncio.sleep(0.1)
 
         assert consolidation_calls == 2, (
-            f"Expected normal + /new consolidations, got {consolidation_calls}"
+            f"Expected normal + fixed-session /new consolidations, got {consolidation_calls}"
         )
         assert max_active == 1, (
             f"Expected serialized consolidation, observed concurrency={max_active}"
@@ -626,7 +627,7 @@ class TestConsolidationDeduplicationGuard:
     async def test_new_waits_for_inflight_consolidation_and_preserves_messages(
         self, tmp_path: Path
     ) -> None:
-        """/new waits for in-flight consolidation and archives before clear."""
+        """Fixed-session /new waits for in-flight consolidation and archives before clear."""
         from nanobot.agent.loop import AgentLoop
         from nanobot.bus.events import InboundMessage
         from nanobot.bus.queue import MessageBus
@@ -642,7 +643,8 @@ class TestConsolidationDeduplicationGuard:
         loop.provider.chat = AsyncMock(return_value=LLMResponse(content="ok", tool_calls=[]))
         loop.tools.get_definitions = MagicMock(return_value=[])
 
-        session = loop.sessions.get_or_create("cli:test")
+        fixed_key = "cli:test"
+        session = loop.sessions.get_or_create(fixed_key)
         for i in range(15):
             session.add_message("user", f"msg{i}")
             session.add_message("assistant", f"resp{i}")
@@ -664,11 +666,11 @@ class TestConsolidationDeduplicationGuard:
         loop._consolidate_memory = _fake_consolidate  # type: ignore[method-assign]
 
         msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="hello")
-        await loop._process_message(msg)
+        await loop._process_message(msg, session_key=fixed_key)
         await started.wait()
 
         new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
-        pending_new = asyncio.create_task(loop._process_message(new_msg))
+        pending_new = asyncio.create_task(loop._process_message(new_msg, session_key=fixed_key))
 
         await asyncio.sleep(0.02)
         assert not pending_new.done(), "/new should wait while consolidation is in-flight"
@@ -676,15 +678,15 @@ class TestConsolidationDeduplicationGuard:
         release.set()
         response = await pending_new
         assert response is not None
-        assert "new session started" in response.content.lower()
+        assert "cleared fixed session history" in response.content.lower()
         assert archived_count > 0, "Expected /new archival to process a non-empty snapshot"
 
-        session_after = loop.sessions.get_or_create("cli:test")
+        session_after = loop.sessions.get_or_create(fixed_key)
         assert session_after.messages == [], "Session should be cleared after successful archival"
 
     @pytest.mark.asyncio
     async def test_new_does_not_clear_session_when_archive_fails(self, tmp_path: Path) -> None:
-        """/new must keep session data if archive step reports failure."""
+        """Fixed-session /new must keep session data if archive step reports failure."""
         from nanobot.agent.loop import AgentLoop
         from nanobot.bus.events import InboundMessage
         from nanobot.bus.queue import MessageBus
@@ -700,7 +702,8 @@ class TestConsolidationDeduplicationGuard:
         loop.provider.chat = AsyncMock(return_value=LLMResponse(content="ok", tool_calls=[]))
         loop.tools.get_definitions = MagicMock(return_value=[])
 
-        session = loop.sessions.get_or_create("cli:test")
+        fixed_key = "cli:test"
+        session = loop.sessions.get_or_create(fixed_key)
         for i in range(5):
             session.add_message("user", f"msg{i}")
             session.add_message("assistant", f"resp{i}")
@@ -715,11 +718,11 @@ class TestConsolidationDeduplicationGuard:
         loop._consolidate_memory = _failing_consolidate  # type: ignore[method-assign]
 
         new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
-        response = await loop._process_message(new_msg)
+        response = await loop._process_message(new_msg, session_key=fixed_key)
 
         assert response is not None
         assert "failed" in response.content.lower()
-        session_after = loop.sessions.get_or_create("cli:test")
+        session_after = loop.sessions.get_or_create(fixed_key)
         assert len(session_after.messages) == before_count, (
             "Session must remain intact when /new archival fails"
         )
@@ -728,7 +731,7 @@ class TestConsolidationDeduplicationGuard:
     async def test_new_archives_only_unconsolidated_messages_after_inflight_task(
         self, tmp_path: Path
     ) -> None:
-        """/new should archive only messages not yet consolidated by prior task."""
+        """Fixed-session /new should archive only messages not yet consolidated by prior task."""
         from nanobot.agent.loop import AgentLoop
         from nanobot.bus.events import InboundMessage
         from nanobot.bus.queue import MessageBus
@@ -744,7 +747,8 @@ class TestConsolidationDeduplicationGuard:
         loop.provider.chat = AsyncMock(return_value=LLMResponse(content="ok", tool_calls=[]))
         loop.tools.get_definitions = MagicMock(return_value=[])
 
-        session = loop.sessions.get_or_create("cli:test")
+        fixed_key = "cli:test"
+        session = loop.sessions.get_or_create(fixed_key)
         for i in range(15):
             session.add_message("user", f"msg{i}")
             session.add_message("assistant", f"resp{i}")
@@ -768,11 +772,11 @@ class TestConsolidationDeduplicationGuard:
         loop._consolidate_memory = _fake_consolidate  # type: ignore[method-assign]
 
         msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="hello")
-        await loop._process_message(msg)
+        await loop._process_message(msg, session_key=fixed_key)
         await started.wait()
 
         new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
-        pending_new = asyncio.create_task(loop._process_message(new_msg))
+        pending_new = asyncio.create_task(loop._process_message(new_msg, session_key=fixed_key))
         await asyncio.sleep(0.02)
         assert not pending_new.done()
 
@@ -780,14 +784,14 @@ class TestConsolidationDeduplicationGuard:
         response = await pending_new
 
         assert response is not None
-        assert "new session started" in response.content.lower()
+        assert "cleared fixed session history" in response.content.lower()
         assert archived_count == 3, (
             f"Expected only unconsolidated tail to archive, got {archived_count}"
         )
 
     @pytest.mark.asyncio
     async def test_new_clears_session_and_responds(self, tmp_path: Path) -> None:
-        """/new clears session and returns confirmation."""
+        """Fixed-session /new clears session history and returns confirmation."""
         from nanobot.agent.loop import AgentLoop
         from nanobot.bus.events import InboundMessage
         from nanobot.bus.queue import MessageBus
@@ -802,7 +806,8 @@ class TestConsolidationDeduplicationGuard:
         loop.provider.chat = AsyncMock(return_value=LLMResponse(content="ok", tool_calls=[]))
         loop.tools.get_definitions = MagicMock(return_value=[])
 
-        session = loop.sessions.get_or_create("cli:test")
+        fixed_key = "cli:test"
+        session = loop.sessions.get_or_create(fixed_key)
         for i in range(3):
             session.add_message("user", f"msg{i}")
             session.add_message("assistant", f"resp{i}")
@@ -814,8 +819,8 @@ class TestConsolidationDeduplicationGuard:
         loop._consolidate_memory = _ok_consolidate  # type: ignore[method-assign]
 
         new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
-        response = await loop._process_message(new_msg)
+        response = await loop._process_message(new_msg, session_key=fixed_key)
 
         assert response is not None
-        assert "new session started" in response.content.lower()
-        assert loop.sessions.get_or_create("cli:test").messages == []
+        assert "cleared fixed session history" in response.content.lower()
+        assert loop.sessions.get_or_create(fixed_key).messages == []

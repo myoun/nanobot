@@ -1,8 +1,11 @@
 import shutil
 import asyncio
 import contextlib
+import importlib
 import json
 from pathlib import Path
+import sys
+import types
 from unittest.mock import patch
 
 import httpx
@@ -13,11 +16,12 @@ from typer.testing import CliRunner
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.web import WebChannel
-from nanobot.cli.commands import app
+from nanobot.cli.commands import _make_provider, app
 from nanobot.config.schema import Config, WebConfig
 from nanobot.providers.litellm_provider import LiteLLMProvider
 from nanobot.providers.openai_codex_provider import _convert_messages, _strip_model_prefix
 from nanobot.providers.registry import find_by_model
+from nanobot.utils.helpers import get_data_path
 
 runner = CliRunner()
 
@@ -42,6 +46,7 @@ def mock_paths():
         mock_cp.return_value = config_file
         mock_ws.return_value = workspace_dir
         mock_sc.side_effect = lambda config: config_file.write_text("{}")
+        mock_lc.side_effect = lambda: Config()
 
         yield config_file, workspace_dir
 
@@ -53,15 +58,19 @@ def test_onboard_fresh_install(mock_paths):
     """No existing config — should create from scratch."""
     config_file, workspace_dir = mock_paths
 
-    result = runner.invoke(app, ["onboard"])
+    result = runner.invoke(app, ["onboard"], input="y\n")
 
     assert result.exit_code == 0
     assert "Created config" in result.stdout
     assert "Created workspace" in result.stdout
+    assert "Enabled Codex workspace profile" in result.stdout
     assert "nanobot is ready" in result.stdout
     assert config_file.exists()
     assert (workspace_dir / "AGENTS.md").exists()
-    assert (workspace_dir / "memory" / "MEMORY.md").exists()
+    assert (workspace_dir / ".codex" / "config.toml").exists()
+    assert not (workspace_dir / "memory").exists()
+    assert (get_data_path() / "codex" / "system_prompt.md").exists()
+    assert (get_data_path() / "codex" / "compact_prompt.md").exists()
 
 
 def test_onboard_existing_config_refresh(mock_paths):
@@ -69,13 +78,14 @@ def test_onboard_existing_config_refresh(mock_paths):
     config_file, workspace_dir = mock_paths
     config_file.write_text('{"existing": true}')
 
-    result = runner.invoke(app, ["onboard"], input="n\n")
+    result = runner.invoke(app, ["onboard"], input="n\ny\n")
 
     assert result.exit_code == 0
     assert "Config already exists" in result.stdout
     assert "existing values preserved" in result.stdout
     assert workspace_dir.exists()
     assert (workspace_dir / "AGENTS.md").exists()
+    assert (workspace_dir / ".codex" / "config.toml").exists()
 
 
 def test_onboard_existing_config_overwrite(mock_paths):
@@ -83,7 +93,7 @@ def test_onboard_existing_config_overwrite(mock_paths):
     config_file, workspace_dir = mock_paths
     config_file.write_text('{"existing": true}')
 
-    result = runner.invoke(app, ["onboard"], input="y\n")
+    result = runner.invoke(app, ["onboard"], input="y\ny\n")
 
     assert result.exit_code == 0
     assert "Config already exists" in result.stdout
@@ -97,12 +107,25 @@ def test_onboard_existing_workspace_safe_create(mock_paths):
     workspace_dir.mkdir(parents=True)
     config_file.write_text("{}")
 
-    result = runner.invoke(app, ["onboard"], input="n\n")
+    result = runner.invoke(app, ["onboard"], input="n\ny\n")
 
     assert result.exit_code == 0
     assert "Created workspace" not in result.stdout
     assert "Created AGENTS.md" in result.stdout
     assert (workspace_dir / "AGENTS.md").exists()
+
+
+def test_onboard_can_skip_codex_profile_setup(mock_paths):
+    """User can decline nanobot-managed Codex profile during onboarding."""
+    config_file, workspace_dir = mock_paths
+
+    result = runner.invoke(app, ["onboard"], input="n\n")
+
+    assert result.exit_code == 0
+    assert "Skipped Codex workspace profile setup" in result.stdout
+    assert not (workspace_dir / ".codex" / "config.toml").exists()
+    assert not (get_data_path() / "codex" / "system_prompt.md").exists()
+    assert not (get_data_path() / "codex" / "compact_prompt.md").exists()
 
 
 def test_config_matches_github_copilot_codex_with_hyphen_prefix():
@@ -152,11 +175,102 @@ def test_openai_codex_convert_messages_keeps_all_system_prompts():
     assert "second system" in system_prompt
 
 
+def test_make_provider_uses_openai_codex_app_server_provider(monkeypatch):
+    class FakeProvider:
+        def __init__(
+            self,
+            default_model: str,
+            workspace=None,
+            profile_name=None,
+            use_workspace_profile=True,
+            sandbox="workspace-write",
+        ):
+            self.default_model = default_model
+            self.workspace = workspace
+            self.profile_name = profile_name
+            self.use_workspace_profile = use_workspace_profile
+            self.sandbox = sandbox
+
+    fake_module = types.ModuleType("nanobot.providers.openai_codex_app_server_provider")
+    fake_module.OpenAICodexAppServerProvider = FakeProvider
+    monkeypatch.setitem(
+        sys.modules,
+        "nanobot.providers.openai_codex_app_server_provider",
+        fake_module,
+    )
+
+    config = Config()
+    config.agents.defaults.model = "openai-codex/gpt-5.1-codex"
+
+    provider = _make_provider(config)
+
+    assert isinstance(provider, FakeProvider)
+    assert provider.default_model == "openai-codex/gpt-5.1-codex"
+    assert provider.workspace == config.workspace_path
+    assert provider.profile_name == "nanobot"
+    assert provider.use_workspace_profile is True
+    assert provider.sandbox == "danger-full-access"
+
+
+def test_make_provider_can_disable_workspace_codex_profile(monkeypatch):
+    class FakeProvider:
+        def __init__(
+            self,
+            default_model: str,
+            workspace=None,
+            profile_name=None,
+            use_workspace_profile=True,
+            sandbox="workspace-write",
+        ):
+            self.default_model = default_model
+            self.workspace = workspace
+            self.profile_name = profile_name
+            self.use_workspace_profile = use_workspace_profile
+            self.sandbox = sandbox
+
+    fake_module = types.ModuleType("nanobot.providers.openai_codex_app_server_provider")
+    fake_module.OpenAICodexAppServerProvider = FakeProvider
+    monkeypatch.setitem(
+        sys.modules,
+        "nanobot.providers.openai_codex_app_server_provider",
+        fake_module,
+    )
+
+    config = Config()
+    config.agents.defaults.model = "openai-codex/gpt-5.1-codex"
+    config.codex.use_workspace_profile = False
+    config.codex.profile_name = "nanobot"
+
+    provider = _make_provider(config)
+
+    assert isinstance(provider, FakeProvider)
+    assert provider.use_workspace_profile is False
+    assert provider.sandbox == "danger-full-access"
+
+
+def test_providers_init_exports_openai_codex_app_server_provider(monkeypatch):
+    class FakeProvider:
+        pass
+
+    fake_module = types.ModuleType("nanobot.providers.openai_codex_app_server_provider")
+    fake_module.OpenAICodexAppServerProvider = FakeProvider
+    monkeypatch.setitem(
+        sys.modules,
+        "nanobot.providers.openai_codex_app_server_provider",
+        fake_module,
+    )
+
+    providers_module = importlib.reload(importlib.import_module("nanobot.providers"))
+
+    assert "OpenAICodexAppServerProvider" in providers_module.__all__
+    assert providers_module.OpenAICodexAppServerProvider is FakeProvider
+
+
 @pytest.mark.asyncio
 async def test_web_channel_http_and_ws_roundtrip() -> None:
     bus = MessageBus()
     channel = WebChannel(
-        WebConfig(enabled=True, host="127.0.0.1", port=0),
+        WebConfig(enabled=True, host="127.0.0.1", port=0, allow_from=["*"]),
         bus,
     )
     await channel.start()

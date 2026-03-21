@@ -44,6 +44,10 @@ class ApprovalRequest:
     status: str
     created_at: str
     expires_at: str
+    origin_session_id: str | None = None
+    origin_session_key: str | None = None
+    current_session_id: str | None = None
+    current_session_key: str | None = None
     resolved_at: str | None = None
     resolver_id: str | None = None
     result_preview: str | None = None
@@ -66,6 +70,10 @@ class ApprovalStore:
         self,
         *,
         session_key: str,
+        origin_session_id: str | None = None,
+        origin_session_key: str | None = None,
+        current_session_id: str | None = None,
+        current_session_key: str | None = None,
         channel: str,
         chat_id: str,
         requester_id: str,
@@ -85,6 +93,10 @@ class ApprovalStore:
         req = ApprovalRequest(
             request_id=f"apr_{uuid.uuid4().hex[:10]}",
             session_key=session_key,
+            origin_session_id=origin_session_id,
+            origin_session_key=origin_session_key,
+            current_session_id=current_session_id,
+            current_session_key=current_session_key,
             channel=channel,
             chat_id=chat_id,
             requester_id=requester_id,
@@ -153,6 +165,26 @@ class ApprovalStore:
         return ApprovalRequest(
             request_id=str(item.get("request_id", "")),
             session_key=str(item.get("session_key", "")),
+            origin_session_id=(
+                str(item["origin_session_id"])
+                if item.get("origin_session_id") is not None
+                else None
+            ),
+            origin_session_key=(
+                str(item["origin_session_key"])
+                if item.get("origin_session_key") is not None
+                else None
+            ),
+            current_session_id=(
+                str(item["current_session_id"])
+                if item.get("current_session_id") is not None
+                else None
+            ),
+            current_session_key=(
+                str(item["current_session_key"])
+                if item.get("current_session_key") is not None
+                else None
+            ),
             channel=str(item.get("channel", "")),
             chat_id=str(item.get("chat_id", "")),
             requester_id=str(item.get("requester_id", "")),
@@ -200,4 +232,3 @@ class ApprovalStore:
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.path)
-

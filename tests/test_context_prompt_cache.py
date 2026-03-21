@@ -63,4 +63,21 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert "Chat ID: direct" in runtime_content
 
     assert messages[-1]["role"] == "user"
-    assert messages[-1]["content"] == "Return exactly: OK"
+    assert "[REQUEST_ROUTING_CONTEXT]" in messages[-1]["content"]
+    assert messages[-1]["content"].endswith("Return exactly: OK")
+
+
+def test_prompts_include_agent_browser_recovery_guidance(tmp_path) -> None:
+    """Browser automation guidance should cover isolated Codex runtimes."""
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    system_prompt = builder.build_system_prompt()
+    app_server_prompt = builder.build_app_server_prompt()
+
+    assert 'Do not use skills with `available="false"`' in system_prompt
+    assert "AGENT_BROWSER_EXECUTABLE_PATH" in system_prompt
+    assert "AGENT_BROWSER_HOME" in system_prompt
+
+    assert "AGENT_BROWSER_EXECUTABLE_PATH" in app_server_prompt
+    assert "AGENT_BROWSER_HOME" in app_server_prompt

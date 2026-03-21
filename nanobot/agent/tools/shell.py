@@ -46,12 +46,33 @@ class ExecTool(Tool):
         self._default_channel = ""
         self._default_chat_id = ""
         self._default_sender_id = ""
+        self._lookup_session_key = ""
+        self._current_session_id = ""
+        self._current_session_key = ""
+        self._origin_session_id = ""
+        self._origin_session_key = ""
 
-    def set_context(self, channel: str, chat_id: str, sender_id: str = "") -> None:
+    def set_context(
+        self,
+        channel: str,
+        chat_id: str,
+        sender_id: str = "",
+        *,
+        lookup_session_key: str | None = None,
+        current_session_id: str | None = None,
+        current_session_key: str | None = None,
+        origin_session_id: str | None = None,
+        origin_session_key: str | None = None,
+    ) -> None:
         """Set current routing context for approval-gated privileged requests."""
         self._default_channel = channel
         self._default_chat_id = chat_id
         self._default_sender_id = sender_id
+        self._lookup_session_key = lookup_session_key or f"{channel}:{chat_id}"
+        self._current_session_id = current_session_id or ""
+        self._current_session_key = current_session_key or ""
+        self._origin_session_id = origin_session_id or self._current_session_id
+        self._origin_session_key = origin_session_key or self._current_session_key
     
     @property
     def name(self) -> str:
@@ -170,7 +191,7 @@ class ExecTool(Tool):
         if not self._default_channel or not self._default_chat_id:
             return "Error: Missing chat context for approval-gated privileged execution."
 
-        session_key = f"{self._default_channel}:{self._default_chat_id}"
+        session_key = self._lookup_session_key or f"{self._default_channel}:{self._default_chat_id}"
         if pending := self.approval_store.get_pending(session_key):
             return json.dumps(
                 {
@@ -188,6 +209,10 @@ class ExecTool(Tool):
 
         req = self.approval_store.create_pending(
             session_key=session_key,
+            origin_session_id=self._origin_session_id or None,
+            origin_session_key=self._origin_session_key or None,
+            current_session_id=self._current_session_id or None,
+            current_session_key=self._current_session_key or None,
             channel=self._default_channel,
             chat_id=self._default_chat_id,
             requester_id=self._default_sender_id,
