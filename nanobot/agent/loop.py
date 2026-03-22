@@ -1103,41 +1103,22 @@ class AgentLoop:
 
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
-        def _fmt(tc: Any) -> str:
+        names: list[str] = []
+        for tc in tool_calls:
             name = getattr(tc, "name", None)
             if not isinstance(name, str) or not name:
-                return ""
-            args = getattr(tc, "arguments", None) or {}
-            if isinstance(args, list):
-                args = args[0] if args else {}
-            if not isinstance(args, dict):
-                return name
-            val = next(iter(args.values()), None)
-            if not isinstance(val, str):
-                return name
-            compact = " ".join(val.split())
-            if len(compact) > 40:
-                compact = compact[:40] + "…"
-            return f'{name}("{compact}")'
-
-        hints: list[str] = []
-        for tc in tool_calls:
-            hint = _fmt(tc)
-            if hint and hint not in hints:
-                hints.append(hint)
-        return ", ".join(hints)
+                continue
+            if name not in names:
+                names.append(name)
+        if not names:
+            return ""
+        return f"Using tool: {names[0]}"
 
     @staticmethod
     def _app_server_tool_hint(tool_name: str, arguments: dict[str, Any]) -> str:
         if not tool_name:
             return ""
-        val = next(iter(arguments.values()), None)
-        if not isinstance(val, str):
-            return tool_name
-        compact = " ".join(val.split())
-        if len(compact) > 40:
-            compact = compact[:40] + "…"
-        return f'{tool_name}("{compact}")'
+        return f"Using tool: {tool_name}"
 
     @staticmethod
     def _trace_content_text(content: Any) -> str:

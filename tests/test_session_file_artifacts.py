@@ -114,3 +114,52 @@ def test_session_artifact_store_does_not_migrate_legacy_workspace_artifacts(tmp_
     assert store.root == get_data_path() / "conversations"
     assert legacy_root.exists()
     assert not any(store.root.iterdir())
+
+
+def test_summary_stays_pending_before_tenth_user_turn(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    session = manager.get_active_session("cli:test-summary-pending")
+    session.title = "Pending summary"
+    for idx in range(3):
+        session.add_message("user", f"user turn {idx + 1}")
+        session.add_message("assistant", f"assistant turn {idx + 1}")
+    manager.save(session)
+    assert session.id is not None
+
+    summary_text = (
+        _conversation_dir(tmp_path, "cli:test-summary-pending") / "sessions" / session.id / "summary.md"
+    ).read_text(encoding="utf-8")
+
+    assert "Automatic session summaries update every 10 user turns." in summary_text
+    assert "Current user turns: 3" in summary_text
+    assert "assistant turn 3" not in summary_text
+    assert session.summary == ""
+
+
+def test_summary_updates_only_on_tenth_user_turn_checkpoint(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    session = manager.get_active_session("cli:test-summary-checkpoint")
+    session.title = "Checkpoint summary"
+    for idx in range(10):
+        session.add_message("user", f"user turn {idx + 1}")
+        session.add_message("assistant", f"assistant turn {idx + 1}")
+    manager.save(session)
+    assert session.id is not None
+
+    summary_path = _conversation_dir(tmp_path, "cli:test-summary-checkpoint") / "sessions" / session.id / "summary.md"
+    summary_after_ten = summary_path.read_text(encoding="utf-8")
+
+    assert "Automatic checkpoint summary after 10 user turns." in summary_after_ten
+    assert "Summary Checkpoint: 10 user turns" in summary_after_ten
+    assert "10. User: user turn 10" in summary_after_ten
+    assert session.metadata["summary_checkpoint_turn"] == 10
+    assert session.metadata["summary_source"] == "auto"
+
+    session.add_message("user", "user turn 11")
+    session.add_message("assistant", "assistant turn 11")
+    manager.save(session)
+
+    summary_after_eleven = summary_path.read_text(encoding="utf-8")
+    assert "Automatic checkpoint summary after 10 user turns." in summary_after_eleven
+    assert "Summary Checkpoint: 10 user turns" in summary_after_eleven
+    assert "user turn 11" not in summary_after_eleven

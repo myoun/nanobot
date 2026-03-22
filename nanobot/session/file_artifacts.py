@@ -31,6 +31,10 @@ class SessionArtifactStore:
     """Mirror sessions into a file-first artifact layout."""
 
     _WORKING_SET_AUTO_MARKER = "<!-- nanobot:auto-working-set -->"
+    _SUMMARY_CHECKPOINT_TURNS = 10
+    _SUMMARY_AUTO_SOURCE = "auto"
+    _SUMMARY_MANUAL_SOURCE = "manual"
+    _SUMMARY_AUTO_MARKER = "<!-- nanobot:auto-summary -->"
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
@@ -120,6 +124,46 @@ class SessionArtifactStore:
         self._ensure_working_set(paths, session)
         return paths
 
+    def refresh_summary_checkpoint(self, session: "Session") -> None:
+        """Refresh the session summary only at checkpoint turns."""
+        metadata = session.metadata if isinstance(session.metadata, dict) else {}
+        session.metadata = metadata
+
+        current_summary = session.summary.strip()
+        stored_auto_text = str(metadata.get("summary_auto_text") or "").strip()
+        summary_source = str(metadata.get("summary_source") or "").strip()
+        last_checkpoint_turn = int(metadata.get("summary_checkpoint_turn") or 0)
+        user_turns = self._count_user_turns(session)
+        checkpoint_turn = (user_turns // self._SUMMARY_CHECKPOINT_TURNS) * self._SUMMARY_CHECKPOINT_TURNS
+
+        if current_summary:
+            if summary_source == self._SUMMARY_AUTO_SOURCE and stored_auto_text and current_summary != stored_auto_text:
+                metadata["summary_source"] = self._SUMMARY_MANUAL_SOURCE
+                metadata.pop("summary_auto_text", None)
+                return
+            if summary_source != self._SUMMARY_AUTO_SOURCE:
+                metadata["summary_source"] = self._SUMMARY_MANUAL_SOURCE
+                metadata.pop("summary_auto_text", None)
+                return
+
+        if checkpoint_turn < self._SUMMARY_CHECKPOINT_TURNS:
+            return
+        if metadata.get("summary_source") == self._SUMMARY_MANUAL_SOURCE and current_summary:
+            return
+        if checkpoint_turn <= last_checkpoint_turn and current_summary:
+            return
+
+        previous_summary = stored_auto_text if summary_source == self._SUMMARY_AUTO_SOURCE else current_summary
+        new_summary = self._build_checkpoint_summary_text(
+            session,
+            checkpoint_turn=checkpoint_turn,
+            previous_summary=previous_summary,
+        )
+        session.summary = new_summary
+        metadata["summary_source"] = self._SUMMARY_AUTO_SOURCE
+        metadata["summary_checkpoint_turn"] = checkpoint_turn
+        metadata["summary_auto_text"] = new_summary
+
     def load_working_set(self, session: "Session") -> tuple[Path | None, str]:
         """Return the current working-set file path and content for a session."""
         if not session.id or not session.conversation_key:
@@ -135,7 +179,7 @@ class SessionArtifactStore:
         title = session.title.strip() or f"Session {session.id}"
         summary = session.summary.strip()
         if not summary:
-            summary = self._latest_summary_fallback(session)
+            summary = self._pending_summary_text(session)
 
         lines = [
             f"# {title}",
@@ -149,9 +193,15 @@ class SessionArtifactStore:
         app_server_thread_id = str(session.metadata.get("app_server_thread_id") or "").strip()
         if app_server_thread_id:
             lines.append(f"- App Server Thread: {app_server_thread_id}")
+        if session.summary.strip() and str(session.metadata.get("summary_source") or "") == self._SUMMARY_AUTO_SOURCE:
+            checkpoint_turn = int(session.metadata.get("summary_checkpoint_turn") or 0)
+            if checkpoint_turn:
+                lines.append(f"- Summary Checkpoint: {checkpoint_turn} user turns")
         lines.extend([
             "",
             "## Summary",
+            "",
+            self._SUMMARY_AUTO_MARKER if str(session.metadata.get("summary_source") or "") == self._SUMMARY_AUTO_SOURCE else "",
             "",
             summary or "(empty)",
             "",
@@ -267,6 +317,80 @@ class SessionArtifactStore:
                 *[f"- `{tool}`" for tool in recent_tools],
             ])
         return "\n".join(lines).rstrip() + "\n"
+
+    def _pending_summary_text(self, session: "Session") -> str:
+        user_turns = self._count_user_turns(session)
+        next_checkpoint = self._SUMMARY_CHECKPOINT_TURNS
+        if user_turns >= self._SUMMARY_CHECKPOINT_TURNS:
+            next_checkpoint = ((user_turns // self._SUMMARY_CHECKPOINT_TURNS) + 1) * self._SUMMARY_CHECKPOINT_TURNS
+        return (
+            "Automatic session summaries update every "
+            f"{self._SUMMARY_CHECKPOINT_TURNS} user turns.\n\n"
+            f"Current user turns: {user_turns}\n"
+            f"Next summary checkpoint: {next_checkpoint}"
+        )
+
+    def _build_checkpoint_summary_text(
+        self,
+        session: "Session",
+        *,
+        checkpoint_turn: int,
+        previous_summary: str,
+    ) -> str:
+        recent_turns = self._select_recent_turn_pairs(session, count=self._SUMMARY_CHECKPOINT_TURNS)
+        lines = [
+            f"Automatic checkpoint summary after {checkpoint_turn} user turns.",
+            "",
+        ]
+        if previous_summary:
+            lines.extend([
+                "Previous checkpoint context:",
+                previous_summary,
+                "",
+            ])
+        if session.title.strip():
+            lines.extend([
+                f"Session title: {session.title.strip()}",
+                "",
+            ])
+        lines.append("Recent turn checkpoints:")
+        for idx, (user_text, assistant_text) in enumerate(recent_turns, start=1):
+            lines.append(f"{idx}. User: {user_text}")
+            if assistant_text:
+                lines.append(f"   Assistant: {assistant_text}")
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _count_user_turns(session: "Session") -> int:
+        return sum(1 for message in session.messages if str(message.get("role") or "").lower() == "user")
+
+    def _select_recent_turn_pairs(self, session: "Session", *, count: int) -> list[tuple[str, str]]:
+        pairs: list[tuple[str, str]] = []
+        current_user = ""
+        current_assistant = ""
+
+        for message in session.messages:
+            role = str(message.get("role") or "").lower()
+            content = " ".join(str(message.get("content") or "").strip().split())
+            if not content:
+                continue
+            if role == "user":
+                if current_user:
+                    pairs.append((current_user, current_assistant))
+                    current_assistant = ""
+                current_user = self._truncate_summary_text(content, limit=220)
+            elif role == "assistant" and current_user and not current_assistant:
+                current_assistant = self._truncate_summary_text(content, limit=260)
+
+        if current_user:
+            pairs.append((current_user, current_assistant))
+        return pairs[-count:]
+
+    @staticmethod
+    def _truncate_summary_text(text: str, *, limit: int) -> str:
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3].rstrip() + "..."
 
     @staticmethod
     def _latest_message_text(session: "Session", *, role: str) -> str:

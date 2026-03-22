@@ -493,6 +493,7 @@ class SessionManager:
         }
 
     def save(self, session: Session) -> None:
+        self.artifacts.refresh_summary_checkpoint(session)
         conversation_key = session.conversation_key or self._conversation_key_from_session_key(session.key)
         now = self._now_iso()
         with self._connect() as conn:

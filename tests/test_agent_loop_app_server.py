@@ -148,12 +148,14 @@ async def test_agent_loop_app_server_branch_stores_thread_and_final_text(
         assert fake_client.run_turn_calls
         assert fake_client.ensure_thread_calls[0]["thread_id"] is None
         assert fake_client.run_turn_calls[0]["thread_id"] == "thread-app-123"
-        assert fake_client.run_turn_calls[0]["input_items"][-1]["text"] == "hello from app server"
+        assert fake_client.run_turn_calls[0]["input_items"][-1]["text"] == (
+            "[Current User Message]\nhello from app server"
+        )
         progress = await loop.bus.consume_outbound()
         assert progress.content == "agent-browser 스킬로 직접 확인한다."
         assert progress.metadata["_progress"] is True
         tool_hint = await loop.bus.consume_outbound()
-        assert tool_hint.content == 'echo_tool("hello")'
+        assert tool_hint.content == "Using tool: echo_tool"
         assert tool_hint.metadata["_tool_hint"] is True
         assert loop.bus.outbound_size == 0
 
@@ -164,6 +166,21 @@ async def test_agent_loop_app_server_branch_stores_thread_and_final_text(
         assert session.messages[-1]["tools_used"] == ["echo_tool"]
     finally:
         await loop.close_mcp()
+
+
+def test_tool_hint_formats_common_tools() -> None:
+    assert AgentLoop._app_server_tool_hint(
+        "read_file",
+        {"path": "/home/myoun/.nanobot/workspace/AGENTS.md"},
+    ) == "Using tool: read_file"
+    assert AgentLoop._app_server_tool_hint(
+        "exec",
+        {"command": 'rg -n "heartbeat|HEARTBEAT|cron" /home/myoun/code/nanobot'},
+    ) == "Using tool: exec"
+    assert AgentLoop._app_server_tool_hint(
+        "cron",
+        {"action": "list"},
+    ) == "Using tool: cron"
 
 
 @pytest.mark.asyncio

@@ -124,7 +124,11 @@ Do not use a skill marked `available="false"` unless you first satisfy its requi
             if resolved.is_file() and mime and mime.startswith("image/"):
                 items.append({"type": "localImage", "path": str(resolved)})
 
-        items.append({"type": "text", "text": current_message, "text_elements": []})
+        items.append({
+            "type": "text",
+            "text": self._build_app_server_current_message_block(current_message),
+            "text_elements": [],
+        })
         return items
 
     def _build_prompt(self, identity: str, skill_names: list[str] | None = None) -> str:
@@ -297,7 +301,12 @@ Use the itemized memories under {data_path}/memories for durable long-term state
         lines = [f"Current Time: {now} ({tz})"]
         if channel and chat_id:
             lines.extend([f"Channel: {channel}", f"Chat ID: {chat_id}"])
-        return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
+        return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _build_app_server_current_message_block(current_message: str) -> str:
+        """Wrap the current user message so App Server item flattening keeps boundaries visible."""
+        return "[Current User Message]\n" + current_message
     
     def _load_bootstrap_files(self, filenames: list[str] | None = None) -> str:
         """Load selected bootstrap files from workspace."""

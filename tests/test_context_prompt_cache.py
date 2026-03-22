@@ -81,3 +81,22 @@ def test_prompts_include_agent_browser_recovery_guidance(tmp_path) -> None:
 
     assert "AGENT_BROWSER_EXECUTABLE_PATH" in app_server_prompt
     assert "AGENT_BROWSER_HOME" in app_server_prompt
+
+
+def test_app_server_turn_input_separates_runtime_context_from_current_message(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    items = builder.build_app_server_turn_input(
+        current_message="아 30일에 끝나네.",
+        channel="telegram",
+        chat_id="7659557915",
+    )
+
+    assert items[0]["type"] == "text"
+    assert str(items[0]["text"]).endswith("\n")
+    assert "Chat ID: 7659557915" in str(items[0]["text"])
+
+    assert items[-1]["type"] == "text"
+    assert str(items[-1]["text"]).startswith("[Current User Message]\n")
+    assert str(items[-1]["text"]).endswith("아 30일에 끝나네.")
