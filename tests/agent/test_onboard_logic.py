@@ -370,12 +370,6 @@ class TestChannelInfo:
             token: str = ""
             streaming: bool = True
 
-        class FakeChannels:
-            telegram = ExistingConfig()
-
-        class FakeConfig:
-            channels = FakeChannels()
-
         captured: dict[str, Any] = {}
 
         monkeypatch.setattr(onboard_wizard, "_get_channel_names", lambda: {"telegram": "Telegram"})
@@ -388,14 +382,16 @@ class TestChannelInfo:
 
         monkeypatch.setattr(onboard_wizard, "_configure_pydantic_model", fake_configure)
 
-        config = FakeConfig()
+        config = Config()
+        config.channels.telegram = ExistingConfig()
         _configure_channel(config, "telegram")
 
         assert isinstance(captured["model"], WizardConfig)
         assert captured["model"].enabled is True
         assert captured["model"].token == "token-1"
-        assert isinstance(config.channels.telegram, WizardConfig)
+        assert type(config.channels.telegram) is type(Config().channels.telegram)
         assert config.channels.telegram.streaming is False
+        assert config.model_dump(by_alias=True)["channels"]["telegram"]["streaming"] is False
 
     def test_config_schema_accepts_extended_telegram_fields(self):
         config = Config.model_validate(
@@ -460,10 +456,39 @@ class TestConfigurePydanticModelDrafts:
     def test_discarding_section_keeps_original_model_unchanged(self, monkeypatch):
         model = _SimpleDraftModel()
         self._patch_prompt_helpers(monkeypatch, ["first", "back"])
+        monkeypatch.setattr(
+            onboard_wizard,
+            "questionary",
+            SimpleNamespace(
+                select=lambda *_args, **_kwargs: SimpleNamespace(
+                    ask=lambda: "[D] Discard Section Changes"
+                )
+            ),
+        )
 
         result = _configure_pydantic_model(model, "Simple")
 
         assert result is None
+        assert model.api_key == ""
+
+    def test_back_can_save_section_changes(self, monkeypatch):
+        model = _SimpleDraftModel()
+        self._patch_prompt_helpers(monkeypatch, ["first", "back"])
+        monkeypatch.setattr(
+            onboard_wizard,
+            "questionary",
+            SimpleNamespace(
+                select=lambda *_args, **_kwargs: SimpleNamespace(
+                    ask=lambda: "[S] Save Section Changes"
+                )
+            ),
+        )
+
+        result = _configure_pydantic_model(model, "Simple")
+
+        assert result is not None
+        updated = cast(_SimpleDraftModel, result)
+        assert updated.api_key == "secret"
         assert model.api_key == ""
 
     def test_completing_section_returns_updated_draft(self, monkeypatch):
@@ -480,6 +505,15 @@ class TestConfigurePydanticModelDrafts:
     def test_nested_section_back_discards_nested_edits(self, monkeypatch):
         model = _OuterDraftModel()
         self._patch_prompt_helpers(monkeypatch, ["first", "first", "back", "done"])
+        monkeypatch.setattr(
+            onboard_wizard,
+            "questionary",
+            SimpleNamespace(
+                select=lambda *_args, **_kwargs: SimpleNamespace(
+                    ask=lambda: "[D] Discard Section Changes"
+                )
+            ),
+        )
 
         result = _configure_pydantic_model(model, "Outer")
 

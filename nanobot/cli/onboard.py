@@ -22,7 +22,7 @@ from nanobot.cli.models import (
     get_model_suggestions,
 )
 from nanobot.config.loader import get_config_path, load_config
-from nanobot.config.schema import Config
+from nanobot.config.schema import ChannelsConfig, Config
 
 console = Console()
 
@@ -537,6 +537,28 @@ def _configure_pydantic_model(
         console.print(f"[dim]{display_name}: No configurable fields[/dim]")
         return working_model
 
+    def _has_section_changes() -> bool:
+        return working_model.model_dump(by_alias=True) != model.model_dump(by_alias=True)
+
+    def _resolve_section_exit() -> str:
+        if not _has_section_changes():
+            return "discard"
+        answer = _get_questionary().select(
+            f"{display_name} has unsaved changes. What would you like to do?",
+            choices=[
+                "[S] Save Section Changes",
+                "[D] Discard Section Changes",
+                "[R] Continue Editing",
+            ],
+            default="[R] Continue Editing",
+            qmark=">",
+        ).ask()
+        if answer == "[S] Save Section Changes":
+            return "save"
+        if answer == "[D] Discard Section Changes":
+            return "discard"
+        return "resume"
+
     def get_choices() -> list[str]:
         items = []
         for fname, finfo in fields:
@@ -553,7 +575,12 @@ def _configure_pydantic_model(
         answer = _select_with_back("Select field to configure:", choices)
 
         if answer is _BACK_PRESSED or answer is None:
-            return None
+            action = _resolve_section_exit()
+            if action == "save":
+                return working_model
+            if action == "discard":
+                return None
+            continue
         if answer == "[Done]":
             return working_model
 
@@ -674,8 +701,21 @@ def _get_channel_names() -> dict[str, str]:
 
 def _get_channel_config_class(channel: str) -> type[BaseModel] | None:
     """Get channel config class."""
+    schema_field = ChannelsConfig.model_fields.get(channel)
+    annotation = schema_field.annotation if schema_field else None
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
     entry = _get_channel_info().get(channel)
     return entry[1] if entry else None
+
+
+def _get_channel_storage_class(channel: str) -> type[BaseModel] | None:
+    """Get the canonical storage class for built-in channel config sections."""
+    schema_field = ChannelsConfig.model_fields.get(channel)
+    annotation = schema_field.annotation if schema_field else None
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    return None
 
 
 def _coerce_channel_config_model(current_value: Any, config_cls: type[BaseModel]) -> BaseModel:
@@ -691,12 +731,32 @@ def _coerce_channel_config_model(current_value: Any, config_cls: type[BaseModel]
     return config_cls.model_validate(current_value)
 
 
+def _normalize_channel_config_for_storage(
+    value: Any,
+    storage_cls: type[BaseModel] | None,
+) -> Any:
+    """Convert wizard output into a config value safe for root-config serialization."""
+    if storage_cls is not None:
+        if isinstance(value, storage_cls):
+            return value
+        if isinstance(value, BaseModel):
+            return storage_cls.model_validate(value.model_dump(by_alias=True, exclude_none=False))
+        if isinstance(value, dict):
+            return storage_cls.model_validate(value)
+        return storage_cls.model_validate(value)
+
+    if isinstance(value, BaseModel):
+        return value.model_dump(by_alias=True, exclude_none=False)
+    return value
+
+
 def _configure_channel(config: Config, channel_name: str) -> None:
     """Configure a single channel."""
     channel_value = getattr(config.channels, channel_name, None)
 
     display_name = _get_channel_names().get(channel_name, channel_name)
     config_cls = _get_channel_config_class(channel_name)
+    storage_cls = _get_channel_storage_class(channel_name)
 
     if config_cls is None:
         console.print(f"[red]No configuration class found for {display_name}[/red]")
@@ -709,7 +769,11 @@ def _configure_channel(config: Config, channel_name: str) -> None:
         display_name,
     )
     if updated_channel is not None:
-        setattr(config.channels, channel_name, updated_channel)
+        setattr(
+            config.channels,
+            channel_name,
+            _normalize_channel_config_for_storage(updated_channel, storage_cls),
+        )
 
 
 def _configure_channels(config: Config) -> None:
