@@ -1412,7 +1412,9 @@ class AgentLoop:
         detail = cls._sanitize_tool_detail(text)
         if not detail:
             return ""
-        return f"~~~{language}\n{detail}\n~~~"
+        longest_run = max((len(run) for run in re.findall(r"`+", detail)), default=0)
+        fence = "`" * max(3, longest_run + 1)
+        return f"{fence}{language}\n{detail}\n{fence}"
 
     @classmethod
     def _tool_call_detail(cls, tool_name: str, arguments: dict[str, Any]) -> tuple[str, str]:

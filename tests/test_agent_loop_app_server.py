@@ -190,10 +190,10 @@ async def test_agent_loop_app_server_branch_stores_thread_and_final_text(
         assert progress.content == "agent-browser 스킬로 직접 확인한다."
         assert progress.metadata["_progress"] is True
         tool_hint = await loop.bus.consume_outbound()
-        assert tool_hint.content == 'Using tool: echo_tool\n~~~json\n{\n  "text": "hello"\n}\n~~~'
+        assert tool_hint.content == 'Using tool: echo_tool\n```json\n{\n  "text": "hello"\n}\n```'
         assert tool_hint.metadata["_tool_hint"] is True
         tool_result_hint = await loop.bus.consume_outbound()
-        assert tool_result_hint.content == "Tool result: echo_tool\n~~~text\necho:hello\n~~~"
+        assert tool_result_hint.content == "Tool result: echo_tool\n```text\necho:hello\n```"
         assert tool_result_hint.metadata["_tool_hint"] is True
         assert loop.bus.outbound_size == 0
 
@@ -211,22 +211,26 @@ def test_tool_hint_formats_common_tools() -> None:
     assert AgentLoop._app_server_tool_hint(
         "read_file",
         {"path": "/home/myoun/.nanobot/workspace/AGENTS.md"},
-    ) == "Using tool: read_file\n~~~text\n/home/myoun/.nanobot/workspace/AGENTS.md\n~~~"
+    ) == "Using tool: read_file\n```text\n/home/myoun/.nanobot/workspace/AGENTS.md\n```"
     assert AgentLoop._app_server_tool_hint(
         "exec",
         {"command": 'rg -n "heartbeat|HEARTBEAT|cron" /home/myoun/code/nanobot'},
-    ) == 'Using tool: exec\n~~~bash\nrg -n "heartbeat|HEARTBEAT|cron" /home/myoun/code/nanobot\n~~~'
+    ) == 'Using tool: exec\n```bash\nrg -n "heartbeat|HEARTBEAT|cron" /home/myoun/code/nanobot\n```'
     assert AgentLoop._app_server_tool_hint(
         "cron",
         {"action": "list"},
-    ) == 'Using tool: cron\n~~~json\n{\n  "action": "list"\n}\n~~~'
+    ) == 'Using tool: cron\n```json\n{\n  "action": "list"\n}\n```'
 
 
 def test_app_server_tool_result_hint_formats_preview() -> None:
     assert AgentLoop._app_server_tool_result_hint(
         "read_file",
         "1| line one\n2| line two",
-    ) == "Tool result: read_file\n~~~text\n1| line one\n2| line two\n~~~"
+    ) == "Tool result: read_file\n```text\n1| line one\n2| line two\n```"
+
+
+def test_tool_detail_block_uses_longer_fence_when_needed() -> None:
+    assert AgentLoop._tool_detail_block("print('```')", language="python") == "````python\nprint('```')\n````"
 
 
 @pytest.mark.asyncio
