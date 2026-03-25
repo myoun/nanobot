@@ -13,7 +13,7 @@ from nanobot.utils.helpers import build_status_content
 
 
 async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
-    """Cancel all active tasks and subagents for the session."""
+    """Cancel all active tasks for the session."""
     loop = ctx.loop
     msg = ctx.msg
     tasks = loop._active_tasks.pop(msg.session_key, [])
@@ -23,7 +23,10 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
             await t
         except (asyncio.CancelledError, Exception):
             pass
-    sub_cancelled = await loop.subagents.cancel_by_session(msg.session_key)
+    sub_cancelled = 0
+    subagents = getattr(loop, "subagents", None)
+    if subagents is not None and hasattr(subagents, "cancel_by_session"):
+        sub_cancelled = await subagents.cancel_by_session(msg.session_key)
     total = cancelled + sub_cancelled
     content = f"Stopped {total} task(s)." if total else "No active task to stop."
     return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
@@ -44,7 +47,22 @@ async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
 async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     """Build an outbound status message for a session."""
     loop = ctx.loop
-    session = loop.sessions.get_or_create(ctx.key)
+    session = ctx.session or loop.sessions.get_or_create(ctx.key)
+    status_builder = getattr(loop, "_build_status_lines", None)
+    if callable(status_builder):
+        session = loop._refresh_session(session)
+        lines = await status_builder(
+            session=session,
+            conversation_key=ctx.msg.session_key,
+            fixed_session_mode=ctx.key != ctx.msg.session_key,
+        )
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="\n".join(lines),
+            metadata={"render_as": "text"},
+        )
+
     ctx_est = 0
     try:
         ctx_est, _ = loop.memory_consolidator.estimate_session_prompt_tokens(session)
@@ -96,8 +114,10 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
         "🐈 nanobot commands:",
         "/new — Start a new conversation",
         "/stop — Stop the current task",
+        "/model — Show or change the current model",
+        "/routing — Toggle intent/execution routing",
         "/restart — Restart the bot",
-        "/status — Show bot status",
+        "/status — Show current session and Codex status",
         "/help — Show available commands",
     ]
     return OutboundMessage(
