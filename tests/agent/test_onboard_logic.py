@@ -349,19 +349,8 @@ class TestSyncWorkspaceTemplates:
             assert not Path(path).is_absolute()
 
 
-class TestProviderChannelInfo:
-    """Tests for provider and channel info retrieval."""
-
-    def test_get_provider_names_returns_dict(self):
-        from nanobot.cli.onboard import _get_provider_names
-
-        names = _get_provider_names()
-        assert isinstance(names, dict)
-        assert len(names) > 0
-        # Should include common providers
-        assert "openai" in names or "anthropic" in names
-        assert "openai_codex" not in names
-        assert "github_copilot" not in names
+class TestChannelInfo:
+    """Tests for channel info retrieval."""
 
     def test_get_channel_names_returns_dict(self):
         from nanobot.cli.onboard import _get_channel_names
@@ -370,16 +359,6 @@ class TestProviderChannelInfo:
         assert isinstance(names, dict)
         # Should include at least some channels
         assert len(names) >= 0
-
-    def test_get_provider_info_returns_valid_structure(self):
-        from nanobot.cli.onboard import _get_provider_info
-
-        info = _get_provider_info()
-        assert isinstance(info, dict)
-        # Each value should be a tuple with expected structure
-        for provider_name, value in info.items():
-            assert isinstance(value, tuple)
-            assert len(value) == 4  # (display_name, needs_api_key, needs_api_base, env_var)
 
     def test_configure_channel_accepts_existing_schema_model_of_different_class(self, monkeypatch):
         class ExistingConfig(BaseModel):
@@ -624,6 +603,27 @@ class TestRunOnboardExitBehavior:
 
         assert result.should_save is False
         assert visited == ["Codex"]
+
+    def test_main_menu_omits_provider_entry(self, monkeypatch):
+        initial_config = Config()
+        captured: dict[str, list[str]] = {}
+
+        def fake_select(_message, *, choices, **_kwargs):
+            captured["choices"] = list(choices)
+            return SimpleNamespace(ask=lambda: "[X] Exit Without Saving")
+
+        monkeypatch.setattr(onboard_wizard, "_show_main_menu_header", lambda: None)
+        monkeypatch.setattr(
+            onboard_wizard,
+            "questionary",
+            SimpleNamespace(select=fake_select),
+        )
+
+        result = run_onboard(initial_config=initial_config)
+
+        assert result.should_save is False
+        assert "[O] Codex" in captured["choices"]
+        assert "[P] LLM Provider" not in captured["choices"]
 
 
 class TestCodexOnboardSync:

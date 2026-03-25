@@ -227,7 +227,7 @@ class AgentDefaults(Base):
     """Default agent configuration."""
 
     workspace: str = "~/.nanobot/workspace"
-    model: str = "anthropic/claude-opus-4-5"
+    model: str = "openai-codex/gpt-5.3-codex"
     max_tokens: int = 8192
     context_window_tokens: int = 65_536
     temperature: float = 0.3
@@ -367,7 +367,8 @@ class Config(BaseSettings):
 
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
-    providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
+    # Legacy compatibility only. We no longer write multi-provider config back out.
+    providers: ProvidersConfig = Field(default_factory=ProvidersConfig, exclude=True)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)

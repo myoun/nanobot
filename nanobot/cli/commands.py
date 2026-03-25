@@ -502,8 +502,7 @@ def onboard(
         console.print(f"  1. Chat: [cyan]{agent_cmd}[/cyan]")
         console.print(f"  2. Start gateway: [cyan]{gateway_cmd}[/cyan]")
     else:
-        console.print(f"  1. Add your API key to [cyan]{config_path}[/cyan]")
-        console.print("     Get one at: https://openrouter.ai/keys")
+        console.print("  1. Authenticate Codex: [cyan]nanobot codex login[/cyan]")
         console.print(f"  2. Chat: [cyan]{agent_cmd}[/cyan]")
         console.print("  3. Optional privileged setup: [cyan]nanobot privileged setup[/cyan]")
     console.print(
@@ -594,57 +593,29 @@ def _configure_codex_profile_on_onboard(
 
 
 def _make_provider(config: Config):
-    """Create the appropriate LLM provider from config."""
-    from nanobot.providers.litellm_provider import LiteLLMProvider
-    from nanobot.providers.custom_provider import CustomProvider
+    """Create the Codex App Server runtime provider."""
+    model = config.agents.defaults.model
+    if not model:
+        model = "openai-codex/gpt-5.3-codex"
 
     _apply_langsmith_config(config)
 
-    model = config.agents.defaults.model
-    provider_name = config.get_provider_name(model)
-    p = config.get_provider(model)
-
-    # OpenAI Codex (OAuth)
-    if provider_name == "openai_codex" or model.startswith("openai-codex/"):
-        try:
-            from nanobot.providers.openai_codex_app_server_provider import (
-                OpenAICodexAppServerProvider,
-            )
-        except ModuleNotFoundError as exc:
-            console.print(
-                "[red]Error: OpenAI Codex App Server provider is unavailable in this build.[/red]"
-            )
-            raise typer.Exit(1) from exc
-        return OpenAICodexAppServerProvider(
-            default_model=model,
-            workspace=config.workspace_path,
-            profile_name=config.codex.profile_name,
-            use_workspace_profile=config.codex.use_workspace_profile is not False,
-            sandbox=config.codex.sandbox,
+    try:
+        from nanobot.providers.openai_codex_app_server_provider import (
+            OpenAICodexAppServerProvider,
         )
-
-    # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
-    if provider_name == "custom":
-        return CustomProvider(
-            api_key=p.api_key if p else "no-key",
-            api_base=config.get_api_base(model) or "http://localhost:8000/v1",
-            default_model=model,
+    except ModuleNotFoundError as exc:
+        console.print(
+            "[red]Error: Codex App Server provider is unavailable in this build.[/red]"
         )
+        raise typer.Exit(1) from exc
 
-    from nanobot.providers.registry import find_by_name
-
-    spec = find_by_name(provider_name)
-    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
-        console.print("[red]Error: No API key configured.[/red]")
-        console.print("Set one in ~/.nanobot/config.json under providers section")
-        raise typer.Exit(1)
-
-    return LiteLLMProvider(
-        api_key=p.api_key if p else None,
-        api_base=config.get_api_base(model),
+    return OpenAICodexAppServerProvider(
         default_model=model,
-        extra_headers=p.extra_headers if p else None,
-        provider_name=provider_name,
+        workspace=config.workspace_path,
+        profile_name=config.codex.profile_name,
+        use_workspace_profile=config.codex.use_workspace_profile is not False,
+        sandbox=config.codex.sandbox,
     )
 
 
@@ -1556,33 +1527,27 @@ def status():
     )
 
     if config_path.exists():
-        from nanobot.providers.registry import PROVIDERS
-
         console.print(f"Model: {config.agents.defaults.model}")
-
-        # Check API keys from registry
-        for spec in PROVIDERS:
-            p = getattr(config.providers, spec.name, None)
-            if p is None:
-                continue
-            if spec.is_oauth:
-                console.print(f"{spec.label}: [green]✓ (OAuth)[/green]")
-            elif spec.is_local:
-                # Local deployments show api_base instead of api_key
-                if p.api_base:
-                    console.print(f"{spec.label}: [green]✓ {p.api_base}[/green]")
-                else:
-                    console.print(f"{spec.label}: [dim]not set[/dim]")
-            else:
-                has_key = bool(p.api_key)
-                console.print(
-                    f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}"
-                )
+        console.print("Runtime: Codex App Server")
+        profile_state = config.codex.use_workspace_profile
+        if profile_state is None:
+            console.print("Codex workspace profile: [dim]auto[/dim]")
+        else:
+            console.print(
+                "Codex workspace profile: "
+                f"{'[green]enabled[/green]' if profile_state else '[dim]disabled[/dim]'}"
+            )
+        console.print(f"Codex profile name: {config.codex.profile_name}")
+        console.print(f"Codex sandbox: {config.codex.sandbox}")
+        console.print(f"Codex auth: {_get_codex_auth_label()}")
 
 
 # ============================================================================
-# OAuth Login
+# Codex Runtime
 # ============================================================================
+
+codex_app = typer.Typer(help="Manage Codex runtime")
+app.add_typer(codex_app, name="codex")
 
 provider_app = typer.Typer(help="Manage providers")
 app.add_typer(provider_app, name="provider")
@@ -1597,6 +1562,30 @@ def _register_login(name: str):
         return fn
 
     return decorator
+
+
+def _get_codex_auth_label() -> str:
+    """Return a short label describing Codex OAuth availability."""
+    try:
+        from oauth_cli_kit import get_token
+
+        token = get_token()
+    except Exception:
+        token = None
+
+    if token and getattr(token, "access", None):
+        account_id = getattr(token, "account_id", "")
+        if account_id:
+            return f"[green]✓[/green] {account_id}"
+        return "[green]✓[/green] authenticated"
+    return "[dim]not authenticated[/dim]"
+
+
+@codex_app.command("login")
+def codex_login():
+    """Authenticate with Codex OAuth."""
+    console.print(f"{__logo__} Codex Login\n")
+    _login_openai_codex()
 
 
 @provider_app.command("login")

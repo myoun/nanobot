@@ -48,6 +48,7 @@ _SELECT_FIELD_HINTS: dict[str, tuple[list[str], str]] = {
 # --- Key Bindings for Navigation ---
 
 _BACK_PRESSED = object()  # Sentinel value for back navigation
+_CODEX_MODEL_PROVIDER = "openai-codex"
 
 
 def _get_questionary():
@@ -387,13 +388,6 @@ def _input_with_existing(
 # --- Pydantic Model Configuration ---
 
 
-def _get_current_provider(model: BaseModel) -> str:
-    """Get the current provider setting from a model (if available)."""
-    if hasattr(model, "provider"):
-        return getattr(model, "provider", "auto") or "auto"
-    return "auto"
-
-
 def _input_model_with_autocomplete(
     display_name: str, current: Any, provider: str
 ) -> str | None:
@@ -464,8 +458,7 @@ def _input_context_window_with_recommendation(
             console.print("[yellow]! Please configure the model field first[/yellow]")
             return None
 
-        provider = _get_current_provider(model_obj)
-        context_limit = get_model_context_limit(model_name, provider)
+        context_limit = get_model_context_limit(model_name, _CODEX_MODEL_PROVIDER)
 
         if context_limit:
             console.print(f"[green]+ Recommended context window: {format_token_count(context_limit)} tokens[/green]")
@@ -494,8 +487,11 @@ def _handle_model_field(
     working_model: BaseModel, field_name: str, field_display: str, current_value: Any
 ) -> None:
     """Handle the 'model' field with autocomplete and context-window auto-fill."""
-    provider = _get_current_provider(working_model)
-    new_value = _input_model_with_autocomplete(field_display, current_value, provider)
+    new_value = _input_model_with_autocomplete(
+        field_display,
+        current_value,
+        _CODEX_MODEL_PROVIDER,
+    )
     if new_value is not None and new_value != current_value:
         setattr(working_model, field_name, new_value)
         _try_auto_fill_context_window(working_model, new_value)
@@ -638,101 +634,13 @@ def _try_auto_fill_context_window(model: BaseModel, new_model_name: str) -> None
     if current_context != default_context:
         return  # User has customized it, don't override
 
-    provider = _get_current_provider(model)
-    context_limit = get_model_context_limit(new_model_name, provider)
+    context_limit = get_model_context_limit(new_model_name, _CODEX_MODEL_PROVIDER)
 
     if context_limit:
         setattr(model, "context_window_tokens", context_limit)
         console.print(f"[green]+ Auto-filled context window: {format_token_count(context_limit)} tokens[/green]")
     else:
         console.print("[dim](i) Could not auto-fill context window (model not in database)[/dim]")
-
-
-# --- Provider Configuration ---
-
-
-@lru_cache(maxsize=1)
-def _get_provider_info() -> dict[str, tuple[str, bool, bool, str]]:
-    """Get provider info from registry (cached)."""
-    from nanobot.providers.registry import PROVIDERS
-
-    return {
-        spec.name: (
-            spec.display_name or spec.name,
-            spec.is_gateway,
-            spec.is_local,
-            spec.default_api_base,
-        )
-        for spec in PROVIDERS
-        if not spec.is_oauth
-    }
-
-
-def _get_provider_names() -> dict[str, str]:
-    """Get provider display names."""
-    info = _get_provider_info()
-    return {name: data[0] for name, data in info.items() if name}
-
-
-def _configure_provider(config: Config, provider_name: str) -> None:
-    """Configure a single LLM provider."""
-    provider_config = getattr(config.providers, provider_name, None)
-    if provider_config is None:
-        console.print(f"[red]Unknown provider: {provider_name}[/red]")
-        return
-
-    display_name = _get_provider_names().get(provider_name, provider_name)
-    info = _get_provider_info()
-    default_api_base = info.get(provider_name, (None, None, None, None))[3]
-
-    if default_api_base and not provider_config.api_base:
-        provider_config.api_base = default_api_base
-
-    updated_provider = _configure_pydantic_model(
-        provider_config,
-        display_name,
-    )
-    if updated_provider is not None:
-        setattr(config.providers, provider_name, updated_provider)
-
-
-def _configure_providers(config: Config) -> None:
-    """Configure LLM providers."""
-
-    def get_provider_choices() -> list[str]:
-        """Build provider choices with config status indicators."""
-        choices = []
-        for name, display in _get_provider_names().items():
-            provider = getattr(config.providers, name, None)
-            if provider and provider.api_key:
-                choices.append(f"{display} *")
-            else:
-                choices.append(display)
-        return choices + ["<- Back"]
-
-    while True:
-        try:
-            console.clear()
-            _show_section_header("LLM Providers", "Select a provider to configure API key and endpoint")
-            choices = get_provider_choices()
-            answer = _select_with_back("Select provider:", choices)
-
-            if answer is _BACK_PRESSED or answer is None or answer == "<- Back":
-                break
-
-            # Type guard: answer is now guaranteed to be a string
-            assert isinstance(answer, str)
-            # Extract provider name from choice (remove " *" suffix if present)
-            provider_name = answer.replace(" *", "")
-            # Find the actual provider key from display names
-            for name, display in _get_provider_names().items():
-                if display == provider_name:
-                    _configure_provider(config, name)
-                    break
-
-        except KeyboardInterrupt:
-            console.print("\n[dim]Returning to main menu...[/dim]")
-            break
 
 
 # --- Channel Configuration ---
@@ -900,14 +808,6 @@ def _show_summary(config: Config) -> None:
     """Display configuration summary using rich."""
     console.print()
 
-    # Providers
-    provider_rows = []
-    for name, display in _get_provider_names().items():
-        provider = getattr(config.providers, name, None)
-        status = "[green]configured[/green]" if (provider and provider.api_key) else "[dim]not configured[/dim]"
-        provider_rows.append((display, status))
-    _print_summary_panel(provider_rows, "LLM Providers")
-
     # Channels
     channel_rows = []
     for name, display in _get_channel_names().items():
@@ -1010,7 +910,6 @@ def run_onboard(initial_config: Config | None = None) -> OnboardResult:
             answer = _get_questionary().select(
                 "What would you like to configure?",
                 choices=[
-                    "[P] LLM Provider",
                     "[C] Chat Channel",
                     "[A] Agent Settings",
                     "[G] Gateway",
@@ -1034,7 +933,6 @@ def run_onboard(initial_config: Config | None = None) -> OnboardResult:
             continue
 
         _MENU_DISPATCH = {
-            "[P] LLM Provider": lambda: _configure_providers(config),
             "[C] Chat Channel": lambda: _configure_channels(config),
             "[A] Agent Settings": lambda: _configure_general_settings(config, "Agent Settings"),
             "[G] Gateway": lambda: _configure_general_settings(config, "Gateway"),
