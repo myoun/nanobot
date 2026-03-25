@@ -9,13 +9,14 @@ import json_repair
 import os
 from pathlib import Path
 import re
+import time
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
 from loguru import logger
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.providers.base import LLMProvider
+from nanobot.providers.base import LLMProvider, LLMResponse
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
@@ -27,11 +28,12 @@ from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.report import ReportToUserTool
 from nanobot.agent.tools.sessions import SessionsTool
 from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.memory import MemoryStore
+from nanobot.agent.memory import MemoryConsolidator, MemoryStore
 from nanobot.security.approval_store import ApprovalStore
 from nanobot.security.privileged_client import PrivilegedClient
 from nanobot.session.manager import Session, SessionManager
 from nanobot.observability.langsmith import get_langsmith_tracer
+from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.utils.helpers import get_data_path
 
 if TYPE_CHECKING:
@@ -127,6 +129,7 @@ class AgentLoop:
         workspace: Path,
         model: str | None = None,
         max_iterations: int = 30,
+        context_window_tokens: int = 65_536,
         temperature: float = 0.3,
         max_tokens: int = 4096,
         memory_window: int = 50,
@@ -138,23 +141,32 @@ class AgentLoop:
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
+        web_search_config: Any | None = None,
+        web_proxy: str | None = None,
+        channels_config: Any | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
 
         self.bus = bus
         self.provider = provider
         self.workspace = workspace
+        self.channels_config = channels_config
         self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations
+        self.context_window_tokens = context_window_tokens
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.memory_window = memory_window
         self.reasoning_effort = reasoning_effort
         self.routing_enabled = routing_enabled
         self.brave_api_key = brave_api_key
+        self.web_search_config = web_search_config
+        self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self._start_time = time.time()
+        self._last_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
 
         self.context = ContextBuilder(workspace)
         self.memory = self.context.memory
@@ -166,6 +178,12 @@ class AgentLoop:
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
         self._mcp_connecting = False
+        self._background_tasks: list[asyncio.Task[Any]] = []
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        max_concurrent = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "0") or "0")
+        self._concurrency_gate: asyncio.Semaphore | None = (
+            asyncio.Semaphore(max_concurrent) if max_concurrent > 0 else None
+        )
         try:
             approvals_path = get_data_path() / "approvals" / "requests.json"
             self._approval_store = ApprovalStore(
@@ -193,11 +211,28 @@ class AgentLoop:
                     "Privileged execution is enabled in config but unsupported on non-Unix runtime; ignoring."
                 )
         self._register_default_tools()
+        provider_generation = getattr(provider, "generation", None)
+        provider_max_completion = getattr(provider_generation, "max_tokens", None)
+        if not isinstance(provider_max_completion, int) or provider_max_completion < 0:
+            provider_max_completion = self.max_tokens
+        self.memory_consolidator = MemoryConsolidator(
+            workspace=workspace,
+            provider=provider,
+            model=self.model,
+            sessions=self.sessions,
+            context_window_tokens=context_window_tokens,
+            build_messages=self.context.build_messages,
+            get_tool_definitions=self.tools.get_definitions,
+            max_completion_tokens=provider_max_completion,
+        )
         self._process_lock = asyncio.Lock()
+        self._active_tasks: dict[str, list[asyncio.Task[Any]]] = {}
         self._consolidation_lock = asyncio.Lock()
         self._consolidation_tasks: dict[str, asyncio.Task[bool]] = {}
         self._consolidation_scheduled_counts: dict[str, int] = {}
         self._tracer = get_langsmith_tracer()
+        self.commands = CommandRouter()
+        register_builtin_commands(self.commands)
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -209,24 +244,29 @@ class AgentLoop:
         self.tools.register(ListDirTool(allowed_dir=allowed_dir))
 
         # Shell tool
-        self.tools.register(
-            ExecTool(
-                working_dir=str(self.workspace),
-                timeout=self.exec_config.timeout,
-                restrict_to_workspace=self.restrict_to_workspace,
-                path_append=self.exec_config.path_append,
-                privileged_enabled=self.exec_config.privileged_enabled,
-                approval_store=self._approval_store,
+        if self.exec_config.enable:
+            self.tools.register(
+                ExecTool(
+                    working_dir=str(self.workspace),
+                    timeout=self.exec_config.timeout,
+                    deny_patterns=self.exec_config.deny_patterns,
+                    restrict_to_workspace=self.restrict_to_workspace,
+                    path_append=self.exec_config.path_append,
+                    privileged_enabled=self.exec_config.privileged_enabled,
+                    approval_store=self._approval_store,
+                )
             )
-        )
 
         # Web tools
         native_web_search = getattr(self.provider, "supports_native_web_search", False)
         if not isinstance(native_web_search, bool):
             native_web_search = False
         if not native_web_search:
-            self.tools.register(WebSearchTool(api_key=self.brave_api_key))
-        self.tools.register(WebFetchTool())
+            if self.web_search_config is not None:
+                self.tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
+            else:
+                self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
+        self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(CompleteTaskTool())
         self.tools.register(SessionsTool(self.sessions))
         self.tools.register(MemoryTool(self.memory))
@@ -310,14 +350,37 @@ class AgentLoop:
         return clean[:max_len] + f"\n... (truncated, {len(clean) - max_len} more chars)"
 
     async def _provider_chat(self, **kwargs: Any):
-        """Call provider.chat with compatibility fallback for older test doubles."""
-        try:
-            return await self.provider.chat(**kwargs)
-        except TypeError as exc:
-            if "reasoning_effort" not in str(exc):
-                raise
-        kwargs.pop("reasoning_effort", None)
-        return await self.provider.chat(**kwargs)
+        """Call the provider with compatibility for old/new provider test doubles."""
+        for method_name in ("chat_with_retry", "chat"):
+            method = getattr(self.provider, method_name, None)
+            if not callable(method) or not inspect.iscoroutinefunction(method):
+                continue
+            try:
+                result = method(**kwargs)
+                if inspect.isawaitable(result):
+                    return await result
+                if isinstance(result, LLMResponse):
+                    return result
+            except TypeError as exc:
+                if "reasoning_effort" not in str(exc):
+                    raise
+                compat_kwargs = dict(kwargs)
+                compat_kwargs.pop("reasoning_effort", None)
+                result = method(**compat_kwargs)
+                if inspect.isawaitable(result):
+                    return await result
+                if isinstance(result, LLMResponse):
+                    return result
+        for method_name in ("chat_with_retry", "chat"):
+            method = getattr(self.provider, method_name, None)
+            if not callable(method):
+                continue
+            result = method(**kwargs)
+            if inspect.isawaitable(result):
+                return await result
+            if isinstance(result, LLMResponse):
+                return result
+        raise AttributeError("Provider does not expose chat/chat_with_retry")
 
     def _uses_app_server_runtime(self) -> bool:
         """Whether primary turns should run through Codex App Server."""
@@ -1442,6 +1505,7 @@ class AgentLoop:
         """
         messages = initial_messages
         request_user_message = self._extract_latest_user_message(initial_messages)
+        simple_completion_mode = request_user_message is None and not initial_messages
         requires_execution = request_execution == self._REQUEST_EXEC_REQUIRED
         active_model = self._normalize_model_name(model) or self.model
         iteration = 0
@@ -1520,6 +1584,11 @@ class AgentLoop:
             except Exception as e:
                 llm_span.finish(error=e)
                 raise
+            usage = response.usage or {}
+            self._last_usage = {
+                "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+                "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+            }
             llm_span.set_outputs(
                 {
                     "content": response.content,
@@ -1747,6 +1816,9 @@ class AgentLoop:
                     )
             else:
                 assistant_text = self._strip_think(response.content) or ""
+                if simple_completion_mode:
+                    final_content = assistant_text or response.content
+                    break
                 if assistant_text:
                     last_nonempty_no_tool_text = assistant_text
                     no_tool_text_rounds += 1
@@ -1870,7 +1942,7 @@ class AgentLoop:
         return final_content, tools_used, llm_metadata
 
     async def run(self) -> None:
-        """Run the agent loop, processing messages from the bus."""
+        """Run the agent loop, keeping priority slash commands responsive."""
         self._running = True
         await self._connect_mcp()
         logger.info("Agent loop started")
@@ -1878,25 +1950,28 @@ class AgentLoop:
         while self._running:
             try:
                 msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
-                try:
-                    async with self._process_lock:
-                        response = await self._process_message(msg)
-                    if response:
-                        await self.bus.publish_outbound(response)
-                except Exception as e:
-                    logger.error(f"Error processing message: {e}")
-                    await self.bus.publish_outbound(
-                        OutboundMessage(
-                            channel=msg.channel,
-                            chat_id=msg.chat_id,
-                            content=f"Sorry, I encountered an error: {str(e)}",
-                        )
-                    )
             except asyncio.TimeoutError:
                 continue
+            except asyncio.CancelledError:
+                if not self._running or asyncio.current_task().cancelling():
+                    raise
+                continue
+
+            raw = msg.content.strip()
+            if self.commands.is_priority(raw):
+                ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, loop=self)
+                result = await self.commands.dispatch_priority(ctx)
+                if result:
+                    await self.bus.publish_outbound(result)
+                continue
+
+            asyncio.create_task(self._dispatch(msg))
 
     async def close_mcp(self) -> None:
         """Close MCP connections."""
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+            self._background_tasks.clear()
         if self._mcp_stack:
             stack = self._mcp_stack
             self._mcp_stack = None
@@ -1912,16 +1987,34 @@ class AgentLoop:
                     pass
         self._mcp_connected = False
         self._mcp_connecting = False
-        close_task = asyncio.create_task(self.provider.aclose())
-        try:
-            await asyncio.shield(close_task)
-        except asyncio.CancelledError:
+        provider_close = getattr(self.provider, "aclose", None)
+        if callable(provider_close):
             try:
-                await close_task
+                result = provider_close()
+                if inspect.isawaitable(result):
+                    close_task = asyncio.create_task(result)
+                    try:
+                        await asyncio.shield(close_task)
+                    except asyncio.CancelledError:
+                        try:
+                            await close_task
+                        except Exception as e:
+                            logger.debug("Provider shutdown failed after cancellation: {}", e)
+                    except Exception as e:
+                        logger.debug("Provider shutdown failed: {}", e)
             except Exception as e:
-                logger.debug("Provider shutdown failed after cancellation: {}", e)
-        except Exception as e:
-            logger.debug("Provider shutdown failed: {}", e)
+                logger.debug("Provider shutdown failed: {}", e)
+
+    def _schedule_background(self, coro: Awaitable[Any]) -> None:
+        """Track background tasks so shutdown can drain them cleanly."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.append(task)
+
+        def _cleanup(done: asyncio.Task[Any]) -> None:
+            if done in self._background_tasks:
+                self._background_tasks.remove(done)
+
+        task.add_done_callback(_cleanup)
 
     def stop(self) -> None:
         """Stop the agent loop."""
@@ -1957,6 +2050,17 @@ class AgentLoop:
             session_key=session_key,
         )
         conversation_key = msg.session_key
+
+        raw = msg.content.strip()
+        command_ctx = CommandContext(
+            msg=msg,
+            session=session,
+            key=session_key or msg.session_key,
+            raw=raw,
+            loop=self,
+        )
+        if result := await self.commands.dispatch(command_ctx):
+            return result
 
         # Handle slash commands
         raw_cmd = msg.content.strip()
@@ -2290,8 +2394,8 @@ class AgentLoop:
                 approve=False,
             )
 
-        if not self._uses_app_server_runtime() and len(session.messages) > self.memory_window:
-            self._track_consolidation_task(session)
+        if not self._uses_app_server_runtime():
+            await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
         if self._request_routing_enabled(session):
             request_intent, request_execution, request_reason = await self._classify_request(
@@ -2615,7 +2719,7 @@ Respond with ONLY valid JSON, no markdown fences."""
         channel: str = "cli",
         chat_id: str = "direct",
         on_progress: Callable[..., Awaitable[None]] | None = None,
-    ) -> str:
+    ) -> OutboundMessage | None:
         """
         Process a message directly (for CLI or cron usage).
 
@@ -2627,16 +2731,15 @@ Respond with ONLY valid JSON, no markdown fences."""
             on_progress: Optional callback for intermediate progress output.
 
         Returns:
-            The agent's response.
+            The agent's outbound response payload.
         """
-        response = await self.process_direct_message(
+        return await self.process_direct_message(
             content=content,
             session_key=session_key,
             channel=channel,
             chat_id=chat_id,
             on_progress=on_progress,
         )
-        return response.content if response else ""
 
     async def process_direct_message(
         self,
@@ -2663,3 +2766,38 @@ Respond with ONLY valid JSON, no markdown fences."""
                     raise
                 kwargs.pop("on_progress", None)
                 return await self._process_message(msg, **kwargs)
+
+    async def _dispatch(self, msg: InboundMessage) -> None:
+        """Process a message with per-session serialization and tracked task cleanup."""
+        task = asyncio.current_task()
+        if task is not None:
+            self._active_tasks.setdefault(msg.session_key, []).append(task)
+        try:
+            lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
+            if self._concurrency_gate is None:
+                async with lock:
+                    async with self._process_lock:
+                        response = await self._process_message(msg)
+            else:
+                async with lock, self._concurrency_gate:
+                    async with self._process_lock:
+                        response = await self._process_message(msg)
+            if response:
+                await self.bus.publish_outbound(response)
+        except asyncio.CancelledError:
+            logger.info("Task cancelled for session {}", msg.session_key)
+            raise
+        except Exception as e:
+            logger.error("Error processing message for session {}: {}", msg.session_key, e)
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=f"Sorry, I encountered an error: {e}",
+                )
+            )
+        finally:
+            if task is not None and (tasks := self._active_tasks.get(msg.session_key)):
+                self._active_tasks[msg.session_key] = [item for item in tasks if item is not task]
+                if not self._active_tasks[msg.session_key]:
+                    self._active_tasks.pop(msg.session_key, None)

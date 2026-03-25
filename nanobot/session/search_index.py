@@ -396,11 +396,34 @@ class SessionArtifactIndex:
     def rebuild(self) -> int:
         """Rebuild the session and memory indexes from current artifact files."""
         seen_session_ids: set[str] = set()
+        allowed_session_ids_by_conversation: dict[Path, set[str] | None] = {}
+        if self.artifacts_root.exists():
+            for state_path in sorted(self.artifacts_root.glob("*/state.toml")):
+                try:
+                    state = tomllib.loads(state_path.read_text(encoding="utf-8"))
+                except Exception:
+                    allowed_session_ids_by_conversation[state_path.parent] = None
+                    continue
+                sessions = state.get("sessions")
+                if not isinstance(sessions, list):
+                    allowed_session_ids_by_conversation[state_path.parent] = None
+                    continue
+                allowed_ids = {
+                    str(item.get("id"))
+                    for item in sessions
+                    if isinstance(item, dict) and str(item.get("id") or "").strip()
+                }
+                allowed_session_ids_by_conversation[state_path.parent] = allowed_ids
         if self.artifacts_root.exists():
             for meta_path in sorted(self.artifacts_root.glob("*/sessions/*/meta.toml")):
+                conversation_dir = meta_path.parent.parent.parent
+                allowed_session_ids = allowed_session_ids_by_conversation.get(conversation_dir)
+                session_id = meta_path.parent.name
+                if allowed_session_ids is not None and session_id not in allowed_session_ids:
+                    continue
                 paths = SessionArtifactPaths(
-                    conversation_dir=meta_path.parent.parent.parent,
-                    state_file=meta_path.parent.parent.parent / "state.toml",
+                    conversation_dir=conversation_dir,
+                    state_file=conversation_dir / "state.toml",
                     session_dir=meta_path.parent,
                     meta_file=meta_path,
                     events_file=meta_path.parent / "events.jsonl",

@@ -7,7 +7,6 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
@@ -32,123 +31,46 @@ class ChannelManager:
         self._init_channels()
 
     def _init_channels(self) -> None:
-        """Initialize channels based on config."""
+        """Initialize channels discovered via pkgutil scan + entry_points plugins."""
+        from nanobot.channels.registry import discover_all
 
-        # Telegram channel
-        if self.config.channels.telegram.enabled:
+        groq_key = self.config.providers.groq.api_key
+
+        for name, cls in discover_all().items():
+            section = getattr(self.config.channels, name, None)
+            if section is None:
+                continue
+            enabled = (
+                section.get("enabled", False)
+                if isinstance(section, dict)
+                else getattr(section, "enabled", False)
+            )
+            if not enabled:
+                continue
             try:
-                from nanobot.channels.telegram import TelegramChannel
+                channel = cls(section, self.bus)
+                channel.transcription_api_key = groq_key
+                self.channels[name] = channel
+                logger.info("{} channel enabled", cls.display_name)
+            except Exception as e:
+                logger.warning("{} channel not available: {}", name, e)
 
-                self.channels["telegram"] = TelegramChannel(
-                    self.config.channels.telegram,
-                    self.bus,
-                    groq_api_key=self.config.providers.groq.api_key,
+        self._validate_allow_from()
+
+    def _validate_allow_from(self) -> None:
+        for name, ch in self.channels.items():
+            if getattr(ch.config, "allow_from", None) == []:
+                raise SystemExit(
+                    f'Error: "{name}" has empty allowFrom (denies all). '
+                    f'Set ["*"] to allow everyone, or add specific user IDs.'
                 )
-                logger.info("Telegram channel enabled")
-            except ImportError as e:
-                logger.warning(f"Telegram channel not available: {e}")
-
-        # WhatsApp channel
-        if self.config.channels.whatsapp.enabled:
-            try:
-                from nanobot.channels.whatsapp import WhatsAppChannel
-
-                self.channels["whatsapp"] = WhatsAppChannel(self.config.channels.whatsapp, self.bus)
-                logger.info("WhatsApp channel enabled")
-            except ImportError as e:
-                logger.warning(f"WhatsApp channel not available: {e}")
-
-        # Discord channel
-        if self.config.channels.discord.enabled:
-            try:
-                from nanobot.channels.discord import DiscordChannel
-
-                self.channels["discord"] = DiscordChannel(self.config.channels.discord, self.bus)
-                logger.info("Discord channel enabled")
-            except ImportError as e:
-                logger.warning(f"Discord channel not available: {e}")
-
-        # Feishu channel
-        if self.config.channels.feishu.enabled:
-            try:
-                from nanobot.channels.feishu import FeishuChannel
-
-                self.channels["feishu"] = FeishuChannel(self.config.channels.feishu, self.bus)
-                logger.info("Feishu channel enabled")
-            except ImportError as e:
-                logger.warning(f"Feishu channel not available: {e}")
-
-        # Mochat channel
-        if self.config.channels.mochat.enabled:
-            try:
-                from nanobot.channels.mochat import MochatChannel
-
-                self.channels["mochat"] = MochatChannel(self.config.channels.mochat, self.bus)
-                logger.info("Mochat channel enabled")
-            except ImportError as e:
-                logger.warning(f"Mochat channel not available: {e}")
-
-        # DingTalk channel
-        if self.config.channels.dingtalk.enabled:
-            try:
-                from nanobot.channels.dingtalk import DingTalkChannel
-
-                self.channels["dingtalk"] = DingTalkChannel(self.config.channels.dingtalk, self.bus)
-                logger.info("DingTalk channel enabled")
-            except ImportError as e:
-                logger.warning(f"DingTalk channel not available: {e}")
-
-        # Email channel
-        if self.config.channels.email.enabled:
-            try:
-                from nanobot.channels.email import EmailChannel
-
-                self.channels["email"] = EmailChannel(self.config.channels.email, self.bus)
-                logger.info("Email channel enabled")
-            except ImportError as e:
-                logger.warning(f"Email channel not available: {e}")
-
-        # Slack channel
-        if self.config.channels.slack.enabled:
-            try:
-                from nanobot.channels.slack import SlackChannel
-
-                self.channels["slack"] = SlackChannel(self.config.channels.slack, self.bus)
-                logger.info("Slack channel enabled")
-            except ImportError as e:
-                logger.warning(f"Slack channel not available: {e}")
-
-        # QQ channel
-        if self.config.channels.qq.enabled:
-            try:
-                from nanobot.channels.qq import QQChannel
-
-                self.channels["qq"] = QQChannel(
-                    self.config.channels.qq,
-                    self.bus,
-                )
-                logger.info("QQ channel enabled")
-            except ImportError as e:
-                logger.warning(f"QQ channel not available: {e}")
-
-        if self.config.channels.web.enabled:
-            try:
-                from nanobot.channels.web import WebChannel
-
-                self.channels["web"] = WebChannel(
-                    self.config.channels.web,
-                    self.bus,
-                )
-                logger.info("Web channel enabled")
-            except ImportError as e:
-                logger.warning(f"Web channel not available: {e}")
 
     async def _start_channel(self, name: str, channel: BaseChannel) -> None:
         """Start a channel and log any exceptions."""
         try:
             await channel.start()
         except Exception as e:
-            logger.error(f"Failed to start channel {name}: {e}")
+            logger.error("Failed to start channel {}: {}", name, e)
 
     async def start_all(self) -> None:
         """Start all channels and the outbound dispatcher."""
@@ -162,7 +84,7 @@ class ChannelManager:
         # Start channels
         tasks = []
         for name, channel in self.channels.items():
-            logger.info(f"Starting {name} channel...")
+            logger.info("Starting {} channel...", name)
             tasks.append(asyncio.create_task(self._start_channel(name, channel)))
 
         # Wait for all to complete (they should run forever)
@@ -184,9 +106,9 @@ class ChannelManager:
         for name, channel in self.channels.items():
             try:
                 await channel.stop()
-                logger.info(f"Stopped {name} channel")
+                logger.info("Stopped {} channel", name)
             except Exception as e:
-                logger.error(f"Error stopping {name}: {e}")
+                logger.error("Error stopping {}: {}", name, e)
 
     async def _dispatch_outbound(self) -> None:
         """Dispatch outbound messages to the appropriate channel."""
@@ -194,26 +116,30 @@ class ChannelManager:
 
         while True:
             try:
-                msg = await asyncio.wait_for(self.bus.consume_outbound(), timeout=1.0)
-                metadata = msg.metadata or {}
-                # Prefer explicit flags first; fall back to legacy is_progress_update.
-                is_tool_hint = metadata.get("_tool_hint") is True
-                is_progress = metadata.get("_progress") is True
-                if not is_tool_hint and not is_progress:
-                    is_progress = bool(metadata.get("is_progress_update"))
-                if is_tool_hint and not self.config.channels.send_tool_hints:
-                    continue
-                if is_progress and not self.config.channels.send_progress:
-                    continue
+                msg = await asyncio.wait_for(
+                    self.bus.consume_outbound(),
+                    timeout=1.0
+                )
+
+                if msg.metadata.get("_progress"):
+                    if msg.metadata.get("_tool_hint") and not self.config.channels.send_tool_hints:
+                        continue
+                    if not msg.metadata.get("_tool_hint") and not self.config.channels.send_progress:
+                        continue
 
                 channel = self.channels.get(msg.channel)
                 if channel:
                     try:
-                        await channel.send(msg)
+                        if msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end"):
+                            await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
+                        elif msg.metadata.get("_streamed"):
+                            pass
+                        else:
+                            await channel.send(msg)
                     except Exception as e:
-                        logger.error(f"Error sending to {msg.channel}: {e}")
+                        logger.error("Error sending to {}: {}", msg.channel, e)
                 else:
-                    logger.warning(f"Unknown channel: {msg.channel}")
+                    logger.warning("Unknown channel: {}", msg.channel)
 
             except asyncio.TimeoutError:
                 continue
@@ -227,7 +153,10 @@ class ChannelManager:
     def get_status(self) -> dict[str, Any]:
         """Get status of all channels."""
         return {
-            name: {"enabled": True, "running": channel.is_running}
+            name: {
+                "enabled": True,
+                "running": channel.is_running
+            }
             for name, channel in self.channels.items()
         }
 

@@ -7,6 +7,7 @@ import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,7 @@ from loguru import logger
 
 from nanobot.session.file_artifacts import SessionArtifactStore
 from nanobot.session.search_index import SessionArtifactIndex
-from nanobot.utils.helpers import get_data_path, safe_filename
+from nanobot.utils.helpers import ensure_dir, get_data_path, safe_filename
 
 
 @dataclass
@@ -111,7 +112,17 @@ class SessionManager:
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
-        self.data_root = get_data_path()
+        try:
+            workspace_resolved = workspace.resolve()
+            workspace_name = workspace_resolved.name
+            workspace_fingerprint = hashlib.sha1(
+                str(workspace_resolved).encode("utf-8")
+            ).hexdigest()[:10]
+        except Exception:
+            workspace_name = workspace.name if isinstance(workspace.name, str) else "workspace"
+            workspace_fingerprint = "workspace"
+        workspace_id = safe_filename(f"{workspace_name or 'workspace'}-{workspace_fingerprint}")
+        self.data_root = ensure_dir(get_data_path() / "workspaces" / workspace_id)
         self.db_path = self.data_root / self._DB_NAME
         self.artifacts = SessionArtifactStore(workspace)
         self.index = SessionArtifactIndex(workspace)
@@ -634,7 +645,33 @@ class SessionManager:
 
     def rebuild_search_index(self) -> int:
         """Rebuild the file-derived search cache from disk."""
-        return self.index.rebuild()
+        snapshots: list[dict[str, Any]] = []
+        for conversation in self.list_sessions():
+            conversation_key = str(conversation.get("key") or "").strip()
+            if not conversation_key:
+                continue
+            snapshots.extend(self.list_conversation_sessions(conversation_key).get("sessions", []))
+        seen_session_ids: set[str] = set()
+        for item in snapshots:
+            session_id = str(item.get("id") or "").strip()
+            conversation_key = str(item.get("conversation_key") or item.get("key") or "").strip()
+            if not session_id or not conversation_key:
+                continue
+            seen_session_ids.add(session_id)
+            self.index.upsert_session(self.artifacts.paths_for(conversation_key, session_id))
+
+        with self.index._connect() as conn:
+            if seen_session_ids:
+                placeholders = ", ".join("?" for _ in seen_session_ids)
+                conn.execute(
+                    f"DELETE FROM indexed_sessions WHERE session_id NOT IN ({placeholders})",
+                    tuple(sorted(seen_session_ids)),
+                )
+            else:
+                conn.execute("DELETE FROM indexed_sessions")
+
+        self.index.rebuild_memory_index()
+        return len(seen_session_ids)
 
     def search_sessions(
         self,
@@ -643,12 +680,25 @@ class SessionManager:
         limit: int = 10,
         conversation_key: str | None = None,
     ) -> list[dict[str, Any]]:
+        valid_session_ids: set[str] = set()
+        conversations = [conversation_key] if conversation_key else [
+            str(item.get("key") or "").strip()
+            for item in self.list_sessions()
+            if str(item.get("key") or "").strip()
+        ]
+        for key in conversations:
+            valid_session_ids.update(
+                str(item.get("id") or "").strip()
+                for item in self.list_conversation_sessions(key).get("sessions", [])
+                if str(item.get("id") or "").strip()
+            )
         try:
             hits = self.index.search(
                 query=query,
                 limit=limit,
                 conversation_key=conversation_key,
             )
+            hits = [hit for hit in hits if str(hit.get("session_id") or "") in valid_session_ids]
             if hits or not query.strip():
                 return hits
         except Exception as e:

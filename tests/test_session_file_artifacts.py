@@ -3,9 +3,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from nanobot.session.file_artifacts import SessionArtifactStore
 from nanobot.session.manager import SessionManager
 from nanobot.utils.helpers import get_data_path
+
+
+@pytest.fixture(autouse=True)
+def _isolated_nanobot_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NANOBOT_HOME", str(tmp_path / ".nanobot-home"))
 
 
 def _conversation_dir(root: Path, conversation_key: str) -> Path:
@@ -103,7 +110,11 @@ def test_working_set_preserves_manual_edits(tmp_path: Path) -> None:
     assert working_set_path.read_text(encoding="utf-8") == manual_text
 
 
-def test_session_artifact_store_does_not_migrate_legacy_workspace_artifacts(tmp_path: Path) -> None:
+def test_session_artifact_store_does_not_migrate_legacy_workspace_artifacts(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("NANOBOT_HOME", str(tmp_path / ".nanobot-home"))
     workspace = tmp_path / "workspace"
     legacy_root = workspace / ".nanobot" / "conversations" / "cli__legacy"
     legacy_root.mkdir(parents=True)

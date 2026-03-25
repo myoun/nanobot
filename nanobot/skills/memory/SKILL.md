@@ -1,6 +1,6 @@
 ---
 name: memory
-description: Itemized long-term memory with explicit create/search/read/update workflows.
+description: Two-layer memory system with grep-based recall.
 always: true
 ---
 
@@ -8,23 +8,30 @@ always: true
 
 ## Structure
 
-- Durable memory lives under `~/.nanobot/memories/`.
-- Global instructions: `~/.nanobot/memories/global/instructions/*.md`
-- Global facts: `~/.nanobot/memories/global/facts/*.md`
-- Global preferences: `~/.nanobot/memories/global/preferences/*.md`
-- Workspace rules: `~/.nanobot/memories/workspaces/<workspace>/rules/*.md`
-- Workspace memory: `~/.nanobot/memories/workspaces/<workspace>/memory/*.md`
+- `memory/MEMORY.md` — Long-term facts (preferences, project context, relationships). Always loaded into your context.
+- `memory/HISTORY.md` — Append-only event log. NOT loaded into context. Search it with grep-style tools or in-memory filters. Each entry starts with [YYYY-MM-DD HH:MM].
 
-## How to Use It
+## Search Past Events
 
-- Use the `memory` tool for all durable memory changes.
-- Create: save a new durable preference, fact, instruction, or workspace rule.
-- Search/list/read: inspect existing memory before creating duplicates.
-- Update: revise an existing item by `item_id`.
+Choose the search method based on file size:
 
-## Rules
+- Small `memory/HISTORY.md`: use `read_file`, then search in-memory
+- Large or long-lived `memory/HISTORY.md`: use the `exec` tool for targeted search
 
-- Do not create `workspace/memory/`.
-- Do not store durable memory under `.codex/`.
-- Do not invent your own long-term memory file path when the `memory` tool can do it.
-- Session continuity belongs in `working_set.md`, `summary.md`, and `transcript.md`, not in global memory.
+Examples:
+- **Linux/macOS:** `grep -i "keyword" memory/HISTORY.md`
+- **Windows:** `findstr /i "keyword" memory\HISTORY.md`
+- **Cross-platform Python:** `python -c "from pathlib import Path; text = Path('memory/HISTORY.md').read_text(encoding='utf-8'); print('\n'.join([l for l in text.splitlines() if 'keyword' in l.lower()][-20:]))"`
+
+Prefer targeted command-line search for large history files.
+
+## When to Update MEMORY.md
+
+Write important facts immediately using `edit_file` or `write_file`:
+- User preferences ("I prefer dark mode")
+- Project context ("The API uses OAuth2")
+- Relationships ("Alice is the project lead")
+
+## Auto-consolidation
+
+Old conversations are automatically summarized and appended to HISTORY.md when the session grows large. Long-term facts are extracted to MEMORY.md. You don't need to manage this.

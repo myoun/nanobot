@@ -281,7 +281,12 @@ async def test_openai_codex_app_server_provider_can_override_sandbox(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_codex_app_server_client_creates_workspace_profile_files(tmp_path: Path) -> None:
+async def test_codex_app_server_client_creates_workspace_profile_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NANOBOT_HOME", str(tmp_path / ".nanobot-home"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex-home"))
     script = tmp_path / "fake_init_only.py"
     script.write_text(
         """

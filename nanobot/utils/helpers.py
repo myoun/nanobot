@@ -1,8 +1,53 @@
 """Utility functions for nanobot."""
 
+from __future__ import annotations
+
+import base64
+import json
 import os
-from pathlib import Path
+import re
+import time
 from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+try:
+    import tiktoken  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    tiktoken = None
+
+
+def strip_think(text: str) -> str:
+    """Remove <think> blocks and any trailing unfinished think tag."""
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text)
+    text = re.sub(r"<think>[\s\S]*$", "", text)
+    return text.strip()
+
+
+def detect_image_mime(data: bytes) -> str | None:
+    """Detect image MIME type from magic bytes."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def build_image_content_blocks(raw: bytes, mime: str, path: str, label: str) -> list[dict[str, Any]]:
+    """Build native image blocks plus a short text label."""
+    b64 = base64.b64encode(raw).decode()
+    return [
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{b64}"},
+            "_meta": {"path": path},
+        },
+        {"type": "text", "text": label},
+    ]
 
 
 def ensure_dir(path: Path) -> Path:
@@ -12,7 +57,7 @@ def ensure_dir(path: Path) -> Path:
 
 
 def get_data_path() -> Path:
-    """Get the nanobot data directory (~/.nanobot)."""
+    """Get the nanobot data directory (~/.nanobot by default)."""
     configured = os.environ.get("NANOBOT_HOME", "").strip()
     if configured:
         return ensure_dir(Path(configured).expanduser())
@@ -20,19 +65,11 @@ def get_data_path() -> Path:
 
 
 def get_workspace_path(workspace: str | None = None) -> Path:
-    """
-    Get the workspace path.
-    
-    Args:
-        workspace: Optional workspace path. Defaults to ~/.nanobot/workspace.
-    
-    Returns:
-        Expanded and ensured workspace path.
-    """
+    """Get the workspace path."""
     if workspace:
         path = Path(workspace).expanduser()
     else:
-        path = Path.home() / ".nanobot" / "workspace"
+        path = get_data_path() / "workspace"
     return ensure_dir(path)
 
 
@@ -52,6 +89,13 @@ def timestamp() -> str:
     return datetime.now().isoformat()
 
 
+def current_time_str() -> str:
+    """Human-readable current time with weekday and timezone."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+    tz = time.strftime("%Z") or "UTC"
+    return f"{now} ({tz})"
+
+
 def truncate_string(s: str, max_len: int = 100, suffix: str = "...") -> str:
     """Truncate a string to max length, adding suffix if truncated."""
     if len(s) <= max_len:
@@ -59,13 +103,186 @@ def truncate_string(s: str, max_len: int = 100, suffix: str = "...") -> str:
     return s[: max_len - len(suffix)] + suffix
 
 
+_UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*]')
+
+
 def safe_filename(name: str) -> str:
     """Convert a string to a safe filename."""
-    # Replace unsafe characters
-    unsafe = '<>:"/\\|?*'
-    for char in unsafe:
-        name = name.replace(char, "_")
-    return name.strip()
+    return _UNSAFE_CHARS.sub("_", name).strip()
+
+
+def split_message(content: str, max_len: int = 2000) -> list[str]:
+    """Split content into chunks within max_len, preferring line breaks."""
+    if not content:
+        return []
+    if len(content) <= max_len:
+        return [content]
+    chunks: list[str] = []
+    while content:
+        if len(content) <= max_len:
+            chunks.append(content)
+            break
+        cut = content[:max_len]
+        pos = cut.rfind("\n")
+        if pos <= 0:
+            pos = cut.rfind(" ")
+        if pos <= 0:
+            pos = max_len
+        chunks.append(content[:pos])
+        content = content[pos:].lstrip()
+    return chunks
+
+
+def build_assistant_message(
+    content: str | None,
+    tool_calls: list[dict[str, Any]] | None = None,
+    reasoning_content: str | None = None,
+    thinking_blocks: list[dict] | None = None,
+) -> dict[str, Any]:
+    """Build a provider-safe assistant message with optional reasoning fields."""
+    msg: dict[str, Any] = {"role": "assistant", "content": content}
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+    if reasoning_content is not None:
+        msg["reasoning_content"] = reasoning_content
+    if thinking_blocks:
+        msg["thinking_blocks"] = thinking_blocks
+    return msg
+
+
+def estimate_prompt_tokens(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+) -> int:
+    """Estimate prompt tokens with optional tiktoken support."""
+    if tiktoken is None:
+        return 0
+    try:
+        enc = tiktoken.get_encoding("cl100k_base")
+        parts: list[str] = []
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text = part.get("text", "")
+                        if text:
+                            parts.append(text)
+                    else:
+                        parts.append(json.dumps(part, ensure_ascii=False))
+            if msg.get("tool_calls"):
+                parts.append(json.dumps(msg["tool_calls"], ensure_ascii=False))
+            rc = msg.get("reasoning_content")
+            if isinstance(rc, str) and rc:
+                parts.append(rc)
+            for key in ("name", "tool_call_id"):
+                value = msg.get(key)
+                if isinstance(value, str) and value:
+                    parts.append(value)
+        if tools:
+            parts.append(json.dumps(tools, ensure_ascii=False))
+        return len(enc.encode("\n".join(parts))) + len(messages) * 4
+    except Exception:
+        return 0
+
+
+def estimate_message_tokens(message: dict[str, Any]) -> int:
+    """Estimate prompt tokens contributed by one persisted message."""
+    content = message.get("content")
+    parts: list[str] = []
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text = part.get("text", "")
+                if text:
+                    parts.append(text)
+            else:
+                parts.append(json.dumps(part, ensure_ascii=False))
+    elif content is not None:
+        parts.append(json.dumps(content, ensure_ascii=False))
+    for key in ("name", "tool_call_id"):
+        value = message.get(key)
+        if isinstance(value, str) and value:
+            parts.append(value)
+    if message.get("tool_calls"):
+        parts.append(json.dumps(message["tool_calls"], ensure_ascii=False))
+    rc = message.get("reasoning_content")
+    if isinstance(rc, str) and rc:
+        parts.append(rc)
+    payload = "\n".join(parts)
+    if not payload:
+        return 4
+    if tiktoken is not None:
+        try:
+            enc = tiktoken.get_encoding("cl100k_base")
+            return max(4, len(enc.encode(payload)) + 4)
+        except Exception:
+            pass
+    return max(4, len(payload) // 4 + 4)
+
+
+def estimate_prompt_tokens_chain(
+    provider: Any,
+    model: str | None,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+) -> tuple[int, str]:
+    """Estimate prompt tokens via provider counter first, then fallback."""
+    provider_counter = getattr(provider, "estimate_prompt_tokens", None)
+    if callable(provider_counter):
+        try:
+            tokens, source = provider_counter(messages, tools, model)
+            if isinstance(tokens, (int, float)) and tokens > 0:
+                return int(tokens), str(source or "provider_counter")
+        except Exception:
+            pass
+    estimated = estimate_prompt_tokens(messages, tools)
+    if estimated > 0:
+        return int(estimated), "tiktoken"
+    return 0, "none"
+
+
+def build_status_content(
+    *,
+    version: str,
+    model: str,
+    start_time: float,
+    last_usage: dict[str, int],
+    context_window_tokens: int,
+    session_msg_count: int,
+    context_tokens_estimate: int,
+) -> str:
+    """Build a human-readable runtime status snapshot."""
+    uptime_s = int(time.time() - start_time)
+    uptime = (
+        f"{uptime_s // 3600}h {(uptime_s % 3600) // 60}m"
+        if uptime_s >= 3600
+        else f"{uptime_s // 60}m {uptime_s % 60}s"
+    )
+    last_in = last_usage.get("prompt_tokens", 0)
+    last_out = last_usage.get("completion_tokens", 0)
+    ctx_total = max(context_window_tokens, 0)
+    ctx_pct = int((context_tokens_estimate / ctx_total) * 100) if ctx_total > 0 else 0
+    ctx_used_str = (
+        f"{context_tokens_estimate // 1000}k"
+        if context_tokens_estimate >= 1000
+        else str(context_tokens_estimate)
+    )
+    ctx_total_str = f"{ctx_total // 1024}k" if ctx_total > 0 else "n/a"
+    return "\n".join(
+        [
+            f"nanobot v{version}",
+            f"Model: {model}",
+            f"Tokens: {last_in} in / {last_out} out",
+            f"Context: {ctx_used_str}/{ctx_total_str} ({ctx_pct}%)",
+            f"Session: {session_msg_count} messages",
+            f"Uptime: {uptime}",
+        ]
+    )
 
 
 def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
@@ -81,7 +298,7 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
 
     added: list[str] = []
 
-    def _write(src, dest: Path) -> None:
+    def _write(src: Any, dest: Path) -> None:
         if dest.exists():
             return
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -90,8 +307,12 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         added.append(str(dest.relative_to(workspace)))
 
     for item in templates_dir.iterdir():
-        if item.name.endswith(".md"):
+        if item.name.endswith(".md") and not item.name.startswith("."):
             _write(item, workspace / item.name)
+    memory_template = templates_dir / "memory" / "MEMORY.md"
+    if memory_template.exists():
+        _write(memory_template, workspace / "memory" / "MEMORY.md")
+        _write(None, workspace / "memory" / "HISTORY.md")
     (workspace / "skills").mkdir(exist_ok=True)
 
     if added and not silent:
@@ -104,15 +325,7 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
 
 
 def parse_session_key(key: str) -> tuple[str, str]:
-    """
-    Parse a session key into channel and chat_id.
-    
-    Args:
-        key: Session key in format "channel:chat_id"
-    
-    Returns:
-        Tuple of (channel, chat_id)
-    """
+    """Parse a session key into channel and chat_id."""
     parts = key.split(":", 1)
     if len(parts) != 2:
         raise ValueError(f"Invalid session key: {key}")

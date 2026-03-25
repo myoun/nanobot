@@ -21,7 +21,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 from nanobot import __version__, __logo__
 from nanobot.config.schema import Config
-from nanobot.utils.helpers import sync_workspace_templates
+from nanobot.utils.helpers import get_workspace_path, sync_workspace_templates
 
 app = typer.Typer(
     name="nanobot",
@@ -407,56 +407,143 @@ def main(
 
 
 @app.command()
-def onboard():
+def onboard(
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+    wizard: bool = typer.Option(False, "--wizard", help="Use interactive wizard"),
+):
     """Initialize nanobot configuration and workspace."""
-    from nanobot.config.loader import get_config_path, load_config, save_config
+    from nanobot.config.loader import get_config_path, load_config, save_config, set_config_path
     from nanobot.config.schema import Config
-    from nanobot.utils.helpers import get_workspace_path
 
-    config_path = get_config_path()
+    if config:
+        config_path = Path(config).expanduser().resolve()
+        set_config_path(config_path)
+        console.print(f"[dim]Using config: {config_path}[/dim]")
+    else:
+        config_path = get_config_path()
+
+    def _apply_workspace_override(loaded: Config) -> Config:
+        if workspace:
+            loaded.agents.defaults.workspace = str(Path(workspace).expanduser().resolve())
+        return loaded
 
     if config_path.exists():
-        console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
-        console.print("  [bold]y[/bold] = overwrite with defaults (existing values will be lost)")
-        console.print(
-            "  [bold]N[/bold] = refresh config, keeping existing values and adding new fields"
-        )
-        if typer.confirm("Overwrite?"):
-            config = Config()
-            save_config(config)
-            console.print(f"[green]✓[/green] Config reset to defaults at {config_path}")
+        if wizard:
+            loaded = load_config(config_path)
+            runtime_config = _apply_workspace_override(loaded)
         else:
-            config = load_config()
-            save_config(config)
+            console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
+            console.print("  [bold]y[/bold] = overwrite with defaults (existing values will be lost)")
             console.print(
-                f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)"
+                "  [bold]N[/bold] = refresh config, keeping existing values and adding new fields"
             )
+            if typer.confirm("Overwrite?"):
+                runtime_config = _apply_workspace_override(Config())
+                save_config(runtime_config, config_path)
+                console.print(f"[green]✓[/green] Config reset to defaults at {config_path}")
+            else:
+                runtime_config = _apply_workspace_override(load_config(config_path))
+                save_config(runtime_config, config_path)
+                console.print(
+                    f"[green]✓[/green] Config refreshed at {config_path} "
+                    "(existing values preserved)"
+                )
     else:
-        config = Config()
-        save_config(config)
-        console.print(f"[green]✓[/green] Created config at {config_path}")
+        runtime_config = _apply_workspace_override(Config())
+        if not wizard:
+            save_config(runtime_config, config_path)
+            console.print(f"[green]✓[/green] Created config at {config_path}")
 
-    # Create workspace
-    workspace = get_workspace_path()
+    if wizard:
+        from nanobot.cli.onboard import run_onboard
 
-    if not workspace.exists():
-        workspace.mkdir(parents=True, exist_ok=True)
-        console.print(f"[green]✓[/green] Created workspace at {workspace}")
+        try:
+            result = run_onboard(initial_config=runtime_config)
+        except Exception as exc:
+            console.print(f"[red]✗[/red] Error during configuration: {exc}")
+            console.print("[yellow]Please run 'nanobot onboard' again to complete setup.[/yellow]")
+            raise typer.Exit(1) from exc
 
-    # Create default bootstrap files
-    sync_workspace_templates(workspace)
-    _configure_codex_profile_on_onboard(config, workspace)
-    save_config(config)
+        if not result.should_save:
+            console.print("[yellow]Configuration discarded. No changes were saved.[/yellow]")
+            return
+
+        runtime_config = result.config
+        save_config(runtime_config, config_path)
+        console.print(f"[green]✓[/green] Config saved at {config_path}")
+
+    _onboard_plugins(config_path)
+
+    workspace_path = get_workspace_path(runtime_config.workspace_path)
+    if not workspace_path.exists():
+        workspace_path.mkdir(parents=True, exist_ok=True)
+        console.print(f"[green]✓[/green] Created workspace at {workspace_path}")
+
+    sync_workspace_templates(workspace_path)
+
+    if not wizard and sys.stdin.isatty() and sys.stdout.isatty():
+        _configure_codex_profile_on_onboard(runtime_config, workspace_path)
+        save_config(runtime_config, config_path)
+
+    agent_cmd = 'nanobot agent -m "Hello!"'
+    gateway_cmd = "nanobot gateway"
+    if config:
+        agent_cmd += f" --config {config_path}"
+        gateway_cmd += f" --config {config_path}"
 
     console.print(f"\n{__logo__} nanobot is ready!")
     console.print("\nNext steps:")
-    console.print("  1. Add your API key to [cyan]~/.nanobot/config.json[/cyan]")
-    console.print("     Get one at: https://openrouter.ai/keys")
-    console.print('  2. Chat: [cyan]nanobot agent -m "Hello!"[/cyan]')
-    console.print("  3. Optional privileged setup: [cyan]nanobot privileged setup[/cyan]")
+    if wizard:
+        console.print(f"  1. Chat: [cyan]{agent_cmd}[/cyan]")
+        console.print(f"  2. Start gateway: [cyan]{gateway_cmd}[/cyan]")
+    else:
+        console.print(f"  1. Add your API key to [cyan]{config_path}[/cyan]")
+        console.print("     Get one at: https://openrouter.ai/keys")
+        console.print(f"  2. Chat: [cyan]{agent_cmd}[/cyan]")
+        console.print("  3. Optional privileged setup: [cyan]nanobot privileged setup[/cyan]")
     console.print(
         "\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]"
     )
+
+
+def _merge_missing_defaults(existing: Any, defaults: Any) -> Any:
+    """Recursively fill in missing values from defaults without overwriting user config."""
+    if not isinstance(existing, dict) or not isinstance(defaults, dict):
+        return existing
+
+    merged = dict(existing)
+    for key, value in defaults.items():
+        if key not in merged:
+            merged[key] = value
+        else:
+            merged[key] = _merge_missing_defaults(merged[key], value)
+    return merged
+
+
+def _onboard_plugins(config_path: Path) -> None:
+    """Inject default config for discovered channels into config.json."""
+    import json
+
+    from nanobot.channels.registry import discover_all
+
+    all_channels = discover_all()
+    if not all_channels or not config_path.exists():
+        return
+
+    with open(config_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    channels = data.setdefault("channels", {})
+    for name, cls in all_channels.items():
+        defaults = cls.default_config()
+        if name not in channels:
+            channels[name] = defaults
+        else:
+            channels[name] = _merge_missing_defaults(channels[name], defaults)
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 def _configure_codex_profile_on_onboard(config: Config, workspace: Path) -> None:
@@ -602,7 +689,7 @@ def gateway(
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        memory_window=config.agents.defaults.memory_window,
+        context_window_tokens=config.agents.defaults.context_window_tokens,
         reasoning_effort=config.agents.defaults.reasoning_effort,
         routing_enabled=config.agents.defaults.intent_execution_routing_enabled,
         brave_api_key=config.tools.web.search.api_key or None,
@@ -616,12 +703,13 @@ def gateway(
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
-        response = await agent.process_direct(
+        outbound = await agent.process_direct(
             job.payload.message,
             session_key=f"cron:{job.id}",
             channel=job.payload.channel or "cli",
             chat_id=job.payload.to or "direct",
         )
+        response = outbound.content if outbound else ""
         if job.payload.deliver and job.payload.to:
             from nanobot.bus.events import OutboundMessage
 
@@ -661,13 +749,14 @@ def gateway(
         async def _silent(*_args, **_kwargs) -> None:
             return
 
-        return await agent.process_direct(
+        outbound = await agent.process_direct(
             tasks,
             session_key="heartbeat",
             channel=channel,
             chat_id=chat_id,
             on_progress=_silent,
         )
+        return outbound.content if outbound else ""
 
     async def on_heartbeat_notify(response: str) -> None:
         """Deliver a heartbeat response to the user's channel."""
@@ -771,7 +860,7 @@ def agent(
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        memory_window=config.agents.defaults.memory_window,
+        context_window_tokens=config.agents.defaults.context_window_tokens,
         reasoning_effort=config.agents.defaults.reasoning_effort,
         routing_enabled=config.agents.defaults.intent_execution_routing_enabled,
         brave_api_key=config.tools.web.search.api_key or None,
@@ -1198,7 +1287,7 @@ def cron_run(
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        memory_window=config.agents.defaults.memory_window,
+        context_window_tokens=config.agents.defaults.context_window_tokens,
         reasoning_effort=config.agents.defaults.reasoning_effort,
         routing_enabled=config.agents.defaults.intent_execution_routing_enabled,
         brave_api_key=config.tools.web.search.api_key or None,
@@ -1211,12 +1300,13 @@ def cron_run(
     result_holder: list[str] = []
 
     async def on_job(job: CronJob) -> str | None:
-        response = await agent_loop.process_direct(
+        outbound = await agent_loop.process_direct(
             job.payload.message,
             session_key=f"cron:{job.id}",
             channel=job.payload.channel or "cli",
             chat_id=job.payload.to or "direct",
         )
+        response = outbound.content if outbound else ""
         result_holder.append(response)
         return response
 

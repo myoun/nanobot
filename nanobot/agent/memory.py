@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
+import weakref
 from datetime import datetime
 from typing import Any, TYPE_CHECKING
 
 from loguru import logger
 
-from nanobot.utils.helpers import ensure_dir, get_data_path, safe_filename
+from nanobot.utils.helpers import (
+    ensure_dir,
+    estimate_message_tokens,
+    estimate_prompt_tokens_chain,
+    get_data_path,
+    safe_filename,
+)
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
@@ -53,7 +61,14 @@ class MemoryStore:
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
         self.item_root = ensure_dir(data_root / "memories")
-        self.workspace_id = safe_filename(workspace.resolve().name or "workspace")
+        try:
+            resolved_name = workspace.resolve().name  # type: ignore[union-attr]
+        except Exception:
+            resolved_name = None
+        if not isinstance(resolved_name, str) or not resolved_name.strip():
+            fallback_name = getattr(workspace, "name", None)
+            resolved_name = fallback_name if isinstance(fallback_name, str) else "workspace"
+        self.workspace_id = safe_filename(resolved_name or "workspace")
         self.global_instructions_dir = ensure_dir(self.item_root / "global" / "instructions")
         self.global_facts_dir = ensure_dir(self.item_root / "global" / "facts")
         self.global_preferences_dir = ensure_dir(self.item_root / "global" / "preferences")
@@ -348,3 +363,188 @@ class MemoryStore:
         except Exception:
             logger.exception("Memory consolidation failed")
             return False
+
+
+class MemoryConsolidator:
+    """Compatibility wrapper for token-based memory consolidation."""
+
+    _MAX_CONSOLIDATION_ROUNDS = 5
+    _MAX_FAILURES_BEFORE_RAW_ARCHIVE = 3
+    _SAFETY_BUFFER = 1024
+
+    def __init__(
+        self,
+        workspace: Path,
+        provider: LLMProvider,
+        model: str,
+        sessions: SessionManager,
+        context_window_tokens: int,
+        build_messages,
+        get_tool_definitions,
+        max_completion_tokens: int = 4096,
+    ):
+        self.store = MemoryStore(workspace)
+        self.provider = provider
+        self.model = model
+        self.sessions = sessions
+        self.context_window_tokens = context_window_tokens
+        self.max_completion_tokens = max_completion_tokens
+        self._build_messages = build_messages
+        self._get_tool_definitions = get_tool_definitions
+        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
+
+    def get_lock(self, session_key: str) -> asyncio.Lock:
+        """Return the shared consolidation lock for one session."""
+        return self._locks.setdefault(session_key, asyncio.Lock())
+
+    async def consolidate_messages(self, messages: list[dict[str, object]]) -> bool:
+        """Archive a selected message chunk into persistent memory."""
+        from nanobot.session.manager import Session
+
+        if not messages:
+            return True
+        snapshot = Session(key="memory:archive")
+        snapshot.messages = [dict(message) for message in messages]
+        return await self.store.consolidate(
+            snapshot,
+            self.provider,
+            self.model,
+            archive_all=True,
+        )
+
+    def pick_consolidation_boundary(
+        self,
+        session: Session,
+        tokens_to_remove: int,
+    ) -> tuple[int, int] | None:
+        """Pick a user-turn boundary that removes enough old prompt tokens."""
+        start = session.last_consolidated
+        if start >= len(session.messages) or tokens_to_remove <= 0:
+            return None
+
+        removed_tokens = 0
+        last_boundary: tuple[int, int] | None = None
+        for idx in range(start, len(session.messages)):
+            message = session.messages[idx]
+            if idx > start and message.get("role") == "user":
+                last_boundary = (idx, removed_tokens)
+                if removed_tokens >= tokens_to_remove:
+                    return last_boundary
+            removed_tokens += estimate_message_tokens(message)
+
+        return last_boundary
+
+    def estimate_session_prompt_tokens(self, session: Session) -> tuple[int, str]:
+        """Estimate current prompt size for the normal session history view."""
+        history = session.get_history(max_messages=0)
+        channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
+        probe_messages = self._build_messages(
+            history=history,
+            current_message="[token-probe]",
+            channel=channel,
+            chat_id=chat_id,
+        )
+        return estimate_prompt_tokens_chain(
+            self.provider,
+            self.model,
+            probe_messages,
+            self._get_tool_definitions(),
+        )
+
+    @staticmethod
+    def _format_messages(messages: list[dict[str, object]]) -> str:
+        lines: list[str] = []
+        for message in messages:
+            content = message.get("content")
+            if not content:
+                continue
+            tools_used = message.get("tools_used")
+            tools = (
+                f" [tools: {', '.join(tools_used)}]"
+                if isinstance(tools_used, list) and tools_used
+                else ""
+            )
+            timestamp = str(message.get("timestamp", "?"))[:16]
+            role = str(message.get("role", "assistant")).upper()
+            lines.append(f"[{timestamp}] {role}{tools}: {content}")
+        return "\n".join(lines)
+
+    def _raw_archive(self, messages: list[dict[str, object]]) -> None:
+        """Fallback: dump raw messages to HISTORY.md without LLM summarization."""
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        self.store.append_history(
+            f"[{ts}] [RAW] {len(messages)} messages\n{self._format_messages(messages)}"
+        )
+        logger.warning(
+            "Memory consolidation degraded: raw-archived {} messages", len(messages)
+        )
+
+    async def archive_messages(self, messages: list[dict[str, object]]) -> bool:
+        """Archive messages with guaranteed persistence."""
+        if not messages:
+            return True
+        for _ in range(self._MAX_FAILURES_BEFORE_RAW_ARCHIVE):
+            if await self.consolidate_messages(messages):
+                return True
+        self._raw_archive(messages)
+        return True
+
+    async def maybe_consolidate_by_tokens(self, session: Session) -> None:
+        """Archive old messages until prompt fits within the safe token budget."""
+        if not session.messages or self.context_window_tokens <= 0:
+            return
+
+        lock = self.get_lock(session.key)
+        async with lock:
+            budget = self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
+            target = budget // 2
+            estimated, source = self.estimate_session_prompt_tokens(session)
+            if estimated <= 0:
+                return
+            if estimated < budget:
+                logger.debug(
+                    "Token consolidation idle {}: {}/{} via {}",
+                    session.key,
+                    estimated,
+                    self.context_window_tokens,
+                    source,
+                )
+                return
+
+            for round_num in range(self._MAX_CONSOLIDATION_ROUNDS):
+                if estimated <= target:
+                    return
+
+                boundary = self.pick_consolidation_boundary(session, max(1, estimated - target))
+                if boundary is None:
+                    logger.debug(
+                        "Token consolidation: no safe boundary for {} (round {})",
+                        session.key,
+                        round_num,
+                    )
+                    return
+
+                end_idx = boundary[0]
+                chunk = session.messages[session.last_consolidated:end_idx]
+                if not chunk:
+                    return
+
+                logger.info(
+                    "Token consolidation round {} for {}: {}/{} via {}, chunk={} msgs",
+                    round_num,
+                    session.key,
+                    estimated,
+                    self.context_window_tokens,
+                    source,
+                    len(chunk),
+                )
+                if not await self.consolidate_messages(chunk):
+                    return
+                session.last_consolidated = end_idx
+                self.sessions.save(session)
+
+                estimated, source = self.estimate_session_prompt_tokens(session)
+                if estimated <= 0:
+                    return

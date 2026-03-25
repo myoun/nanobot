@@ -52,6 +52,15 @@ class LLMResponse:
         }
 
 
+@dataclass(frozen=True)
+class GenerationSettings:
+    """Default generation parameters for LLM calls."""
+
+    temperature: float = 0.7
+    max_tokens: int = 4096
+    reasoning_effort: str | None = None
+
+
 @dataclass
 class AppServerTurnResult:
     """Structured result returned from a Codex App Server turn."""
@@ -74,6 +83,7 @@ class LLMProvider(ABC):
     def __init__(self, api_key: str | None = None, api_base: str | None = None):
         self.api_key = api_key
         self.api_base = api_base
+        self.generation: GenerationSettings = GenerationSettings()
 
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

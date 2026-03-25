@@ -1,6 +1,7 @@
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
+from typing import Literal
 from pydantic import BaseModel, Field, ConfigDict
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
@@ -191,6 +192,12 @@ class WebConfig(BaseModel):
 class ChannelsConfig(Base):
     """Configuration for chat channels."""
 
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        extra="allow",
+    )
+
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
@@ -211,9 +218,9 @@ class AgentDefaults(Base):
     workspace: str = "~/.nanobot/workspace"
     model: str = "anthropic/claude-opus-4-5"
     max_tokens: int = 8192
+    context_window_tokens: int = 65_536
     temperature: float = 0.3
     max_tool_iterations: int = 30
-    memory_window: int = 50
     reasoning_effort: str | None = None  # low / medium / high
     intent_execution_routing_enabled: bool = True
 
@@ -274,7 +281,9 @@ class GatewayConfig(Base):
 class WebSearchConfig(Base):
     """Web search tool configuration."""
 
+    provider: str = "brave"
     api_key: str = ""  # Brave Search API key
+    base_url: str = ""
     max_results: int = 5
 
 
@@ -287,8 +296,10 @@ class WebToolsConfig(Base):
 class ExecToolConfig(Base):
     """Shell exec tool configuration."""
 
+    enable: bool = True
     timeout: int = 60
     path_append: str = ""  # Additional PATH entries appended for exec tool
+    deny_patterns: list[str] | None = None
     privileged_enabled: bool = False
     privileged_socket: str = "/run/nanobot-privileged.sock"
     approval_ttl_sec: int = 600
@@ -298,10 +309,14 @@ class ExecToolConfig(Base):
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
 
+    type: Literal["stdio", "sse", "streamableHttp"] | None = None
     command: str = ""  # Stdio: command to run (e.g. "npx")
     args: list[str] = Field(default_factory=list)  # Stdio: command arguments
     env: dict[str, str] = Field(default_factory=dict)  # Stdio: extra env vars
     url: str = ""  # HTTP: streamable HTTP endpoint URL
+    headers: dict[str, str] = Field(default_factory=dict)
+    tool_timeout: int = 30
+    enabled_tools: list[str] = Field(default_factory=lambda: ["*"])
 
 
 class ToolsConfig(Base):
