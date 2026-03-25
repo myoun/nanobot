@@ -237,7 +237,7 @@ class TelegramChannel(BaseChannel):
             return False
 
         sid, username = sender_str.split("|", 1)
-        if not sid.isdigit() or not username:
+        if not re.fullmatch(r"-?\d+", sid) or not username:
             return False
 
         return sid in allow_list or username in allow_list
@@ -578,6 +578,25 @@ class TelegramChannel(BaseChannel):
         return f"{sid}|{user.username}" if user.username else sid
 
     @staticmethod
+    def _sender_chat_id(sender_chat) -> str:
+        """Build sender_id for anonymous-admin or sender_chat Telegram messages."""
+        sid = str(sender_chat.id)
+        username = getattr(sender_chat, "username", None)
+        return f"{sid}|{username}" if username else sid
+
+    @classmethod
+    def _resolve_sender(cls, update: Update) -> tuple[Any | None, Any | None, str | None]:
+        """Resolve Telegram sender identity from either effective_user or sender_chat."""
+        message = update.message
+        user = update.effective_user or getattr(message, "from_user", None)
+        if user is not None:
+            return user, None, cls._sender_id(user)
+        sender_chat = getattr(message, "sender_chat", None)
+        if sender_chat is not None:
+            return None, sender_chat, cls._sender_chat_id(sender_chat)
+        return None, None, None
+
+    @staticmethod
     def _derive_topic_session_key(message) -> str | None:
         """Derive topic-scoped session key for non-private Telegram chats."""
         message_thread_id = getattr(message, "message_thread_id", None)
@@ -586,14 +605,34 @@ class TelegramChannel(BaseChannel):
         return f"telegram:{message.chat_id}:topic:{message_thread_id}"
 
     @staticmethod
-    def _build_message_metadata(message, user) -> dict:
+    def _build_message_metadata(message, user=None, sender_chat=None) -> dict:
         """Build common Telegram inbound metadata payload."""
         reply_to = getattr(message, "reply_to_message", None)
+        username = getattr(user, "username", None)
+        first_name = getattr(user, "first_name", None)
+        user_id = getattr(user, "id", None)
+        sender_kind = "user" if user is not None else None
+        sender_chat_id = None
+        sender_chat_title = None
+        if user is None and sender_chat is not None:
+            sender_kind = "chat"
+            sender_chat_id = getattr(sender_chat, "id", None)
+            sender_chat_title = getattr(sender_chat, "title", None)
+            username = getattr(sender_chat, "username", None)
+            first_name = (
+                getattr(message, "author_signature", None)
+                or sender_chat_title
+                or username
+            )
         return {
             "message_id": message.message_id,
-            "user_id": user.id,
-            "username": user.username,
-            "first_name": user.first_name,
+            "user_id": user_id,
+            "username": username,
+            "first_name": first_name,
+            "sender_kind": sender_kind,
+            "sender_chat_id": sender_chat_id,
+            "sender_chat_title": sender_chat_title,
+            "author_signature": getattr(message, "author_signature", None),
             "is_group": message.chat.type != "private",
             "message_thread_id": getattr(message, "message_thread_id", None),
             "is_forum": bool(getattr(message.chat, "is_forum", False)),
@@ -741,34 +780,59 @@ class TelegramChannel(BaseChannel):
 
     async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Forward slash commands to the bus for unified handling in AgentLoop."""
-        if not update.message or not update.effective_user:
+        if not update.message:
             return
         message = update.message
-        user = update.effective_user
+        user, sender_chat, sender_id = self._resolve_sender(update)
+        if sender_id is None:
+            logger.debug(
+                "Ignoring Telegram command without sender identity: chat_id={} message_id={}",
+                message.chat_id,
+                message.message_id,
+            )
+            return
         self._remember_thread_context(message)
         await self._handle_message(
-            sender_id=self._sender_id(user),
+            sender_id=sender_id,
             chat_id=str(message.chat_id),
             content=message.text or "",
-            metadata=self._build_message_metadata(message, user),
+            metadata=self._build_message_metadata(message, user=user, sender_chat=sender_chat),
             session_key=self._derive_topic_session_key(message),
         )
 
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming messages (text, photos, voice, documents)."""
-        if not update.message or not update.effective_user:
+        if not update.message:
             return
 
         message = update.message
-        user = update.effective_user
+        user, sender_chat, sender_id = self._resolve_sender(update)
+        if sender_id is None:
+            logger.debug(
+                "Ignoring Telegram message without sender identity: chat_id={} message_id={}",
+                message.chat_id,
+                message.message_id,
+            )
+            return
+        if user is None and sender_chat is not None:
+            logger.debug(
+                "Telegram message {} in chat {} arrived via sender_chat fallback ({})",
+                message.message_id,
+                message.chat_id,
+                sender_id,
+            )
         chat_id = message.chat_id
-        sender_id = self._sender_id(user)
         self._remember_thread_context(message)
 
         # Store chat_id for replies
         self._chat_ids[sender_id] = chat_id
 
         if not await self._is_group_message_for_bot(message):
+            logger.debug(
+                "Ignoring Telegram group message {} in chat {} because it was not addressed to the bot",
+                message.message_id,
+                message.chat_id,
+            )
             return
 
         # Build content from text and/or media
@@ -806,7 +870,7 @@ class TelegramChannel(BaseChannel):
         logger.debug("Telegram message from {}: {}...", sender_id, content[:50])
 
         str_chat_id = str(chat_id)
-        metadata = self._build_message_metadata(message, user)
+        metadata = self._build_message_metadata(message, user=user, sender_chat=sender_chat)
         session_key = self._derive_topic_session_key(message)
 
         # Telegram media groups: buffer briefly, forward as one aggregated turn.

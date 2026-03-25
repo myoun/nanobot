@@ -16,6 +16,8 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.telegram import TELEGRAM_REPLY_CONTEXT_MAX_LEN, TelegramChannel
 from nanobot.channels.telegram import TelegramConfig
 
+_MISSING = object()
+
 
 class _FakeHTTPXRequest:
     instances: list["_FakeHTTPXRequest"] = []
@@ -132,8 +134,15 @@ def _make_telegram_update(
     entities=None,
     caption_entities=None,
     reply_to_message=None,
+    effective_user=_MISSING,
+    sender_chat=None,
+    author_signature: str | None = None,
 ):
-    user = SimpleNamespace(id=12345, username="alice", first_name="Alice")
+    user = (
+        SimpleNamespace(id=12345, username="alice", first_name="Alice")
+        if effective_user is _MISSING
+        else effective_user
+    )
     message = SimpleNamespace(
         chat=SimpleNamespace(type=chat_type, is_forum=False),
         chat_id=-100123,
@@ -149,8 +158,14 @@ def _make_telegram_update(
         media_group_id=None,
         message_thread_id=None,
         message_id=1,
+        from_user=user,
+        sender_chat=sender_chat,
+        author_signature=author_signature,
     )
-    return SimpleNamespace(message=message, effective_user=user)
+    return SimpleNamespace(
+        message=message,
+        effective_user=user if effective_user is _MISSING else effective_user,
+    )
 
 
 @pytest.mark.asyncio
@@ -305,6 +320,14 @@ def test_is_allowed_accepts_legacy_telegram_id_username_formats() -> None:
     assert channel.is_allowed("12345|carol") is True
     assert channel.is_allowed("99999|alice") is True
     assert channel.is_allowed("67890|bob") is True
+
+
+def test_is_allowed_accepts_signed_telegram_sender_ids() -> None:
+    channel = TelegramChannel(TelegramConfig(allow_from=["-100123", "group_alias"]), MessageBus())
+
+    assert channel.is_allowed("-100123|group_alias") is True
+    assert channel.is_allowed("-100123|someone_else") is True
+    assert channel.is_allowed("-100999|group_alias") is True
 
 
 def test_is_allowed_rejects_invalid_legacy_telegram_sender_shapes() -> None:
@@ -525,6 +548,68 @@ async def test_group_policy_open_accepts_plain_group_message() -> None:
 
     assert len(handled) == 1
     assert channel._app.bot.get_me_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_group_policy_open_accepts_sender_chat_message() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    sender_chat = SimpleNamespace(id=-100123, username="group_alias", title="Group Alias")
+    update = _make_telegram_update(
+        text="hello from anonymous admin",
+        effective_user=None,
+        sender_chat=sender_chat,
+        author_signature="Alice Admin",
+    )
+    update.message.from_user = None
+    await channel._on_message(update, None)
+
+    assert len(handled) == 1
+    assert handled[0]["sender_id"] == "-100123|group_alias"
+    assert handled[0]["metadata"]["sender_kind"] == "chat"
+    assert handled[0]["metadata"]["sender_chat_id"] == -100123
+    assert handled[0]["metadata"]["first_name"] == "Alice Admin"
+
+
+@pytest.mark.asyncio
+async def test_forward_command_accepts_sender_chat_identity() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+
+    sender_chat = SimpleNamespace(id=-100123, username="group_alias", title="Group Alias")
+    update = _make_telegram_update(
+        text="/status",
+        effective_user=None,
+        sender_chat=sender_chat,
+        author_signature="Alice Admin",
+    )
+    update.message.from_user = None
+    await channel._forward_command(update, None)
+
+    assert len(handled) == 1
+    assert handled[0]["sender_id"] == "-100123|group_alias"
+    assert handled[0]["metadata"]["sender_kind"] == "chat"
 
 
 def test_extract_reply_context_no_reply() -> None:
