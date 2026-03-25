@@ -7,7 +7,7 @@ import pytest
 
 # Check optional Telegram dependencies before running tests
 try:
-    import telegram  # noqa: F401
+    from telegram import Update
 except ImportError:
     pytest.skip("Telegram dependencies not installed (python-telegram-bot)", allow_module_level=True)
 
@@ -34,8 +34,10 @@ class _FakeHTTPXRequest:
 class _FakeUpdater:
     def __init__(self, on_start_polling) -> None:
         self._on_start_polling = on_start_polling
+        self.poll_kwargs = None
 
     async def start_polling(self, **kwargs) -> None:
+        self.poll_kwargs = kwargs
         self._on_start_polling()
 
 
@@ -87,8 +89,8 @@ class _FakeApp:
     def add_error_handler(self, handler) -> None:
         self.error_handlers.append(handler)
 
-    def add_handler(self, handler) -> None:
-        self.handlers.append(handler)
+    def add_handler(self, handler, group=0) -> None:
+        self.handlers.append((group, handler))
 
     async def initialize(self) -> None:
         pass
@@ -198,6 +200,7 @@ async def test_start_creates_separate_pools_with_proxy(monkeypatch) -> None:
     assert poll_req.kwargs["connection_pool_size"] == 4
     assert builder.request_value is api_req
     assert builder.get_updates_request_value is poll_req
+    assert app.updater.poll_kwargs["allowed_updates"] == Update.ALL_TYPES
     assert any(cmd.command == "status" for cmd in app.bot.commands)
 
 

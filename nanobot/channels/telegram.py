@@ -13,7 +13,7 @@ from loguru import logger
 from pydantic import Field
 from telegram import BotCommand, ReactionTypeEmoji, ReplyParameters, Update
 from telegram.error import TimedOut
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, TypeHandler, filters
 from telegram.request import HTTPXRequest
 
 from nanobot.bus.events import OutboundMessage
@@ -275,6 +275,7 @@ class TelegramChannel(BaseChannel):
         )
         self._app = builder.build()
         self._app.add_error_handler(self._on_error)
+        self._app.add_handler(TypeHandler(Update, self._trace_update), group=-1)
 
         # Add command handlers
         self._app.add_handler(CommandHandler("start", self._on_start))
@@ -316,7 +317,7 @@ class TelegramChannel(BaseChannel):
 
         # Start polling (this runs until stopped)
         await self._app.updater.start_polling(
-            allowed_updates=["message"],
+            allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True  # Ignore old messages on startup
         )
 
@@ -962,6 +963,53 @@ class TelegramChannel(BaseChannel):
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Log polling / handler errors instead of silently swallowing them."""
         logger.error("Telegram error: {}", context.error)
+
+    @staticmethod
+    def _update_kind(update: Update) -> str:
+        """Return the first Telegram update field present for debug tracing."""
+        for name in (
+            "message",
+            "edited_message",
+            "channel_post",
+            "edited_channel_post",
+            "business_message",
+            "edited_business_message",
+            "callback_query",
+            "inline_query",
+            "chat_member",
+            "my_chat_member",
+        ):
+            if getattr(update, name, None) is not None:
+                return name
+        return "unknown"
+
+    async def _trace_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Emit debug diagnostics for incoming Telegram updates."""
+        message = update.effective_message
+        if message is None:
+            logger.debug("Telegram update kind={} without effective_message", self._update_kind(update))
+            return
+        sender_chat = getattr(message, "sender_chat", None)
+        user = update.effective_user or getattr(message, "from_user", None)
+        logger.debug(
+            (
+                "Telegram update kind={} chat_type={} chat_id={} message_id={} "
+                "has_text={} has_caption={} has_user={} user_id={} "
+                "has_sender_chat={} sender_chat_id={} is_topic={} text_preview={!r}"
+            ),
+            self._update_kind(update),
+            getattr(message.chat, "type", None),
+            getattr(message, "chat_id", None),
+            getattr(message, "message_id", None),
+            bool(getattr(message, "text", None)),
+            bool(getattr(message, "caption", None)),
+            user is not None,
+            getattr(user, "id", None),
+            sender_chat is not None,
+            getattr(sender_chat, "id", None),
+            getattr(message, "message_thread_id", None) is not None,
+            (getattr(message, "text", None) or getattr(message, "caption", None) or "")[:80],
+        )
 
     def _get_extension(
         self,
