@@ -40,6 +40,7 @@ dependencies = [
     "qq-botpy>=1.0.0",
     "python-socks[asyncio]>=2.4.0",
     "prompt-toolkit>=3.0.0",
+    "questionary>=2.0.0,<3.0.0",
     "mcp>=1.0.0",
     "json-repair>=0.30.0",
     "langsmith>=0.7.9",
