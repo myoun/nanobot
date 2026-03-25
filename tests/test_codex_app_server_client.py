@@ -144,6 +144,54 @@ for raw in sys.stdin:
 
 
 @pytest.mark.asyncio
+async def test_codex_app_server_client_reads_runtime_account_status(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "fake_account_status.py"
+    script.write_text(
+        """
+import json
+import sys
+
+for raw in sys.stdin:
+    msg = json.loads(raw)
+    method = msg.get("method")
+    request_id = msg.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "unix", "platformOs": "linux"}}), flush=True)
+    elif method == "initialized":
+        continue
+    elif method == "account/read":
+        print(json.dumps({"id": request_id, "result": {"account": {"type": "chatgpt", "email": "user@example.com", "planType": "pro"}, "requiresOpenaiAuth": False}}), flush=True)
+    elif method == "config/read":
+        print(json.dumps({"id": request_id, "result": {"config": {"model": "gpt-5.4", "model_context_window": 400000, "model_auto_compact_token_limit": 200000}, "origins": {}}}), flush=True)
+    elif method == "account/rateLimits/read":
+        print(json.dumps({"id": request_id, "result": {"rateLimits": {"limitId": "codex", "planType": "pro", "primary": {"usedPercent": 55, "windowDurationMins": 300, "resetsAt": 1900000000}, "secondary": {"usedPercent": 23, "windowDurationMins": 10080, "resetsAt": 1900604800}}}}), flush=True)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    client = CodexAppServerClient(
+        command=[sys.executable, str(script)],
+        cwd=tmp_path,
+        client_name="pytest",
+        client_title="pytest",
+        client_version="0",
+    )
+    status = await client.get_runtime_status()
+
+    assert status["account"]["type"] == "chatgpt"
+    assert status["account"]["email"] == "user@example.com"
+    assert status["account"]["planType"] == "pro"
+    assert status["account"]["authMode"] == "chatgpt"
+    assert status["config"]["model_context_window"] == 400000
+    assert status["config"]["model_auto_compact_token_limit"] == 200000
+    assert status["rate_limits"]["primary"]["usedPercent"] == 55
+    assert status["rate_limits"]["secondary"]["windowDurationMins"] == 10080
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_openai_codex_app_server_provider_uses_dynamic_tools_and_filters_complete_task(
     tmp_path: Path,
 ) -> None:

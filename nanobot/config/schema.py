@@ -222,6 +222,7 @@ class AgentDefaults(Base):
     temperature: float = 0.3
     max_tool_iterations: int = 30
     reasoning_effort: str | None = None  # low / medium / high
+    intent_execution_routing_enabled: bool = True
 
 
 class AgentsConfig(Base):

@@ -28,7 +28,6 @@ You have access to:
 - Shell commands (exec)
 - Web access (search, fetch)
 - Messaging (message)
-- Background tasks (spawn)
 
 ## Memory
 

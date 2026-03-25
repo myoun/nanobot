@@ -195,9 +195,11 @@ class TelegramChannel(BaseChannel):
         BotCommand("start", "Start the bot"),
         BotCommand("new", "Start a new conversation"),
         BotCommand("stop", "Stop the current task"),
+        BotCommand("model", "Show or change the current model"),
+        BotCommand("routing", "Toggle intent/execution routing"),
+        BotCommand("status", "Show current session and Codex status"),
         BotCommand("help", "Show available commands"),
         BotCommand("restart", "Restart the bot"),
-        BotCommand("status", "Show bot status"),
     ]
 
     @classmethod
@@ -281,7 +283,10 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(CommandHandler("restart", self._forward_command))
         self._app.add_handler(CommandHandler("status", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._on_help))
-
+        self._app.add_handler(CommandHandler("model", self._forward_command))
+        self._app.add_handler(CommandHandler("routing", self._forward_command))
+        self._app.add_handler(CommandHandler("approve", self._forward_command))
+        self._app.add_handler(CommandHandler("deny", self._forward_command))
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
             MessageHandler(
@@ -559,8 +564,10 @@ class TelegramChannel(BaseChannel):
             "🐈 nanobot commands:\n"
             "/new — Start a new conversation\n"
             "/stop — Stop the current task\n"
+            "/model — Show or change the current model\n"
+            "/routing — Toggle intent/execution routing\n"
             "/restart — Restart the bot\n"
-            "/status — Show bot status\n"
+            "/status — Show current session and Codex status\n"
             "/help — Show available commands"
         )
 

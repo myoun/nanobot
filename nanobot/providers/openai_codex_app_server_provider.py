@@ -90,5 +90,9 @@ class OpenAICodexAppServerProvider(OpenAICodexProvider):
             metadata=metadata,
         )
 
+    async def get_runtime_status(self) -> dict[str, Any]:
+        """Return App Server runtime/account status for user-facing diagnostics."""
+        return await self._app_server.get_runtime_status()
+
     async def aclose(self) -> None:
         await self._app_server.aclose()
