@@ -215,6 +215,7 @@ class AgentDefaults(Base):
     max_tool_iterations: int = 30
     memory_window: int = 50
     reasoning_effort: str | None = None  # low / medium / high
+    intent_execution_routing_enabled: bool = True
 
 
 class AgentsConfig(Base):

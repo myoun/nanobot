@@ -168,6 +168,9 @@ class CodexAppServerClient:
         self._active_turns: dict[str, _TurnAccumulator] = {}
         self._tool_executors: dict[str, DynamicToolExecutor] = {}
         self._event_callbacks: dict[str, AppServerEventCallback] = {}
+        self._account_info: dict[str, Any] = {}
+        self._config_info: dict[str, Any] = {}
+        self._rate_limit_snapshot: dict[str, Any] = {}
         self._initialized = False
         self._closing = False
 
@@ -340,6 +343,37 @@ class CodexAppServerClient:
             self._tool_executors.pop(thread_id, None)
             self._event_callbacks.pop(thread_id, None)
 
+    async def get_runtime_status(self) -> dict[str, Any]:
+        """Return best-effort account and rate-limit status from App Server."""
+        await self.ensure_started()
+
+        try:
+            result = await self._send_request("account/read", {"refreshToken": False})
+            self._update_account_info(result if isinstance(result, dict) else {})
+        except Exception as exc:
+            logger.debug("Failed to read Codex account status: {}", exc)
+
+        try:
+            params: dict[str, Any] = {"includeLayers": False}
+            if self.cwd:
+                params["cwd"] = self.cwd
+            result = await self._send_request("config/read", params)
+            self._update_config_info(result if isinstance(result, dict) else {})
+        except Exception as exc:
+            logger.debug("Failed to read Codex runtime config: {}", exc)
+
+        try:
+            result = await self._send_request("account/rateLimits/read")
+            self._update_rate_limit_snapshot(result if isinstance(result, dict) else {})
+        except Exception as exc:
+            logger.debug("Failed to read Codex rate limits: {}", exc)
+
+        return {
+            "account": dict(self._account_info),
+            "config": dict(self._config_info),
+            "rate_limits": dict(self._rate_limit_snapshot),
+        }
+
     async def aclose(self) -> None:
         """Terminate the App Server process and fail pending requests."""
         proc = self._proc
@@ -347,6 +381,9 @@ class CodexAppServerClient:
         self._initialized = False
         self._closing = True
         self._loaded_threads.clear()
+        self._account_info.clear()
+        self._config_info.clear()
+        self._rate_limit_snapshot.clear()
         self._fail_pending(RuntimeError("Codex App Server client closed"))
 
         if proc and proc.stdin:
@@ -489,6 +526,12 @@ class CodexAppServerClient:
                 thread_id = str(thread.get("id") or "")
                 if thread_id:
                     self._loaded_threads.add(thread_id)
+
+        if method == "account/updated" and isinstance(params, dict):
+            self._update_account_info(params)
+
+        if method == "account/rateLimits/updated" and isinstance(params, dict):
+            self._update_rate_limit_snapshot(params)
 
         if method == "thread/closed" and isinstance(params, dict):
             thread_id = str(params.get("threadId") or "")
@@ -645,3 +688,59 @@ class CodexAppServerClient:
         for accumulator in self._active_turns.values():
             if accumulator.done and not accumulator.done.done():
                 accumulator.done.set_exception(exc)
+
+    def _update_account_info(self, payload: dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            return
+        account = payload.get("account")
+        if isinstance(account, dict):
+            self._account_info["type"] = str(account.get("type") or "").strip() or None
+            self._account_info["email"] = str(account.get("email") or "").strip() or None
+            self._account_info["planType"] = str(account.get("planType") or "").strip() or None
+        auth_mode = str(payload.get("authMode") or "").strip()
+        if auth_mode:
+            self._account_info["authMode"] = auth_mode
+        requires_auth = payload.get("requiresOpenaiAuth")
+        if isinstance(requires_auth, bool):
+            self._account_info["requiresOpenaiAuth"] = requires_auth
+        if "authMode" not in self._account_info:
+            account_type = str(self._account_info.get("type") or "").strip()
+            if account_type == "chatgpt":
+                self._account_info["authMode"] = "chatgpt"
+            elif account_type == "apiKey":
+                self._account_info["authMode"] = "apikey"
+
+    def _update_rate_limit_snapshot(self, payload: dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            return
+        snapshot = self._select_rate_limit_snapshot(payload)
+        if snapshot:
+            self._rate_limit_snapshot = snapshot
+
+    def _update_config_info(self, payload: dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            return
+        config = payload.get("config")
+        if not isinstance(config, dict):
+            return
+        for key in ("model", "model_context_window", "model_auto_compact_token_limit"):
+            value = config.get(key)
+            if value is not None:
+                self._config_info[key] = value
+
+    @staticmethod
+    def _select_rate_limit_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        by_limit_id = payload.get("rateLimitsByLimitId")
+        if isinstance(by_limit_id, dict):
+            preferred = by_limit_id.get("codex")
+            if isinstance(preferred, dict):
+                return dict(preferred)
+            for value in by_limit_id.values():
+                if isinstance(value, dict):
+                    return dict(value)
+        snapshot = payload.get("rateLimits")
+        if isinstance(snapshot, dict):
+            return dict(snapshot)
+        return {}

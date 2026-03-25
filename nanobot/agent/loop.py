@@ -2,6 +2,8 @@
 
 import asyncio
 from contextlib import AsyncExitStack
+from datetime import datetime, timezone
+import inspect
 import json
 import json_repair
 import os
@@ -24,10 +26,8 @@ from nanobot.agent.tools.memory import MemoryTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.report import ReportToUserTool
 from nanobot.agent.tools.sessions import SessionsTool
-from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.memory import MemoryStore
-from nanobot.agent.subagent import SubagentManager
 from nanobot.security.approval_store import ApprovalStore
 from nanobot.security.privileged_client import PrivilegedClient
 from nanobot.session.manager import Session, SessionManager
@@ -131,6 +131,7 @@ class AgentLoop:
         max_tokens: int = 4096,
         memory_window: int = 50,
         reasoning_effort: str | None = None,
+        routing_enabled: bool = True,
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         cron_service: "CronService | None" = None,
@@ -149,6 +150,7 @@ class AgentLoop:
         self.max_tokens = max_tokens
         self.memory_window = memory_window
         self.reasoning_effort = reasoning_effort
+        self.routing_enabled = routing_enabled
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
@@ -158,18 +160,6 @@ class AgentLoop:
         self.memory = self.context.memory
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
-        self.subagents = SubagentManager(
-            provider=provider,
-            workspace=workspace,
-            bus=bus,
-            model=self.model,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            reasoning_effort=self.reasoning_effort,
-            brave_api_key=brave_api_key,
-            exec_config=self.exec_config,
-            restrict_to_workspace=restrict_to_workspace,
-        )
 
         self._running = False
         self._mcp_servers = mcp_servers or {}
@@ -249,10 +239,6 @@ class AgentLoop:
         message_tool = MessageTool(send_callback=self.bus.publish_outbound)
         self.tools.register(message_tool)
 
-        # Spawn tool (for subagents)
-        spawn_tool = SpawnTool(manager=self.subagents)
-        self.tools.register(spawn_tool)
-
         # Cron tool (for scheduling)
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
@@ -312,15 +298,6 @@ class AgentLoop:
             if isinstance(report_tool, ReportToUserTool):
                 report_tool.set_context(channel, chat_id)
 
-        if spawn_tool := self.tools.get("spawn"):
-            if isinstance(spawn_tool, SpawnTool):
-                spawn_tool.set_context(
-                    channel,
-                    chat_id,
-                    session_key=session.key if session else lookup_session_key,
-                    session_id=session.id if session else None,
-                )
-
         if cron_tool := self.tools.get("cron"):
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
@@ -347,6 +324,240 @@ class AgentLoop:
         uses_app_server = getattr(self.provider, "uses_app_server", False)
         return uses_app_server if isinstance(uses_app_server, bool) else False
 
+    def _normalize_model_name(self, model: str | None) -> str:
+        """Normalize model names to the active provider namespace when possible."""
+        value = str(model or "").strip()
+        if not value:
+            return ""
+        if "/" in value:
+            return value
+        default_model = str(self.model or "").strip()
+        for prefix in ("openai-codex/", "openai_codex/"):
+            if default_model.startswith(prefix):
+                return f"{prefix}{value}"
+        return value
+
+    def _resolve_session_model(self, session: Session) -> str:
+        """Return the active model for the current session."""
+        override = self._normalize_model_name(session.metadata.get("model_override"))
+        return override or self.model
+
+    def _request_routing_enabled(self, session: Session) -> bool:
+        override = session.metadata.get("routing_enabled")
+        if isinstance(override, bool):
+            return override
+        return self.routing_enabled
+
+    async def _get_provider_runtime_status(self) -> dict[str, Any]:
+        """Fetch best-effort provider runtime status when supported."""
+        getter = getattr(self.provider, "get_runtime_status", None)
+        if not callable(getter):
+            return {}
+        try:
+            result = getter()
+            if inspect.isawaitable(result):
+                result = await result
+            return result if isinstance(result, dict) else {}
+        except Exception as exc:
+            logger.debug("Failed to read provider runtime status: {}", exc)
+            return {}
+
+    @staticmethod
+    def _format_status_timestamp(value: Any) -> str | None:
+        if value in {None, ""}:
+            return None
+        try:
+            timestamp = float(value)
+        except Exception:
+            return str(value)
+        if timestamp > 1_000_000_000_000:
+            timestamp /= 1000.0
+        dt = datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone()
+        return dt.strftime("%Y-%m-%d %H:%M %Z")
+
+    @staticmethod
+    def _extract_total_tokens(token_usage: Any) -> int | None:
+        if not isinstance(token_usage, dict):
+            return None
+        total = token_usage.get("total")
+        if isinstance(total, dict):
+            total_tokens = total.get("totalTokens")
+            if isinstance(total_tokens, int):
+                return total_tokens
+            input_tokens = total.get("inputTokens")
+            output_tokens = total.get("outputTokens")
+            if isinstance(input_tokens, int) and isinstance(output_tokens, int):
+                return input_tokens + output_tokens
+        total_tokens = token_usage.get("totalTokens")
+        if isinstance(total_tokens, int):
+            return total_tokens
+        return None
+
+    @staticmethod
+    def _model_context_limit(model: str) -> int | None:
+        normalized = str(model or "").strip().lower()
+        if not normalized:
+            return None
+        if "mini" in normalized:
+            return 200_000
+        if "gpt-5" in normalized:
+            return 400_000
+        return None
+
+    @classmethod
+    def _format_context_window_line(
+        cls,
+        model: str,
+        token_usage: Any,
+        runtime_config: Any = None,
+    ) -> str:
+        used_tokens = cls._extract_total_tokens(token_usage)
+        config_limit = None
+        config_label = "context window"
+        if isinstance(runtime_config, dict):
+            auto_compact_limit = runtime_config.get("model_auto_compact_token_limit")
+            context_window = runtime_config.get("model_context_window")
+            if isinstance(auto_compact_limit, int) and auto_compact_limit > 0:
+                config_limit = auto_compact_limit
+                config_label = "auto-compact budget"
+            elif isinstance(context_window, int) and context_window > 0:
+                config_limit = context_window
+                config_label = "context window"
+        limit = config_limit or cls._model_context_limit(model)
+        if used_tokens is None and limit is None:
+            return "Context window: unavailable"
+        if used_tokens is None:
+            return f"Context window: up to {limit:,} tokens (recent usage unavailable)"
+        if limit is None:
+            return f"Context window: last turn used ~{used_tokens:,} tokens (model max unavailable)"
+        remaining = max(limit - used_tokens, 0)
+        remaining_percent = max(min(round((remaining / limit) * 100), 100), 0)
+        return (
+            f"Context left: ~{remaining_percent}% "
+            f"({remaining:,} / {limit:,} tokens remaining in {config_label}; "
+            f"last turn used ~{used_tokens:,})"
+        )
+
+    @staticmethod
+    def _rate_limit_window_label(window: dict[str, Any] | None, fallback: str) -> str:
+        if not isinstance(window, dict):
+            return fallback
+        duration_mins = window.get("windowDurationMins")
+        if not isinstance(duration_mins, int):
+            return fallback
+        if duration_mins == 300:
+            return "5h limit"
+        if duration_mins == 10_080:
+            return "Weekly limit"
+        if duration_mins % (24 * 60) == 0:
+            days = duration_mins // (24 * 60)
+            return f"{days}d limit"
+        if duration_mins % 60 == 0:
+            hours = duration_mins // 60
+            return f"{hours}h limit"
+        return f"{duration_mins}m limit"
+
+    @classmethod
+    def _format_rate_limit_line(
+        cls,
+        fallback_label: str,
+        window: dict[str, Any] | None,
+    ) -> str:
+        label = cls._rate_limit_window_label(window, fallback_label)
+        if not isinstance(window, dict):
+            return f"{label}: unavailable"
+        used_percent = window.get("usedPercent")
+        if isinstance(used_percent, int):
+            text = f"{label}: {used_percent}% used"
+        else:
+            text = f"{label}: usage unavailable"
+        reset_at = cls._format_status_timestamp(window.get("resetsAt"))
+        if reset_at:
+            text += f", resets {reset_at}"
+        return text
+
+    @classmethod
+    def _status_rate_limit_lines(cls, snapshot: Any) -> list[str]:
+        if not isinstance(snapshot, dict):
+            return ["5h limit: unavailable", "Weekly limit: unavailable"]
+
+        lines_by_label: dict[str, str] = {}
+        extras: list[str] = []
+        for fallback_label, key in (("Primary limit", "primary"), ("Secondary limit", "secondary")):
+            window = snapshot.get(key)
+            line = cls._format_rate_limit_line(fallback_label, window)
+            resolved_label = cls._rate_limit_window_label(window, fallback_label)
+            if resolved_label in {"5h limit", "Weekly limit"}:
+                lines_by_label[resolved_label] = line
+            else:
+                extras.append(line)
+
+        ordered = [
+            lines_by_label.get("5h limit", "5h limit: unavailable"),
+            lines_by_label.get("Weekly limit", "Weekly limit: unavailable"),
+        ]
+        for extra in extras:
+            if extra not in ordered:
+                ordered.append(extra)
+        return ordered
+
+    async def _build_status_lines(
+        self,
+        *,
+        session: Session,
+        conversation_key: str,
+        fixed_session_mode: bool,
+    ) -> list[str]:
+        active_model = self._resolve_session_model(session)
+        lines = [f"Model: {active_model}"]
+        lines.append(
+            f"Routing: {'enabled' if self._request_routing_enabled(session) else 'disabled'}"
+        )
+        if fixed_session_mode:
+            lines.append(f"Session: {session.id or '(unsaved)'}")
+            lines.append(f"Session key: {session.key}")
+            lines.append("Scope: fixed session")
+        else:
+            title = str(session.title or "").strip() or "(untitled)"
+            lines.append(f"Session: {session.id or '(unsaved)'} ({title})")
+            lines.append(f"Conversation: {conversation_key}")
+        thread_id = str(session.metadata.get("app_server_thread_id") or "").strip()
+        if thread_id:
+            lines.append(f"App Server thread: {thread_id}")
+
+        runtime_status = await self._get_provider_runtime_status() if self._uses_app_server_runtime() else {}
+        account = runtime_status.get("account") if isinstance(runtime_status, dict) else None
+        if isinstance(account, dict):
+            auth_mode = str(account.get("authMode") or "").strip()
+            if auth_mode:
+                lines.append(f"Auth: {auth_mode}")
+            plan_type = str(account.get("planType") or "").strip()
+            if plan_type:
+                lines.append(f"Plan: {plan_type}")
+
+        rate_limits = runtime_status.get("rate_limits") if isinstance(runtime_status, dict) else None
+        lines.extend(self._status_rate_limit_lines(rate_limits))
+        lines.append(
+            self._format_context_window_line(
+                active_model,
+                session.metadata.get("app_server_token_usage"),
+                runtime_status.get("config") if isinstance(runtime_status, dict) else None,
+            )
+        )
+        return lines
+
+    @staticmethod
+    def _clear_app_server_binding(session: Session) -> bool:
+        """Remove remote App Server thread binding metadata from a session."""
+        had_binding = any(
+            str(session.metadata.get(key) or "").strip()
+            for key in ("app_server_thread_id", "app_server_last_turn_id", "app_server_model")
+        )
+        session.metadata.pop("app_server_thread_id", None)
+        session.metadata.pop("app_server_last_turn_id", None)
+        session.metadata.pop("app_server_model", None)
+        return had_binding
+
     async def _run_app_server_primary_turn(
         self,
         *,
@@ -356,6 +567,7 @@ class AgentLoop:
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str], dict[str, Any]]:
         """Execute the current turn via Codex App Server."""
+        active_model = self._resolve_session_model(session)
         existing_thread_id = str(session.metadata.get("app_server_thread_id") or "").strip() or None
         history = session.get_history(max_messages=self.memory_window)
         working_set_path = None
@@ -451,18 +663,23 @@ class AgentLoop:
             developer_instructions=self.context.build_app_server_prompt(),
             event_callback=_app_server_event,
             cwd=str(self.workspace),
-            model=self.model,
+            model=active_model,
             reasoning_effort=self.reasoning_effort,
             exclude_tool_names=[self._COMPLETE_TOOL_NAME],
         )
         await _flush_progress(force=True)
         session.metadata["app_server_thread_id"] = result.thread_id
         session.metadata["app_server_last_turn_id"] = result.turn_id
+        session.metadata["app_server_model"] = active_model
+        token_usage = result.metadata.get("token_usage") if isinstance(result.metadata, dict) else None
+        if isinstance(token_usage, dict):
+            session.metadata["app_server_token_usage"] = token_usage
 
         llm_metadata = dict(result.metadata or {})
         llm_metadata["request_execution"] = request_execution
         llm_metadata["app_server_thread_id"] = result.thread_id
         llm_metadata["app_server_turn_id"] = result.turn_id
+        llm_metadata["model"] = active_model
         return result.final_text, list(result.tools_used), llm_metadata
 
     @staticmethod
@@ -666,11 +883,13 @@ class AgentLoop:
             current_message=followup_event,
             channel=msg.channel,
             chat_id=msg.chat_id,
+            request_routing_enabled=self._request_routing_enabled(target_session),
         )
         final_content, tools_used, llm_metadata = await self._run_agent_loop(
             initial_messages,
             initial_external_progress=True,
             request_execution=self._REQUEST_EXEC_REQUIRED,
+            model=self._resolve_session_model(target_session),
         )
         session_trace_messages = llm_metadata.pop(self._SESSION_TRACE_MESSAGES_KEY, None)
         skip_session_assistant = bool(llm_metadata.pop(self._SKIP_SESSION_ASSISTANT_KEY, False))
@@ -817,6 +1036,7 @@ class AgentLoop:
         return any(re.search(p, lowered) for p in patterns)
 
     async def _classify_request(self, session: Session, user_text: str) -> tuple[str, str, str]:
+        active_model = self._resolve_session_model(session)
         recent_lines: list[str] = []
         for msg in session.messages[-self._MODE_CLASSIFIER_MAX_HISTORY :]:
             role = str(msg.get("role") or "").upper()
@@ -890,7 +1110,7 @@ class AgentLoop:
             response = await self._provider_chat(
                 messages=classifier_messages,
                 tools=[],
-                model=self.model,
+                model=active_model,
                 max_tokens=120,
                 temperature=0.0,
             )
@@ -1207,6 +1427,7 @@ class AgentLoop:
         *,
         initial_external_progress: bool = False,
         request_execution: str = _REQUEST_EXEC_OPTIONAL,
+        model: str | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str], dict[str, Any]]:
         """
@@ -1222,6 +1443,7 @@ class AgentLoop:
         messages = initial_messages
         request_user_message = self._extract_latest_user_message(initial_messages)
         requires_execution = request_execution == self._REQUEST_EXEC_REQUIRED
+        active_model = self._normalize_model_name(model) or self.model
         iteration = 0
         final_content = None
         tools_used: list[str] = []
@@ -1250,7 +1472,7 @@ class AgentLoop:
             ),
             metadata={
                 "request_execution": request_execution,
-                "model": self.model,
+                "model": active_model,
                 "provider": type(self.provider).__name__,
                 "max_iterations": self.max_iterations,
             },
@@ -1284,13 +1506,13 @@ class AgentLoop:
                     request_messages,
                     request_user_message=request_user_message,
                 ),
-                metadata={"iteration": iteration, "model": self.model},
+                metadata={"iteration": iteration, "model": active_model},
             )
             try:
                 response = await self._provider_chat(
                     messages=request_messages,
                     tools=self.tools.get_definitions(),
-                    model=self.model,
+                    model=active_model,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                     reasoning_effort=self.reasoning_effort,
@@ -1634,6 +1856,7 @@ class AgentLoop:
         if llm_error:
             llm_metadata[self._SKIP_SESSION_ASSISTANT_KEY] = True
         llm_metadata["request_execution"] = request_execution
+        llm_metadata["model"] = active_model
 
         flow_span.set_outputs(
             {
@@ -1736,7 +1959,8 @@ class AgentLoop:
         conversation_key = msg.session_key
 
         # Handle slash commands
-        cmd = msg.content.strip().lower()
+        raw_cmd = msg.content.strip()
+        cmd = raw_cmd.lower()
         cmd_token = cmd.split()[0] if cmd else ""
         cmd_name = cmd_token.split("@", 1)[0]
         if cmd_name == "/new":
@@ -1760,8 +1984,7 @@ class AgentLoop:
                         chat_id=msg.chat_id,
                         content="Failed to archive fixed session history. Session was left unchanged.",
                     )
-                session.metadata.pop("app_server_thread_id", None)
-                session.metadata.pop("app_server_last_turn_id", None)
+                self._clear_app_server_binding(session)
                 session.clear()
                 self.sessions.save(session)
                 self._consolidation_scheduled_counts.pop(session.key, None)
@@ -1815,9 +2038,7 @@ class AgentLoop:
                     content="Rebase is only available when nanobot is using Codex App Server.",
                 )
             session = self._refresh_session(session)
-            had_remote_thread = bool(str(session.metadata.get("app_server_thread_id") or "").strip())
-            session.metadata.pop("app_server_thread_id", None)
-            session.metadata.pop("app_server_last_turn_id", None)
+            had_remote_thread = self._clear_app_server_binding(session)
             self.sessions.save(session)
             if had_remote_thread:
                 return OutboundMessage(
@@ -1832,6 +2053,145 @@ class AgentLoop:
                 channel=msg.channel,
                 chat_id=msg.chat_id,
                 content="This session is already detached from any remote App Server thread.",
+            )
+        if cmd_name == "/model":
+            session = self._refresh_session(session)
+            parts = raw_cmd.split(maxsplit=1)
+            active_model = self._resolve_session_model(session)
+            base_model = self.model
+            override_model = self._normalize_model_name(session.metadata.get("model_override"))
+            if len(parts) == 1:
+                scope = "session override" if override_model else "default"
+                lines = [f"Current model: {active_model}", f"Default model: {base_model}"]
+                if override_model:
+                    lines.append(f"Session override: {override_model}")
+                else:
+                    lines.append("Session override: none")
+                lines.append("Usage: /model <name> | /model reset")
+                lines.append(f"Scope: {scope}")
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="\n".join(lines),
+                )
+
+            requested = parts[1].strip()
+            if not requested:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Usage: /model <name> | /model reset",
+                )
+
+            if requested.lower() in {"reset", "default"}:
+                if not override_model:
+                    return OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=f"This session is already using the default model: {base_model}",
+                    )
+                session.metadata.pop("model_override", None)
+                self.sessions.save(session)
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=f"Reset this session to the default model: {base_model}.",
+                )
+
+            normalized_model = self._normalize_model_name(requested)
+            if not normalized_model:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Usage: /model <name> | /model reset",
+                )
+
+            if normalized_model == active_model:
+                if normalized_model == base_model:
+                    session.metadata.pop("model_override", None)
+                    self.sessions.save(session)
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=f"This session is already using {normalized_model}.",
+                )
+
+            if normalized_model == base_model:
+                session.metadata.pop("model_override", None)
+            else:
+                session.metadata["model_override"] = normalized_model
+            self.sessions.save(session)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=f"Switched this session to model {normalized_model}.",
+            )
+        if cmd_name == "/routing":
+            session = self._refresh_session(session)
+            parts = raw_cmd.split(maxsplit=1)
+            current_enabled = self._request_routing_enabled(session)
+            override = session.metadata.get("routing_enabled")
+            if len(parts) == 1:
+                lines = [
+                    f"Intent/execution routing: {'enabled' if current_enabled else 'disabled'}",
+                    f"Default: {'enabled' if self.routing_enabled else 'disabled'}",
+                    (
+                        f"Session override: {'enabled' if override else 'disabled'}"
+                        if isinstance(override, bool)
+                        else "Session override: none"
+                    ),
+                    "Usage: /routing on | /routing off | /routing reset",
+                ]
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="\n".join(lines),
+                )
+
+            requested = parts[1].strip().lower()
+            if requested in {"on", "enable", "enabled"}:
+                session.metadata["routing_enabled"] = True
+                self.sessions.save(session)
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Enabled intent/execution routing for this session.",
+                )
+            if requested in {"off", "disable", "disabled"}:
+                session.metadata["routing_enabled"] = False
+                self.sessions.save(session)
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Disabled intent/execution routing for this session.",
+                )
+            if requested in {"reset", "default"}:
+                session.metadata.pop("routing_enabled", None)
+                self.sessions.save(session)
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=(
+                        "Cleared the session routing override. "
+                        f"Using default: {'enabled' if self.routing_enabled else 'disabled'}."
+                    ),
+                )
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="Usage: /routing on | /routing off | /routing reset",
+            )
+        if cmd_name == "/status":
+            session = self._refresh_session(session)
+            lines = await self._build_status_lines(
+                session=session,
+                conversation_key=conversation_key,
+                fixed_session_mode=fixed_session_mode,
+            )
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="\n".join(lines),
             )
         if cmd_name == "/session":
             if fixed_session_mode:
@@ -1888,6 +2248,9 @@ class AgentLoop:
                     content=(
                         "nanobot fixed-session mode:\n"
                         "/new - Clear current fixed session history\n"
+                        "/model - Show or change the current fixed session model\n"
+                        "/routing - Toggle intent/execution routing for this session\n"
+                        "/status - Show current model, session, and Codex limits\n"
                         "/rebase - Start a fresh Codex thread for the current fixed session\n"
                         "/help - Show available commands\n"
                         "/approve - Approve pending privileged request\n"
@@ -1900,6 +2263,9 @@ class AgentLoop:
                 content=(
                     "nanobot commands:\n"
                     "/new - Start a new session in this conversation\n"
+                    "/model - Show or change the current session model\n"
+                    "/routing - Toggle intent/execution routing for this session\n"
+                    "/status - Show current model, session, and Codex limits\n"
                     "/rebase - Start a fresh Codex thread for the current session\n"
                     "/session list - List sessions in this conversation\n"
                     "/session new - Create a new session\n"
@@ -1927,9 +2293,14 @@ class AgentLoop:
         if not self._uses_app_server_runtime() and len(session.messages) > self.memory_window:
             self._track_consolidation_task(session)
 
-        request_intent, request_execution, request_reason = await self._classify_request(
-            session, msg.content
-        )
+        if self._request_routing_enabled(session):
+            request_intent, request_execution, request_reason = await self._classify_request(
+                session, msg.content
+            )
+        else:
+            request_intent = self._REQUEST_INTENT_TASK
+            request_execution = self._REQUEST_EXEC_OPTIONAL
+            request_reason = "intent/execution routing disabled for this session"
         logger.info(
             f"Request routing for {msg.channel}:{msg.chat_id}: "
             f"intent={request_intent}, execution={request_execution} ({request_reason})"
@@ -2014,11 +2385,13 @@ class AgentLoop:
                 media=msg.media if msg.media else None,
                 channel=msg.channel,
                 chat_id=msg.chat_id,
+                request_routing_enabled=self._request_routing_enabled(session),
             )
 
             final_content, tools_used, llm_metadata = await self._run_agent_loop(
                 initial_messages,
                 request_execution=request_execution,
+                model=self._resolve_session_model(session),
                 on_progress=progress_cb,
             )
         llm_metadata["request_intent"] = request_intent
@@ -2058,7 +2431,7 @@ class AgentLoop:
 
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
-        Process a system message (e.g., subagent announce).
+        Process a system message.
 
         The chat_id field contains "original_channel:original_chat_id" to route
         the response back to the correct destination.
@@ -2096,8 +2469,12 @@ class AgentLoop:
             current_message=msg.content,
             channel=origin_channel,
             chat_id=origin_chat_id,
+            request_routing_enabled=self._request_routing_enabled(session),
         )
-        final_content, _, llm_metadata = await self._run_agent_loop(initial_messages)
+        final_content, _, llm_metadata = await self._run_agent_loop(
+            initial_messages,
+            model=self._resolve_session_model(session),
+        )
         session_trace_messages = llm_metadata.pop(self._SESSION_TRACE_MESSAGES_KEY, None)
         skip_session_assistant = bool(llm_metadata.pop(self._SKIP_SESSION_ASSISTANT_KEY, False))
 
@@ -2195,7 +2572,7 @@ Respond with ONLY valid JSON, no markdown fences."""
                     },
                     {"role": "user", "content": prompt},
                 ],
-                model=self.model,
+                model=self._resolve_session_model(session),
                 reasoning_effort=self.reasoning_effort,
             )
             text = (response.content or "").strip()

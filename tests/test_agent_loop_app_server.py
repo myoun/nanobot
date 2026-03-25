@@ -99,8 +99,32 @@ class FakeAppServerClient:
             "turn-app-456",
             "final answer from app server",
             ["echo_tool"],
-            {"token_usage": {"total": {"outputTokens": 1}}},
+            {"token_usage": {"total": {"inputTokens": 3210, "outputTokens": 210, "totalTokens": 3420}}},
         )
+
+    async def get_runtime_status(self) -> dict[str, Any]:
+        return {
+            "account": {
+                "authMode": "chatgpt",
+                "planType": "pro",
+            },
+            "config": {
+                "model_context_window": 400_000,
+                "model_auto_compact_token_limit": 200_000,
+            },
+            "rate_limits": {
+                "primary": {
+                    "usedPercent": 42,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1_900_000_000,
+                },
+                "secondary": {
+                    "usedPercent": 18,
+                    "windowDurationMins": 10_080,
+                    "resetsAt": 1_900_604_800,
+                },
+            },
+        }
 
     async def aclose(self) -> None:
         self.closed = True
@@ -162,6 +186,7 @@ async def test_agent_loop_app_server_branch_stores_thread_and_final_text(
         session = loop.sessions.get_active_session("cli:appserver-thread")
         assert session.metadata["app_server_thread_id"] == "thread-app-123"
         assert session.metadata["app_server_last_turn_id"] == "turn-app-456"
+        assert session.metadata["app_server_token_usage"]["total"]["totalTokens"] == 3420
         assert session.messages[-1]["content"] == "final answer from app server"
         assert session.messages[-1]["tools_used"] == ["echo_tool"]
     finally:
@@ -329,6 +354,235 @@ async def test_rebase_clears_remote_thread_binding_but_keeps_session_history(
         assert "app_server_thread_id" not in refreshed.metadata
         assert "app_server_last_turn_id" not in refreshed.metadata
         assert refreshed.messages[-1]["content"] == "keep this history"
+    finally:
+        await loop.close_mcp()
+
+
+@pytest.mark.asyncio
+async def test_model_command_reports_current_session_model(
+    tmp_path: Path,
+) -> None:
+    fake_client = FakeAppServerClient()
+    provider = OpenAICodexAppServerProvider(
+        default_model="openai-codex/gpt-5.1-codex",
+        workspace=tmp_path,
+        app_server_client=fake_client,  # type: ignore[arg-type]
+    )
+    loop = _make_loop(tmp_path, provider)
+
+    try:
+        response = await loop._process_message(
+            InboundMessage(
+                channel="cli",
+                sender_id="user",
+                chat_id="model-info",
+                content="/model",
+            )
+        )
+
+        assert response is not None
+        assert "Current model: openai-codex/gpt-5.1-codex" in response.content
+        assert "Session override: none" in response.content
+        assert "Usage: /model <name> | /model reset" in response.content
+    finally:
+        await loop.close_mcp()
+
+
+@pytest.mark.asyncio
+async def test_status_command_reports_session_limits_and_context_window(
+    tmp_path: Path,
+) -> None:
+    fake_client = FakeAppServerClient()
+    provider = OpenAICodexAppServerProvider(
+        default_model="openai-codex/gpt-5.1-codex",
+        workspace=tmp_path,
+        app_server_client=fake_client,  # type: ignore[arg-type]
+    )
+    loop = _make_loop(tmp_path, provider)
+
+    session = loop.sessions.get_active_session("cli:status-info")
+    session.title = "Status test"
+    session.metadata["app_server_thread_id"] = "thread-status-1"
+    session.metadata["app_server_token_usage"] = {
+        "total": {"inputTokens": 12_000, "outputTokens": 800, "totalTokens": 12_800}
+    }
+    loop.sessions.save(session)
+
+    try:
+        response = await loop._process_message(
+            InboundMessage(
+                channel="cli",
+                sender_id="user",
+                chat_id="status-info",
+                content="/status",
+            )
+        )
+
+        assert response is not None
+        assert "Model: openai-codex/gpt-5.1-codex" in response.content
+        assert "Routing: enabled" in response.content
+        assert "Session: " in response.content
+        assert "Conversation: cli:status-info" in response.content
+        assert "App Server thread: thread-status-1" in response.content
+        assert "Auth: chatgpt" in response.content
+        assert "Plan: pro" in response.content
+        assert "5h limit: 42% used" in response.content
+        assert "Weekly limit: 18% used" in response.content
+        assert "Context left: ~94% (187,200 / 200,000 tokens remaining in auto-compact budget" in response.content
+    finally:
+        await loop.close_mcp()
+
+
+@pytest.mark.asyncio
+async def test_routing_command_disables_request_classification_for_session(
+    tmp_path: Path,
+) -> None:
+    fake_client = FakeAppServerClient()
+    provider = OpenAICodexAppServerProvider(
+        default_model="openai-codex/gpt-5.1-codex",
+        workspace=tmp_path,
+        app_server_client=fake_client,  # type: ignore[arg-type]
+    )
+    loop = _make_loop(tmp_path, provider)
+
+    async def should_not_run(_session, _user_text):
+        raise AssertionError("classification should be bypassed when routing is disabled")
+
+    loop._classify_request = should_not_run  # type: ignore[method-assign]
+
+    try:
+        disable_response = await loop._process_message(
+            InboundMessage(
+                channel="cli",
+                sender_id="user",
+                chat_id="routing-toggle",
+                content="/routing off",
+            )
+        )
+
+        assert disable_response is not None
+        assert disable_response.content == "Disabled intent/execution routing for this session."
+
+        routed_response = await loop._process_message(
+            InboundMessage(
+                channel="cli",
+                sender_id="user",
+                chat_id="routing-toggle",
+                content="just continue",
+            )
+        )
+
+        assert routed_response is not None
+        assert routed_response.content == "final answer from app server"
+        session = loop.sessions.get_active_session("cli:routing-toggle")
+        assert session.metadata["routing_enabled"] is False
+        assert session.metadata["last_request_intent"] == "TASK"
+        assert session.metadata["last_request_execution"] == "OPTIONAL"
+        assert session.metadata["last_request_reason"] == "intent/execution routing disabled for this session"
+    finally:
+        await loop.close_mcp()
+
+
+@pytest.mark.asyncio
+async def test_model_command_switches_session_model_without_detaching_thread_binding(
+    tmp_path: Path,
+) -> None:
+    fake_client = FakeAppServerClient()
+    provider = OpenAICodexAppServerProvider(
+        default_model="openai-codex/gpt-5.1-codex",
+        workspace=tmp_path,
+        app_server_client=fake_client,  # type: ignore[arg-type]
+    )
+    loop = _make_loop(tmp_path, provider)
+
+    async def fake_classify(session, user_text):
+        return "TASK", "OPTIONAL", "test classifier"
+
+    loop._classify_request = fake_classify  # type: ignore[method-assign]
+
+    session = loop.sessions.get_active_session("cli:model-switch")
+    session.metadata["app_server_thread_id"] = "thread-old"
+    session.metadata["app_server_last_turn_id"] = "turn-old"
+    session.metadata["app_server_model"] = "openai-codex/gpt-5.1-codex"
+    loop.sessions.save(session)
+
+    try:
+        switch_response = await loop._process_message(
+            InboundMessage(
+                channel="cli",
+                sender_id="user",
+                chat_id="model-switch",
+                content="/model gpt-5.4",
+            )
+        )
+
+        assert switch_response is not None
+        assert switch_response.content == "Switched this session to model openai-codex/gpt-5.4."
+
+        refreshed = loop.sessions.get_active_session("cli:model-switch")
+        assert refreshed.metadata["model_override"] == "openai-codex/gpt-5.4"
+        assert refreshed.metadata["app_server_thread_id"] == "thread-old"
+        assert refreshed.metadata["app_server_last_turn_id"] == "turn-old"
+        assert refreshed.metadata["app_server_model"] == "openai-codex/gpt-5.1-codex"
+
+        response = await loop._process_message(
+            InboundMessage(
+                channel="cli",
+                sender_id="user",
+                chat_id="model-switch",
+                content="continue with the new model",
+            )
+        )
+
+        assert response is not None
+        assert response.content == "final answer from app server"
+        assert fake_client.ensure_thread_calls[-1]["thread_id"] == "thread-old"
+        assert fake_client.ensure_thread_calls[-1]["model"] == "gpt-5.4"
+        assert fake_client.run_turn_calls[-1]["model"] == "gpt-5.4"
+
+        latest_session = loop.sessions.get_active_session("cli:model-switch")
+        assert latest_session.metadata["app_server_model"] == "openai-codex/gpt-5.4"
+    finally:
+        await loop.close_mcp()
+
+
+@pytest.mark.asyncio
+async def test_model_command_reset_returns_session_to_default_model(
+    tmp_path: Path,
+) -> None:
+    fake_client = FakeAppServerClient()
+    provider = OpenAICodexAppServerProvider(
+        default_model="openai-codex/gpt-5.1-codex",
+        workspace=tmp_path,
+        app_server_client=fake_client,  # type: ignore[arg-type]
+    )
+    loop = _make_loop(tmp_path, provider)
+
+    session = loop.sessions.get_active_session("cli:model-reset")
+    session.metadata["model_override"] = "openai-codex/gpt-5.4"
+    session.metadata["app_server_thread_id"] = "thread-old"
+    session.metadata["app_server_last_turn_id"] = "turn-old"
+    session.metadata["app_server_model"] = "openai-codex/gpt-5.4"
+    loop.sessions.save(session)
+
+    try:
+        response = await loop._process_message(
+            InboundMessage(
+                channel="cli",
+                sender_id="user",
+                chat_id="model-reset",
+                content="/model reset",
+            )
+        )
+
+        assert response is not None
+        assert response.content == "Reset this session to the default model: openai-codex/gpt-5.1-codex."
+
+        refreshed = loop.sessions.get_active_session("cli:model-reset")
+        assert "model_override" not in refreshed.metadata
+        assert refreshed.metadata["app_server_thread_id"] == "thread-old"
+        assert refreshed.metadata["app_server_last_turn_id"] == "turn-old"
+        assert refreshed.metadata["app_server_model"] == "openai-codex/gpt-5.4"
     finally:
         await loop.close_mcp()
 

@@ -198,7 +198,6 @@ You have access to tools that allow you to:
 - Execute shell commands
 - Search the web and fetch web pages
 - Send messages to users on chat channels
-- Spawn subagents for complex background tasks
 
 ## Runtime
 {runtime}
@@ -360,6 +359,7 @@ This thread runs inside the `nanobot` product layer on top of Codex App Server.
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        request_routing_enabled: bool = True,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -387,7 +387,11 @@ This thread runs inside the `nanobot` product layer on top of Codex App Server.
         messages.append({"role": "user", "content": self._build_runtime_context(channel, chat_id)})
 
         # Current message (with optional image attachments)
-        routing_aware_message = self._inject_request_routing_context(history, current_message)
+        routing_aware_message = (
+            self._inject_request_routing_context(history, current_message)
+            if request_routing_enabled
+            else current_message
+        )
         user_content = self._build_user_content(routing_aware_message, media)
         messages.append({"role": "user", "content": user_content})
 
