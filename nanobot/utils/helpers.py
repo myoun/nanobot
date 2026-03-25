@@ -1,25 +1,31 @@
 """Utility functions for nanobot."""
 
+from __future__ import annotations
+
 import base64
 import json
+import os
 import re
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import tiktoken
+try:
+    import tiktoken  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    tiktoken = None
 
 
 def strip_think(text: str) -> str:
-    """Remove <think>…</think> blocks and any unclosed trailing <think> tag."""
+    """Remove <think> blocks and any trailing unfinished think tag."""
     text = re.sub(r"<think>[\s\S]*?</think>", "", text)
     text = re.sub(r"<think>[\s\S]*$", "", text)
     return text.strip()
 
 
 def detect_image_mime(data: bytes) -> str | None:
-    """Detect image MIME type from magic bytes, ignoring file extension."""
+    """Detect image MIME type from magic bytes."""
     if data[:8] == b"\x89PNG\r\n\x1a\n":
         return "image/png"
     if data[:3] == b"\xff\xd8\xff":
@@ -45,41 +51,68 @@ def build_image_content_blocks(raw: bytes, mime: str, path: str, label: str) -> 
 
 
 def ensure_dir(path: Path) -> Path:
-    """Ensure directory exists, return it."""
+    """Ensure a directory exists, creating it if necessary."""
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
+def get_data_path() -> Path:
+    """Get the nanobot data directory (~/.nanobot by default)."""
+    configured = os.environ.get("NANOBOT_HOME", "").strip()
+    if configured:
+        return ensure_dir(Path(configured).expanduser())
+    return ensure_dir(Path.home() / ".nanobot")
+
+
+def get_workspace_path(workspace: str | None = None) -> Path:
+    """Get the workspace path."""
+    if workspace:
+        path = Path(workspace).expanduser()
+    else:
+        path = get_data_path() / "workspace"
+    return ensure_dir(path)
+
+
+def get_sessions_path() -> Path:
+    """Get the sessions storage directory."""
+    return ensure_dir(get_data_path() / "sessions")
+
+
+def get_skills_path(workspace: Path | None = None) -> Path:
+    """Get the skills directory within the workspace."""
+    ws = workspace or get_workspace_path()
+    return ensure_dir(ws / "skills")
+
+
 def timestamp() -> str:
-    """Current ISO timestamp."""
+    """Get current timestamp in ISO format."""
     return datetime.now().isoformat()
 
 
 def current_time_str() -> str:
-    """Human-readable current time with weekday and timezone, e.g. '2026-03-15 22:30 (Saturday) (CST)'."""
+    """Human-readable current time with weekday and timezone."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
     tz = time.strftime("%Z") or "UTC"
     return f"{now} ({tz})"
 
 
+def truncate_string(s: str, max_len: int = 100, suffix: str = "...") -> str:
+    """Truncate a string to max length, adding suffix if truncated."""
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - len(suffix)] + suffix
+
+
 _UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*]')
 
+
 def safe_filename(name: str) -> str:
-    """Replace unsafe path characters with underscores."""
+    """Convert a string to a safe filename."""
     return _UNSAFE_CHARS.sub("_", name).strip()
 
 
 def split_message(content: str, max_len: int = 2000) -> list[str]:
-    """
-    Split content into chunks within max_len, preferring line breaks.
-
-    Args:
-        content: The text content to split.
-        max_len: Maximum length per chunk (default 2000 for Discord compatibility).
-
-    Returns:
-        List of message chunks, each within max_len.
-    """
+    """Split content into chunks within max_len, preferring line breaks."""
     if not content:
         return []
     if len(content) <= max_len:
@@ -90,10 +123,9 @@ def split_message(content: str, max_len: int = 2000) -> list[str]:
             chunks.append(content)
             break
         cut = content[:max_len]
-        # Try to break at newline first, then space, then hard break
-        pos = cut.rfind('\n')
+        pos = cut.rfind("\n")
         if pos <= 0:
-            pos = cut.rfind(' ')
+            pos = cut.rfind(" ")
         if pos <= 0:
             pos = max_len
         chunks.append(content[:pos])
@@ -122,11 +154,9 @@ def estimate_prompt_tokens(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
 ) -> int:
-    """Estimate prompt tokens with tiktoken.
-
-    Counts all fields that providers send to the LLM: content, tool_calls,
-    reasoning_content, tool_call_id, name, plus per-message framing overhead.
-    """
+    """Estimate prompt tokens with optional tiktoken support."""
+    if tiktoken is None:
+        return 0
     try:
         enc = tiktoken.get_encoding("cl100k_base")
         parts: list[str] = []
@@ -137,28 +167,23 @@ def estimate_prompt_tokens(
             elif isinstance(content, list):
                 for part in content:
                     if isinstance(part, dict) and part.get("type") == "text":
-                        txt = part.get("text", "")
-                        if txt:
-                            parts.append(txt)
-
-            tc = msg.get("tool_calls")
-            if tc:
-                parts.append(json.dumps(tc, ensure_ascii=False))
-
+                        text = part.get("text", "")
+                        if text:
+                            parts.append(text)
+                    else:
+                        parts.append(json.dumps(part, ensure_ascii=False))
+            if msg.get("tool_calls"):
+                parts.append(json.dumps(msg["tool_calls"], ensure_ascii=False))
             rc = msg.get("reasoning_content")
             if isinstance(rc, str) and rc:
                 parts.append(rc)
-
             for key in ("name", "tool_call_id"):
                 value = msg.get(key)
                 if isinstance(value, str) and value:
                     parts.append(value)
-
         if tools:
             parts.append(json.dumps(tools, ensure_ascii=False))
-
-        per_message_overhead = len(messages) * 4
-        return len(enc.encode("\n".join(parts))) + per_message_overhead
+        return len(enc.encode("\n".join(parts))) + len(messages) * 4
     except Exception:
         return 0
 
@@ -179,26 +204,25 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
                 parts.append(json.dumps(part, ensure_ascii=False))
     elif content is not None:
         parts.append(json.dumps(content, ensure_ascii=False))
-
     for key in ("name", "tool_call_id"):
         value = message.get(key)
         if isinstance(value, str) and value:
             parts.append(value)
     if message.get("tool_calls"):
         parts.append(json.dumps(message["tool_calls"], ensure_ascii=False))
-
     rc = message.get("reasoning_content")
     if isinstance(rc, str) and rc:
         parts.append(rc)
-
     payload = "\n".join(parts)
     if not payload:
         return 4
-    try:
-        enc = tiktoken.get_encoding("cl100k_base")
-        return max(4, len(enc.encode(payload)) + 4)
-    except Exception:
-        return max(4, len(payload) // 4 + 4)
+    if tiktoken is not None:
+        try:
+            enc = tiktoken.get_encoding("cl100k_base")
+            return max(4, len(enc.encode(payload)) + 4)
+        except Exception:
+            pass
+    return max(4, len(payload) // 4 + 4)
 
 
 def estimate_prompt_tokens_chain(
@@ -207,7 +231,7 @@ def estimate_prompt_tokens_chain(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
 ) -> tuple[int, str]:
-    """Estimate prompt tokens via provider counter first, then tiktoken fallback."""
+    """Estimate prompt tokens via provider counter first, then fallback."""
     provider_counter = getattr(provider, "estimate_prompt_tokens", None)
     if callable(provider_counter):
         try:
@@ -216,7 +240,6 @@ def estimate_prompt_tokens_chain(
                 return int(tokens), str(source or "provider_counter")
         except Exception:
             pass
-
     estimated = estimate_prompt_tokens(messages, tools)
     if estimated > 0:
         return int(estimated), "tiktoken"
@@ -244,46 +267,66 @@ def build_status_content(
     last_out = last_usage.get("completion_tokens", 0)
     ctx_total = max(context_window_tokens, 0)
     ctx_pct = int((context_tokens_estimate / ctx_total) * 100) if ctx_total > 0 else 0
-    ctx_used_str = f"{context_tokens_estimate // 1000}k" if context_tokens_estimate >= 1000 else str(context_tokens_estimate)
+    ctx_used_str = (
+        f"{context_tokens_estimate // 1000}k"
+        if context_tokens_estimate >= 1000
+        else str(context_tokens_estimate)
+    )
     ctx_total_str = f"{ctx_total // 1024}k" if ctx_total > 0 else "n/a"
-    return "\n".join([
-        f"\U0001f408 nanobot v{version}",
-        f"\U0001f9e0 Model: {model}",
-        f"\U0001f4ca Tokens: {last_in} in / {last_out} out",
-        f"\U0001f4da Context: {ctx_used_str}/{ctx_total_str} ({ctx_pct}%)",
-        f"\U0001f4ac Session: {session_msg_count} messages",
-        f"\u23f1 Uptime: {uptime}",
-    ])
+    return "\n".join(
+        [
+            f"nanobot v{version}",
+            f"Model: {model}",
+            f"Tokens: {last_in} in / {last_out} out",
+            f"Context: {ctx_used_str}/{ctx_total_str} ({ctx_pct}%)",
+            f"Session: {session_msg_count} messages",
+            f"Uptime: {uptime}",
+        ]
+    )
 
 
 def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
     """Sync bundled templates to workspace. Only creates missing files."""
     from importlib.resources import files as pkg_files
+
     try:
-        tpl = pkg_files("nanobot") / "templates"
+        templates_dir = pkg_files("nanobot") / "templates"
     except Exception:
         return []
-    if not tpl.is_dir():
+    if not templates_dir.is_dir():
         return []
 
     added: list[str] = []
 
-    def _write(src, dest: Path):
+    def _write(src: Any, dest: Path) -> None:
         if dest.exists():
             return
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(src.read_text(encoding="utf-8") if src else "", encoding="utf-8")
+        text = src.read_text(encoding="utf-8") if src else ""
+        dest.write_text(text, encoding="utf-8")
         added.append(str(dest.relative_to(workspace)))
 
-    for item in tpl.iterdir():
+    for item in templates_dir.iterdir():
         if item.name.endswith(".md") and not item.name.startswith("."):
             _write(item, workspace / item.name)
-    _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md")
-    _write(None, workspace / "memory" / "HISTORY.md")
+    memory_template = templates_dir / "memory" / "MEMORY.md"
+    if memory_template.exists():
+        _write(memory_template, workspace / "memory" / "MEMORY.md")
+        _write(None, workspace / "memory" / "HISTORY.md")
     (workspace / "skills").mkdir(exist_ok=True)
 
     if added and not silent:
         from rich.console import Console
+
         for name in added:
             Console().print(f"  [dim]Created {name}[/dim]")
+
     return added
+
+
+def parse_session_key(key: str) -> tuple[str, str]:
+    """Parse a session key into channel and chat_id."""
+    parts = key.split(":", 1)
+    if len(parts) != 2:
+        raise ValueError(f"Invalid session key: {key}")
+    return parts[0], parts[1]

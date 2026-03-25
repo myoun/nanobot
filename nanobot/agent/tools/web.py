@@ -7,6 +7,7 @@ import html
 import json
 import os
 import re
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -86,10 +87,26 @@ class WebSearchTool(Tool):
         "required": ["query"],
     }
 
-    def __init__(self, config: WebSearchConfig | None = None, proxy: str | None = None):
+    def __init__(
+        self,
+        config: WebSearchConfig | None = None,
+        proxy: str | None = None,
+        api_key: str | None = None,
+        max_results: int | None = None,
+    ):
         from nanobot.config.schema import WebSearchConfig
 
-        self.config = config if config is not None else WebSearchConfig()
+        if config is not None:
+            self.config = config
+        else:
+            base = WebSearchConfig()
+            # Backward compatibility for older call sites that passed api_key/max_results directly.
+            self.config = SimpleNamespace(
+                provider=getattr(base, "provider", "brave"),
+                api_key=api_key if api_key is not None else getattr(base, "api_key", ""),
+                base_url=getattr(base, "base_url", ""),
+                max_results=max_results if max_results is not None else getattr(base, "max_results", 5),
+            )
         self.proxy = proxy
 
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:

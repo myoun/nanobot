@@ -1,0 +1,2 @@
+"""Bundled memory template files."""
+

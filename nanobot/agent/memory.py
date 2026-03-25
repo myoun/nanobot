@@ -4,18 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 import weakref
 from datetime import datetime
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import Any, TYPE_CHECKING
 
 from loguru import logger
 
-from nanobot.utils.helpers import ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain
+from nanobot.utils.helpers import (
+    ensure_dir,
+    estimate_message_tokens,
+    estimate_prompt_tokens_chain,
+    get_data_path,
+    safe_filename,
+)
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
-    from nanobot.session.manager import Session, SessionManager
+    from nanobot.session.manager import Session
 
 
 _SAVE_MEMORY_TOOL = [
@@ -29,7 +35,7 @@ _SAVE_MEMORY_TOOL = [
                 "properties": {
                     "history_entry": {
                         "type": "string",
-                        "description": "A paragraph summarizing key events/decisions/topics. "
+                        "description": "A paragraph (2-5 sentences) summarizing key events/decisions/topics. "
                         "Start with [YYYY-MM-DD HH:MM]. Include detail useful for grep search.",
                     },
                     "memory_update": {
@@ -45,43 +51,90 @@ _SAVE_MEMORY_TOOL = [
 ]
 
 
-def _ensure_text(value: Any) -> str:
-    """Normalize tool-call payload values to text for file storage."""
-    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-
-
-def _normalize_save_memory_args(args: Any) -> dict[str, Any] | None:
-    """Normalize provider tool-call arguments to the expected dict shape."""
-    if isinstance(args, str):
-        args = json.loads(args)
-    if isinstance(args, list):
-        return args[0] if args and isinstance(args[0], dict) else None
-    return args if isinstance(args, dict) else None
-
-_TOOL_CHOICE_ERROR_MARKERS = (
-    "tool_choice",
-    "toolchoice",
-    "does not support",
-    'should be ["none", "auto"]',
-)
-
-
-def _is_tool_choice_unsupported(content: str | None) -> bool:
-    """Detect provider errors caused by forced tool_choice being unsupported."""
-    text = (content or "").lower()
-    return any(m in text for m in _TOOL_CHOICE_ERROR_MARKERS)
-
-
 class MemoryStore:
     """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log)."""
 
-    _MAX_FAILURES_BEFORE_RAW_ARCHIVE = 3
-
     def __init__(self, workspace: Path):
-        self.memory_dir = ensure_dir(workspace / "memory")
+        self.workspace = workspace
+        data_root = get_data_path()
+        self.memory_dir = ensure_dir(data_root / "memories" / "_legacy")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
-        self._consecutive_failures = 0
+        self.item_root = ensure_dir(data_root / "memories")
+        try:
+            resolved_name = workspace.resolve().name  # type: ignore[union-attr]
+        except Exception:
+            resolved_name = None
+        if not isinstance(resolved_name, str) or not resolved_name.strip():
+            fallback_name = getattr(workspace, "name", None)
+            resolved_name = fallback_name if isinstance(fallback_name, str) else "workspace"
+        self.workspace_id = safe_filename(resolved_name or "workspace")
+        self.global_instructions_dir = ensure_dir(self.item_root / "global" / "instructions")
+        self.global_facts_dir = ensure_dir(self.item_root / "global" / "facts")
+        self.global_preferences_dir = ensure_dir(self.item_root / "global" / "preferences")
+        self.workspace_rules_dir = ensure_dir(self.item_root / "workspaces" / self.workspace_id / "rules")
+        self.workspace_memory_dir = ensure_dir(self.item_root / "workspaces" / self.workspace_id / "memory")
+
+    def list_items(
+        self,
+        *,
+        scope: str | None = None,
+        kind: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        return self.search_items("", limit=limit, scope=scope, kind=kind)
+
+    def create_item(
+        self,
+        *,
+        scope: str,
+        kind: str,
+        title: str,
+        content: str,
+        slug: str | None = None,
+    ) -> dict[str, Any]:
+        directory = self._directory_for(scope=scope, kind=kind)
+        item_path = self._allocate_item_path(directory, slug=slug or title)
+        rendered = self._render_item_markdown(title=title, content=content)
+        item_path.write_text(rendered, encoding="utf-8")
+        self.rebuild_index()
+        item_id = item_path.relative_to(self.item_root).as_posix()
+        return {
+            "item_id": item_id,
+            "scope": scope,
+            "kind": kind,
+            "title": title.strip(),
+            "path": str(item_path),
+            "updated_at": datetime.fromtimestamp(item_path.stat().st_mtime).isoformat(),
+        }
+
+    def update_item(
+        self,
+        *,
+        item_id: str,
+        content: str,
+        title: str | None = None,
+    ) -> dict[str, Any]:
+        item_path = self._path_for_item_id(item_id)
+        existing_title = title or self._title_from_item_file(item_path)
+        rendered = self._render_item_markdown(title=existing_title, content=content)
+        item_path.write_text(rendered, encoding="utf-8")
+        self.rebuild_index()
+
+        parts = Path(item_id).parts
+        scope = parts[0] if parts else ""
+        kind = parts[1] if len(parts) >= 2 else "memory"
+        if scope == "workspaces" and len(parts) >= 3:
+            scope = f"workspace:{parts[1]}"
+            kind = parts[2]
+        return {
+            "item_id": item_id,
+            "scope": scope,
+            "kind": kind,
+            "title": existing_title.strip(),
+            "path": str(item_path),
+            "updated_at": datetime.fromtimestamp(item_path.stat().st_mtime).isoformat(),
+        }
 
     def read_long_term(self) -> str:
         if self.memory_file.exists():
@@ -96,30 +149,172 @@ class MemoryStore:
             f.write(entry.rstrip() + "\n\n")
 
     def get_memory_context(self) -> str:
-        long_term = self.read_long_term()
-        return f"## Long-term Memory\n{long_term}" if long_term else ""
+        sections: list[str] = []
+
+        if global_instructions := self._read_item_group(self.global_instructions_dir):
+            sections.append(f"## Global Instructions\n{global_instructions}")
+
+        if workspace_rules := self._read_item_group(self.workspace_rules_dir):
+            sections.append(f"## Workspace Rules\n{workspace_rules}")
+
+        if workspace_memory := self._read_item_group(self.workspace_memory_dir):
+            sections.append(f"## Workspace Memory\n{workspace_memory}")
+
+        global_memory_parts = [
+            self._read_item_group(self.global_facts_dir),
+            self._read_item_group(self.global_preferences_dir),
+        ]
+        global_memory = "\n\n".join(part for part in global_memory_parts if part)
+        if global_memory:
+            sections.append(f"## Global Memory\n{global_memory}")
+
+        if long_term := self.read_long_term():
+            sections.append(f"## Legacy Workspace Memory\n{long_term}")
+
+        return "\n\n".join(section for section in sections if section)
+
+    def rebuild_index(self) -> int:
+        from nanobot.session.search_index import SessionArtifactIndex
+
+        return SessionArtifactIndex(self.workspace).rebuild_memory_index()
+
+    def search_items(
+        self,
+        query: str,
+        *,
+        limit: int = 10,
+        scope: str | None = None,
+        kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        from nanobot.session.search_index import SessionArtifactIndex
+
+        return SessionArtifactIndex(self.workspace).search_memory(
+            query=query,
+            limit=limit,
+            scope=scope,
+            kind=kind,
+        )
+
+    def read_item(self, item_id: str) -> dict[str, Any] | None:
+        from nanobot.session.search_index import SessionArtifactIndex
+
+        return SessionArtifactIndex(self.workspace).read_memory_item(item_id)
+
+    def _directory_for(self, *, scope: str, kind: str) -> Path:
+        normalized_scope = scope.strip().lower()
+        normalized_kind = kind.strip().lower()
+        if normalized_scope == "global":
+            mapping = {
+                "instructions": self.global_instructions_dir,
+                "facts": self.global_facts_dir,
+                "preferences": self.global_preferences_dir,
+            }
+        elif normalized_scope == "workspace":
+            mapping = {
+                "rules": self.workspace_rules_dir,
+                "memory": self.workspace_memory_dir,
+            }
+        else:
+            raise ValueError("scope must be 'global' or 'workspace'")
+
+        directory = mapping.get(normalized_kind)
+        if directory is None:
+            allowed = ", ".join(sorted(mapping))
+            raise ValueError(f"kind must be one of: {allowed}")
+        return directory
+
+    def _path_for_item_id(self, item_id: str) -> Path:
+        raw = item_id.strip().strip("/")
+        if not raw:
+            raise ValueError("item_id is required")
+        path = (self.item_root / raw).resolve()
+        item_root_resolved = self.item_root.resolve()
+        if item_root_resolved not in path.parents and path != item_root_resolved:
+            raise ValueError("item_id must stay inside the memories root")
+        if not path.exists():
+            raise ValueError(f"Unknown memory item: {item_id}")
+        if not path.is_file():
+            raise ValueError(f"Memory item is not a file: {item_id}")
+        return path
 
     @staticmethod
-    def _format_messages(messages: list[dict]) -> str:
-        lines = []
-        for message in messages:
-            if not message.get("content"):
+    def _slugify(value: str) -> str:
+        base = safe_filename(value.strip().lower() or "memory")
+        base = "-".join(part for part in base.replace("_", " ").split() if part)
+        return base or "memory"
+
+    def _allocate_item_path(self, directory: Path, *, slug: str) -> Path:
+        base = self._slugify(slug)
+        candidate = directory / f"{base}.md"
+        suffix = 2
+        while candidate.exists():
+            candidate = directory / f"{base}-{suffix}.md"
+            suffix += 1
+        return candidate
+
+    @staticmethod
+    def _render_item_markdown(*, title: str, content: str) -> str:
+        heading = title.strip() or "Memory"
+        body = content.strip()
+        if not body:
+            raise ValueError("content must not be empty")
+        return f"# {heading}\n\n{body}\n"
+
+    @staticmethod
+    def _title_from_item_file(path: Path) -> str:
+        text = path.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                return stripped.lstrip("#").strip() or path.stem
+        return path.stem.replace("-", " ").replace("_", " ").strip() or path.stem
+
+    def _read_item_group(self, directory: Path) -> str:
+        if not directory.exists():
+            return ""
+
+        entries: list[str] = []
+        for path in sorted(directory.glob("*.md")):
+            text = path.read_text(encoding="utf-8").strip()
+            if not text:
                 continue
-            tools = f" [tools: {', '.join(message['tools_used'])}]" if message.get("tools_used") else ""
-            lines.append(
-                f"[{message.get('timestamp', '?')[:16]}] {message['role'].upper()}{tools}: {message['content']}"
-            )
-        return "\n".join(lines)
+            entries.append(text)
+        return "\n\n---\n\n".join(entries)
 
     async def consolidate(
         self,
-        messages: list[dict],
+        session: Session,
         provider: LLMProvider,
         model: str,
+        *,
+        archive_all: bool = False,
+        memory_window: int = 50,
     ) -> bool:
-        """Consolidate the provided message chunk into MEMORY.md + HISTORY.md."""
-        if not messages:
-            return True
+        """Consolidate old messages into MEMORY.md + HISTORY.md via LLM tool call.
+
+        Returns True on success (including no-op), False on failure.
+        """
+        if archive_all:
+            old_messages = session.messages
+            keep_count = 0
+            logger.info("Memory consolidation (archive_all): {} messages", len(session.messages))
+        else:
+            keep_count = memory_window // 2
+            if len(session.messages) <= keep_count:
+                return True
+            if len(session.messages) - session.last_consolidated <= 0:
+                return True
+            old_messages = session.messages[session.last_consolidated:-keep_count]
+            if not old_messages:
+                return True
+            logger.info("Memory consolidation: {} to consolidate, {} keep", len(old_messages), keep_count)
+
+        lines = []
+        for m in old_messages:
+            if not m.get("content"):
+                continue
+            tools = f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
+            lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
 
         current_memory = self.read_long_term()
         prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
@@ -128,103 +323,54 @@ class MemoryStore:
 {current_memory or "(empty)"}
 
 ## Conversation to Process
-{self._format_messages(messages)}"""
-
-        chat_messages = [
-            {"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."},
-            {"role": "user", "content": prompt},
-        ]
+{chr(10).join(lines)}"""
 
         try:
-            forced = {"type": "function", "function": {"name": "save_memory"}}
-            response = await provider.chat_with_retry(
-                messages=chat_messages,
+            response = await provider.chat(
+                messages=[
+                    {"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."},
+                    {"role": "user", "content": prompt},
+                ],
                 tools=_SAVE_MEMORY_TOOL,
                 model=model,
-                tool_choice=forced,
             )
 
-            if response.finish_reason == "error" and _is_tool_choice_unsupported(
-                response.content
-            ):
-                logger.warning("Forced tool_choice unsupported, retrying with auto")
-                response = await provider.chat_with_retry(
-                    messages=chat_messages,
-                    tools=_SAVE_MEMORY_TOOL,
-                    model=model,
-                    tool_choice="auto",
-                )
-
             if not response.has_tool_calls:
-                logger.warning(
-                    "Memory consolidation: LLM did not call save_memory "
-                    "(finish_reason={}, content_len={}, content_preview={})",
-                    response.finish_reason,
-                    len(response.content or ""),
-                    (response.content or "")[:200],
-                )
-                return self._fail_or_raw_archive(messages)
+                logger.warning("Memory consolidation: LLM did not call save_memory, skipping")
+                return False
 
-            args = _normalize_save_memory_args(response.tool_calls[0].arguments)
-            if args is None:
-                logger.warning("Memory consolidation: unexpected save_memory arguments")
-                return self._fail_or_raw_archive(messages)
+            args = response.tool_calls[0].arguments
+            # Some providers return arguments as a JSON string instead of dict
+            if isinstance(args, str):
+                args = json.loads(args)
+            if not isinstance(args, dict):
+                logger.warning("Memory consolidation: unexpected arguments type {}", type(args).__name__)
+                return False
 
-            if "history_entry" not in args or "memory_update" not in args:
-                logger.warning("Memory consolidation: save_memory payload missing required fields")
-                return self._fail_or_raw_archive(messages)
+            if entry := args.get("history_entry"):
+                if not isinstance(entry, str):
+                    entry = json.dumps(entry, ensure_ascii=False)
+                self.append_history(entry)
+            if update := args.get("memory_update"):
+                if not isinstance(update, str):
+                    update = json.dumps(update, ensure_ascii=False)
+                if update != current_memory:
+                    self.write_long_term(update)
 
-            entry = args["history_entry"]
-            update = args["memory_update"]
-
-            if entry is None or update is None:
-                logger.warning("Memory consolidation: save_memory payload contains null required fields")
-                return self._fail_or_raw_archive(messages)
-
-            entry = _ensure_text(entry).strip()
-            if not entry:
-                logger.warning("Memory consolidation: history_entry is empty after normalization")
-                return self._fail_or_raw_archive(messages)
-
-            self.append_history(entry)
-            update = _ensure_text(update)
-            if update != current_memory:
-                self.write_long_term(update)
-
-            self._consecutive_failures = 0
-            logger.info("Memory consolidation done for {} messages", len(messages))
+            session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count
+            logger.info("Memory consolidation done: {} messages, last_consolidated={}", len(session.messages), session.last_consolidated)
             return True
         except Exception:
             logger.exception("Memory consolidation failed")
-            return self._fail_or_raw_archive(messages)
-
-    def _fail_or_raw_archive(self, messages: list[dict]) -> bool:
-        """Increment failure count; after threshold, raw-archive messages and return True."""
-        self._consecutive_failures += 1
-        if self._consecutive_failures < self._MAX_FAILURES_BEFORE_RAW_ARCHIVE:
             return False
-        self._raw_archive(messages)
-        self._consecutive_failures = 0
-        return True
-
-    def _raw_archive(self, messages: list[dict]) -> None:
-        """Fallback: dump raw messages to HISTORY.md without LLM summarization."""
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-        self.append_history(
-            f"[{ts}] [RAW] {len(messages)} messages\n"
-            f"{self._format_messages(messages)}"
-        )
-        logger.warning(
-            "Memory consolidation degraded: raw-archived {} messages", len(messages)
-        )
 
 
 class MemoryConsolidator:
-    """Owns consolidation policy, locking, and session offset updates."""
+    """Compatibility wrapper for token-based memory consolidation."""
 
     _MAX_CONSOLIDATION_ROUNDS = 5
-
-    _SAFETY_BUFFER = 1024  # extra headroom for tokenizer estimation drift
+    _MAX_FAILURES_BEFORE_RAW_ARCHIVE = 3
+    _SAFETY_BUFFER = 1024
 
     def __init__(
         self,
@@ -233,8 +379,8 @@ class MemoryConsolidator:
         model: str,
         sessions: SessionManager,
         context_window_tokens: int,
-        build_messages: Callable[..., list[dict[str, Any]]],
-        get_tool_definitions: Callable[[], list[dict[str, Any]]],
+        build_messages,
+        get_tool_definitions,
         max_completion_tokens: int = 4096,
     ):
         self.store = MemoryStore(workspace)
@@ -245,7 +391,9 @@ class MemoryConsolidator:
         self.max_completion_tokens = max_completion_tokens
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
-        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
 
     def get_lock(self, session_key: str) -> asyncio.Lock:
         """Return the shared consolidation lock for one session."""
@@ -253,7 +401,18 @@ class MemoryConsolidator:
 
     async def consolidate_messages(self, messages: list[dict[str, object]]) -> bool:
         """Archive a selected message chunk into persistent memory."""
-        return await self.store.consolidate(messages, self.provider, self.model)
+        from nanobot.session.manager import Session
+
+        if not messages:
+            return True
+        snapshot = Session(key="memory:archive")
+        snapshot.messages = [dict(message) for message in messages]
+        return await self.store.consolidate(
+            snapshot,
+            self.provider,
+            self.model,
+            archive_all=True,
+        )
 
     def pick_consolidation_boundary(
         self,
@@ -294,21 +453,46 @@ class MemoryConsolidator:
             self._get_tool_definitions(),
         )
 
+    @staticmethod
+    def _format_messages(messages: list[dict[str, object]]) -> str:
+        lines: list[str] = []
+        for message in messages:
+            content = message.get("content")
+            if not content:
+                continue
+            tools_used = message.get("tools_used")
+            tools = (
+                f" [tools: {', '.join(tools_used)}]"
+                if isinstance(tools_used, list) and tools_used
+                else ""
+            )
+            timestamp = str(message.get("timestamp", "?"))[:16]
+            role = str(message.get("role", "assistant")).upper()
+            lines.append(f"[{timestamp}] {role}{tools}: {content}")
+        return "\n".join(lines)
+
+    def _raw_archive(self, messages: list[dict[str, object]]) -> None:
+        """Fallback: dump raw messages to HISTORY.md without LLM summarization."""
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        self.store.append_history(
+            f"[{ts}] [RAW] {len(messages)} messages\n{self._format_messages(messages)}"
+        )
+        logger.warning(
+            "Memory consolidation degraded: raw-archived {} messages", len(messages)
+        )
+
     async def archive_messages(self, messages: list[dict[str, object]]) -> bool:
-        """Archive messages with guaranteed persistence (retries until raw-dump fallback)."""
+        """Archive messages with guaranteed persistence."""
         if not messages:
             return True
-        for _ in range(self.store._MAX_FAILURES_BEFORE_RAW_ARCHIVE):
+        for _ in range(self._MAX_FAILURES_BEFORE_RAW_ARCHIVE):
             if await self.consolidate_messages(messages):
                 return True
+        self._raw_archive(messages)
         return True
 
     async def maybe_consolidate_by_tokens(self, session: Session) -> None:
-        """Loop: archive old messages until prompt fits within safe budget.
-
-        The budget reserves space for completion tokens and a safety buffer
-        so the LLM request never exceeds the context window.
-        """
+        """Archive old messages until prompt fits within the safe token budget."""
         if not session.messages or self.context_window_tokens <= 0:
             return
 

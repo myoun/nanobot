@@ -1,6 +1,6 @@
 """Spawn tool for creating background subagents."""
 
-from typing import TYPE_CHECKING, Any
+from typing import Any, TYPE_CHECKING
 
 from nanobot.agent.tools.base import Tool
 
@@ -9,24 +9,38 @@ if TYPE_CHECKING:
 
 
 class SpawnTool(Tool):
-    """Tool to spawn a subagent for background task execution."""
-
+    """
+    Tool to spawn a subagent for background task execution.
+    
+    The subagent runs asynchronously and announces its result back
+    to the main agent when complete.
+    """
+    
     def __init__(self, manager: "SubagentManager"):
         self._manager = manager
         self._origin_channel = "cli"
         self._origin_chat_id = "direct"
         self._session_key = "cli:direct"
+        self._session_id = ""
 
-    def set_context(self, channel: str, chat_id: str) -> None:
+    def set_context(
+        self,
+        channel: str,
+        chat_id: str,
+        *,
+        session_key: str | None = None,
+        session_id: str | None = None,
+    ) -> None:
         """Set the origin context for subagent announcements."""
         self._origin_channel = channel
         self._origin_chat_id = chat_id
-        self._session_key = f"{channel}:{chat_id}"
-
+        self._session_key = session_key or f"{channel}:{chat_id}"
+        self._session_id = session_id or ""
+    
     @property
     def name(self) -> str:
         return "spawn"
-
+    
     @property
     def description(self) -> str:
         return (
@@ -36,7 +50,7 @@ class SpawnTool(Tool):
             "For deliverables or existing projects, inspect the workspace first "
             "and use a dedicated subdirectory when helpful."
         )
-
+    
     @property
     def parameters(self) -> dict[str, Any]:
         return {
@@ -53,7 +67,7 @@ class SpawnTool(Tool):
             },
             "required": ["task"],
         }
-
+    
     async def execute(self, task: str, label: str | None = None, **kwargs: Any) -> str:
         """Spawn a subagent to execute the given task."""
         return await self._manager.spawn(
@@ -62,4 +76,5 @@ class SpawnTool(Tool):
             origin_channel=self._origin_channel,
             origin_chat_id=self._origin_chat_id,
             session_key=self._session_key,
+            session_id=self._session_id or None,
         )

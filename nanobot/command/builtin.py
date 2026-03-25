@@ -44,7 +44,7 @@ async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
 async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     """Build an outbound status message for a session."""
     loop = ctx.loop
-    session = ctx.session or loop.sessions.get_or_create(ctx.key)
+    session = loop.sessions.get_or_create(ctx.key)
     ctx_est = 0
     try:
         ctx_est, _ = loop.memory_consolidator.estimate_session_prompt_tokens(session)
@@ -69,7 +69,15 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
 async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     """Start a fresh session."""
     loop = ctx.loop
-    session = ctx.session or loop.sessions.get_or_create(ctx.key)
+    if loop._uses_app_server_runtime():
+        created = loop.sessions.create_session(ctx.msg.session_key, switch_to=True)
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=f"New session started. Switched to session {created['id']}.",
+        )
+
+    session = loop.sessions.get_or_create(ctx.key)
     snapshot = session.messages[session.last_consolidated:]
     session.clear()
     loop.sessions.save(session)

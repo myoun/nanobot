@@ -31,14 +31,14 @@ Information about the user to help personalize interactions.
 ## Work Context
 
 - **Primary Role**: (your role, e.g., developer, researcher)
-- **Main Projects**: (what you're working on)
+- **Main Projects**: (what you are working on)
 - **Tools You Use**: (IDEs, languages, frameworks)
 
 ## Topics of Interest
 
-- 
-- 
-- 
+-
+-
+-
 
 ## Special Instructions
 
@@ -46,4 +46,5 @@ Information about the user to help personalize interactions.
 
 ---
 
-*Edit this file to customize nanobot's behavior for your needs.*
+*Edit this file to customize nanobot behavior for your needs.*
+

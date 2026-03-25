@@ -12,11 +12,13 @@ Each skill is a directory containing a `SKILL.md` file with:
 
 These skills are adapted from [OpenClaw](https://github.com/openclaw/openclaw)'s skill system.
 The skill format and metadata structure follow OpenClaw's conventions to maintain compatibility.
+Some bundled skills may include upstream third-party content and retain their original license notices.
 
 ## Available Skills
 
 | Skill | Description |
 |-------|-------------|
+| `agent-browser` | Browser automation workflows for the `agent-browser` CLI |
 | `github` | Interact with GitHub using the `gh` CLI |
 | `weather` | Get weather info using wttr.in and Open-Meteo |
 | `summarize` | Summarize URLs, files, and YouTube videos |

@@ -1,46 +1,30 @@
 """CLI commands for nanobot."""
 
 import asyncio
-from contextlib import contextmanager, nullcontext
-
 import os
-import select
 import signal
-import sys
 from pathlib import Path
+import select
+import sys
 from typing import Any
 
-# Force UTF-8 encoding for Windows console
-if sys.platform == "win32":
-    if sys.stdout.encoding != "utf-8":
-        os.environ["PYTHONIOENCODING"] = "utf-8"
-        # Re-open stdout/stderr with UTF-8 encoding
-        try:
-            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
-
 import typer
-from prompt_toolkit import PromptSession, print_formatted_text
-from prompt_toolkit.application import run_in_terminal
-from prompt_toolkit.formatted_text import ANSI, HTML
-from prompt_toolkit.history import FileHistory
-from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
 
-from nanobot import __logo__, __version__
-from nanobot.cli.stream import StreamRenderer, ThinkingSpinner
-from nanobot.config.paths import get_workspace_path, is_default_workspace
+from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.patch_stdout import patch_stdout
+
+from nanobot import __version__, __logo__
 from nanobot.config.schema import Config
-from nanobot.utils.helpers import sync_workspace_templates
+from nanobot.utils.helpers import get_workspace_path, sync_workspace_templates
 
 app = typer.Typer(
     name="nanobot",
-    context_settings={"help_option_names": ["-h", "--help"]},
     help=f"{__logo__} nanobot - Personal AI Assistant",
     no_args_is_help=True,
 )
@@ -67,6 +51,7 @@ def _flush_pending_tty_input() -> None:
 
     try:
         import termios
+
         termios.tcflush(fd, termios.TCIFLUSH)
         return
     except Exception:
@@ -89,6 +74,7 @@ def _restore_terminal() -> None:
         return
     try:
         import termios
+
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _SAVED_TERM_ATTRS)
     except Exception:
         pass
@@ -101,109 +87,285 @@ def _init_prompt_session() -> None:
     # Save terminal state so we can restore it on exit
     try:
         import termios
+
         _SAVED_TERM_ATTRS = termios.tcgetattr(sys.stdin.fileno())
     except Exception:
         pass
 
-    from nanobot.config.paths import get_cli_history_path
-
-    history_file = get_cli_history_path()
+    history_file = Path.home() / ".nanobot" / "history" / "cli_history"
     history_file.parent.mkdir(parents=True, exist_ok=True)
 
     _PROMPT_SESSION = PromptSession(
         history=FileHistory(str(history_file)),
         enable_open_in_editor=False,
-        multiline=False,   # Enter submits (single line mode)
+        multiline=False,  # Enter submits (single line mode)
     )
 
 
-def _make_console() -> Console:
-    return Console(file=sys.stdout)
+def _extract_web_search_trace(metadata: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(metadata, dict):
+        return []
+    nanobot_meta = metadata.get("_nanobot")
+    if not isinstance(nanobot_meta, dict):
+        return []
+    trace = nanobot_meta.get("web_search_trace")
+    if not isinstance(trace, list):
+        return []
+    return [item for item in trace if isinstance(item, dict)]
 
 
-def _render_interactive_ansi(render_fn) -> str:
-    """Render Rich output to ANSI so prompt_toolkit can print it safely."""
-    ansi_console = Console(
-        force_terminal=True,
-        color_system=console.color_system or "standard",
-        width=console.width,
-    )
-    with ansi_console.capture() as capture:
-        render_fn(ansi_console)
-    return capture.get()
+def _render_web_search_trace(trace: list[dict[str, Any]]) -> None:
+    if not trace:
+        return
+
+    console.print("[dim]web search trace[/dim]")
+    for idx, item in enumerate(trace, start=1):
+        action_type = item.get("type")
+        if action_type == "search":
+            query = item.get("query")
+            if not isinstance(query, str) or not query:
+                queries = item.get("queries")
+                if isinstance(queries, list):
+                    query = " | ".join(q for q in queries if isinstance(q, str) and q)
+            label = f"search: {query}" if query else "search"
+        elif action_type == "open_page":
+            url = item.get("url")
+            label = f"open_page: {url}" if isinstance(url, str) and url else "open_page"
+        elif action_type == "find_in_page":
+            url = item.get("url")
+            pattern = item.get("pattern")
+            if isinstance(url, str) and url and isinstance(pattern, str) and pattern:
+                label = f"find_in_page: {pattern} @ {url}"
+            elif isinstance(url, str) and url:
+                label = f"find_in_page: {url}"
+            else:
+                label = "find_in_page"
+        else:
+            label = action_type if isinstance(action_type, str) else "web_action"
+        console.print(f"[dim]{idx}. {label}[/dim]")
 
 
 def _print_agent_response(
     response: str,
     render_markdown: bool,
-    metadata: dict | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     """Render assistant response with consistent terminal styling."""
-    console = _make_console()
     content = response or ""
-    body = _response_renderable(content, render_markdown, metadata)
+    body = Markdown(content) if render_markdown else Text(content)
+    web_trace = _extract_web_search_trace(metadata)
     console.print()
     console.print(f"[cyan]{__logo__} nanobot[/cyan]")
+    _render_web_search_trace(web_trace)
     console.print(body)
     console.print()
-
-
-def _response_renderable(content: str, render_markdown: bool, metadata: dict | None = None):
-    """Render plain-text command output without markdown collapsing newlines."""
-    if not render_markdown:
-        return Text(content)
-    if (metadata or {}).get("render_as") == "text":
-        return Text(content)
-    return Markdown(content)
-
-
-async def _print_interactive_line(text: str) -> None:
-    """Print async interactive updates with prompt_toolkit-safe Rich styling."""
-    def _write() -> None:
-        ansi = _render_interactive_ansi(
-            lambda c: c.print(f"  [dim]↳ {text}[/dim]")
-        )
-        print_formatted_text(ANSI(ansi), end="")
-
-    await run_in_terminal(_write)
-
-
-async def _print_interactive_response(
-    response: str,
-    render_markdown: bool,
-    metadata: dict | None = None,
-) -> None:
-    """Print async interactive replies with prompt_toolkit-safe Rich styling."""
-    def _write() -> None:
-        content = response or ""
-        ansi = _render_interactive_ansi(
-            lambda c: (
-                c.print(),
-                c.print(f"[cyan]{__logo__} nanobot[/cyan]"),
-                c.print(_response_renderable(content, render_markdown, metadata)),
-                c.print(),
-            )
-        )
-        print_formatted_text(ANSI(ansi), end="")
-
-    await run_in_terminal(_write)
-
-
-def _print_cli_progress_line(text: str, thinking: ThinkingSpinner | None) -> None:
-    """Print a CLI progress line, pausing the spinner if needed."""
-    with thinking.pause() if thinking else nullcontext():
-        console.print(f"  [dim]↳ {text}[/dim]")
-
-
-async def _print_interactive_progress_line(text: str, thinking: ThinkingSpinner | None) -> None:
-    """Print an interactive progress line, pausing the spinner if needed."""
-    with thinking.pause() if thinking else nullcontext():
-        await _print_interactive_line(text)
 
 
 def _is_exit_command(command: str) -> bool:
     """Return True when input should end interactive chat."""
     return command.lower() in EXIT_COMMANDS
+
+
+def _configure_privileged_settings(
+    *,
+    socket: str,
+    approval_ttl_sec: int,
+    single_pending_per_chat: bool,
+    enabled: bool,
+) -> None:
+    """Persist privileged execution settings in config.json."""
+    from nanobot.config.loader import load_config, save_config
+
+    config = load_config()
+    exec_cfg = config.tools.exec
+    exec_cfg.privileged_enabled = enabled
+    exec_cfg.privileged_socket = socket
+    exec_cfg.approval_ttl_sec = max(60, approval_ttl_sec)
+    exec_cfg.single_pending_per_chat = single_pending_per_chat
+    save_config(config)
+
+
+def _default_socket_group() -> str | None:
+    """Best-effort socket group for non-root clients (Unix/Linux)."""
+    if os.name != "posix":
+        return None
+    try:
+        import grp
+        import pwd
+    except Exception:
+        return None
+
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        try:
+            user = pwd.getpwnam(sudo_user)
+            return grp.getgrgid(user.pw_gid).gr_name
+        except Exception:
+            pass
+
+    try:
+        return grp.getgrgid(os.getgid()).gr_name
+    except Exception:
+        return None
+
+
+def _resolve_socket_group(socket_group: str | None) -> str | None:
+    group = (socket_group or "").strip()
+    if group:
+        return group
+    return _default_socket_group()
+
+
+def _install_or_update_privileged_service(
+    *,
+    socket: str,
+    audit_log: str,
+    socket_group: str | None = None,
+) -> tuple[bool, str]:
+    """Install/update and start systemd service for privileged runner."""
+    import shutil
+    import subprocess
+
+    if os.name != "posix":
+        return False, "System service setup is only supported on Unix/Linux."
+
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        return False, "systemctl not found. Install service manually."
+
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        return False, (
+            "Root privileges required to install service. Run: sudo nanobot privileged setup"
+        )
+
+    unit_path = Path("/etc/systemd/system/nanobot-privileged.service")
+    runner_cmd = shutil.which("nanobot") or f"{sys.executable} -m nanobot"
+    group_arg = f" --socket-group {socket_group}" if socket_group else ""
+    unit = f"""[Unit]
+Description=nanobot privileged runner
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={runner_cmd} privileged run --socket {socket} --audit-log {audit_log}{group_arg}
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run /var/log
+
+[Install]
+WantedBy=multi-user.target
+"""
+    unit_path.write_text(unit, encoding="utf-8")
+    subprocess.run([systemctl, "daemon-reload"], check=True)
+    subprocess.run([systemctl, "enable", "--now", "nanobot-privileged.service"], check=True)
+    active = subprocess.run(
+        [systemctl, "is-active", "nanobot-privileged.service"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if active.returncode == 0 and active.stdout.strip() == "active":
+        return True, "nanobot-privileged.service is active."
+    return (
+        False,
+        "Service installed but not active. Check: systemctl status nanobot-privileged.service",
+    )
+
+
+def _stop_privileged_service() -> tuple[bool, str]:
+    """Disable and stop systemd privileged runner service."""
+    import shutil
+    import subprocess
+
+    if os.name != "posix":
+        return False, "Service stop is only supported on Unix/Linux."
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        return False, "systemctl not found."
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        return (
+            False,
+            "Root privileges required. Run: sudo nanobot privileged disable --stop-service",
+        )
+
+    subprocess.run([systemctl, "disable", "--now", "nanobot-privileged.service"], check=False)
+    return True, "nanobot-privileged.service disabled/stopped."
+
+
+def _launch_privileged_runner_daemon(
+    *,
+    socket: str,
+    audit_log: str,
+    daemon_log: str | None,
+    socket_group: str | None,
+) -> tuple[bool, str]:
+    """Launch privileged runner as a detached background process."""
+    import subprocess
+    import time
+
+    log_path = Path(daemon_log) if daemon_log else Path(audit_log).with_suffix(".runner.log")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "nanobot",
+        "privileged",
+        "run",
+        "--socket",
+        socket,
+        "--audit-log",
+        audit_log,
+    ]
+    if socket_group:
+        cmd.extend(["--socket-group", socket_group])
+
+    with log_path.open("ab") as lf:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=lf,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+
+    sock = Path(socket)
+    for _ in range(30):
+        if sock.exists():
+            return True, (
+                f"Started privileged runner in background (pid={proc.pid}). "
+                f"Socket: {socket}, log: {log_path}"
+            )
+        if proc.poll() is not None:
+            break
+        time.sleep(0.1)
+
+    if proc.poll() is not None:
+        tail = ""
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+            tail = text[-400:].strip()
+        except Exception:
+            tail = ""
+        detail = f" Last log: {tail}" if tail else ""
+        return False, f"Failed to start privileged runner daemon.{detail}"
+
+    return True, (
+        f"Started privileged runner in background (pid={proc.pid}), "
+        f"socket initialization is still in progress. Log: {log_path}"
+    )
+
+
+def _ensure_posix_for_privileged() -> None:
+    """Privileged runner is supported only on Unix/Linux."""
+    if os.name != "posix":
+        console.print("[red]Privileged execution is supported only on Unix/Linux.[/red]")
+        raise typer.Exit(1)
 
 
 async def _read_interactive_input_async() -> str:
@@ -225,7 +387,6 @@ async def _read_interactive_input_async() -> str:
         raise KeyboardInterrupt from exc
 
 
-
 def version_callback(value: bool):
     if value:
         console.print(f"{__logo__} nanobot v{__version__}")
@@ -234,9 +395,7 @@ def version_callback(value: bool):
 
 @app.callback()
 def main(
-    version: bool = typer.Option(
-        None, "--version", "-v", callback=version_callback, is_eager=True
-    ),
+    version: bool = typer.Option(None, "--version", "-v", callback=version_callback, is_eager=True),
 ):
     """nanobot - Personal AI Assistant."""
     pass
@@ -266,58 +425,66 @@ def onboard(
 
     def _apply_workspace_override(loaded: Config) -> Config:
         if workspace:
-            loaded.agents.defaults.workspace = workspace
+            loaded.agents.defaults.workspace = str(Path(workspace).expanduser().resolve())
         return loaded
 
-    # Create or update config
     if config_path.exists():
         if wizard:
-            config = _apply_workspace_override(load_config(config_path))
+            loaded = load_config(config_path)
+            runtime_config = _apply_workspace_override(loaded)
         else:
             console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
             console.print("  [bold]y[/bold] = overwrite with defaults (existing values will be lost)")
-            console.print("  [bold]N[/bold] = refresh config, keeping existing values and adding new fields")
+            console.print(
+                "  [bold]N[/bold] = refresh config, keeping existing values and adding new fields"
+            )
             if typer.confirm("Overwrite?"):
-                config = _apply_workspace_override(Config())
-                save_config(config, config_path)
+                runtime_config = _apply_workspace_override(Config())
+                save_config(runtime_config, config_path)
                 console.print(f"[green]✓[/green] Config reset to defaults at {config_path}")
             else:
-                config = _apply_workspace_override(load_config(config_path))
-                save_config(config, config_path)
-                console.print(f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)")
+                runtime_config = _apply_workspace_override(load_config(config_path))
+                save_config(runtime_config, config_path)
+                console.print(
+                    f"[green]✓[/green] Config refreshed at {config_path} "
+                    "(existing values preserved)"
+                )
     else:
-        config = _apply_workspace_override(Config())
-        # In wizard mode, don't save yet - the wizard will handle saving if should_save=True
+        runtime_config = _apply_workspace_override(Config())
         if not wizard:
-            save_config(config, config_path)
+            save_config(runtime_config, config_path)
             console.print(f"[green]✓[/green] Created config at {config_path}")
 
-    # Run interactive wizard if enabled
     if wizard:
         from nanobot.cli.onboard import run_onboard
 
         try:
-            result = run_onboard(initial_config=config)
-            if not result.should_save:
-                console.print("[yellow]Configuration discarded. No changes were saved.[/yellow]")
-                return
-
-            config = result.config
-            save_config(config, config_path)
-            console.print(f"[green]✓[/green] Config saved at {config_path}")
-        except Exception as e:
-            console.print(f"[red]✗[/red] Error during configuration: {e}")
+            result = run_onboard(initial_config=runtime_config)
+        except Exception as exc:
+            console.print(f"[red]✗[/red] Error during configuration: {exc}")
             console.print("[yellow]Please run 'nanobot onboard' again to complete setup.[/yellow]")
-            raise typer.Exit(1)
+            raise typer.Exit(1) from exc
+
+        if not result.should_save:
+            console.print("[yellow]Configuration discarded. No changes were saved.[/yellow]")
+            return
+
+        runtime_config = result.config
+        save_config(runtime_config, config_path)
+        console.print(f"[green]✓[/green] Config saved at {config_path}")
+
     _onboard_plugins(config_path)
 
-    # Create workspace, preferring the configured workspace path.
-    workspace_path = get_workspace_path(config.workspace_path)
+    workspace_path = get_workspace_path(runtime_config.workspace_path)
     if not workspace_path.exists():
         workspace_path.mkdir(parents=True, exist_ok=True)
         console.print(f"[green]✓[/green] Created workspace at {workspace_path}")
 
     sync_workspace_templates(workspace_path)
+
+    if not wizard and sys.stdin.isatty() and sys.stdout.isatty():
+        _configure_codex_profile_on_onboard(runtime_config, workspace_path)
+        save_config(runtime_config, config_path)
 
     agent_cmd = 'nanobot agent -m "Hello!"'
     gateway_cmd = "nanobot gateway"
@@ -334,7 +501,10 @@ def onboard(
         console.print(f"  1. Add your API key to [cyan]{config_path}[/cyan]")
         console.print("     Get one at: https://openrouter.ai/keys")
         console.print(f"  2. Chat: [cyan]{agent_cmd}[/cyan]")
-    console.print("\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]")
+        console.print("  3. Optional privileged setup: [cyan]nanobot privileged setup[/cyan]")
+    console.print(
+        "\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]"
+    )
 
 
 def _merge_missing_defaults(existing: Any, defaults: Any) -> Any:
@@ -352,13 +522,13 @@ def _merge_missing_defaults(existing: Any, defaults: Any) -> Any:
 
 
 def _onboard_plugins(config_path: Path) -> None:
-    """Inject default config for all discovered channels (built-in + plugins)."""
+    """Inject default config for discovered channels into config.json."""
     import json
 
     from nanobot.channels.registry import discover_all
 
     all_channels = discover_all()
-    if not all_channels:
+    if not all_channels or not config_path.exists():
         return
 
     with open(config_path, encoding="utf-8") as f:
@@ -366,129 +536,110 @@ def _onboard_plugins(config_path: Path) -> None:
 
     channels = data.setdefault("channels", {})
     for name, cls in all_channels.items():
+        defaults = cls.default_config()
         if name not in channels:
-            channels[name] = cls.default_config()
+            channels[name] = defaults
         else:
-            channels[name] = _merge_missing_defaults(channels[name], cls.default_config())
+            channels[name] = _merge_missing_defaults(channels[name], defaults)
 
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def _make_provider(config: Config):
-    """Create the appropriate LLM provider from config.
+def _configure_codex_profile_on_onboard(config: Config, workspace: Path) -> None:
+    """Ask whether nanobot should manage a workspace-local Codex profile."""
+    from nanobot.providers.codex_profile import CodexProfileManager
 
-    Routing is driven by ``ProviderSpec.backend`` in the registry.
-    """
-    from nanobot.providers.base import GenerationSettings
-    from nanobot.providers.registry import find_by_name
+    manager = CodexProfileManager(workspace, profile_name=config.codex.profile_name)
+    apply_profile = typer.confirm(
+        "Apply nanobot-managed Codex profile for Codex App Server in this workspace?",
+        default=True,
+    )
+    config.codex.use_workspace_profile = apply_profile
+    if apply_profile:
+        manager.ensure_profile()
+        console.print(
+            f"[green]✓[/green] Enabled Codex workspace profile "
+            f"[cyan]{config.codex.profile_name}[/cyan]"
+        )
+        return
+
+    removed = manager.remove_managed_profile()
+    if removed:
+        console.print("[green]✓[/green] Removed nanobot-managed Codex workspace profile files")
+    else:
+        console.print("[dim]Skipped Codex workspace profile setup[/dim]")
+
+
+def _make_provider(config: Config):
+    """Create the appropriate LLM provider from config."""
+    from nanobot.providers.litellm_provider import LiteLLMProvider
+    from nanobot.providers.custom_provider import CustomProvider
+
+    _apply_langsmith_config(config)
 
     model = config.agents.defaults.model
     provider_name = config.get_provider_name(model)
     p = config.get_provider(model)
-    spec = find_by_name(provider_name) if provider_name else None
-    backend = spec.backend if spec else "openai_compat"
 
-    # --- validation ---
-    if backend == "azure_openai":
-        if not p or not p.api_key or not p.api_base:
-            console.print("[red]Error: Azure OpenAI requires api_key and api_base.[/red]")
-            console.print("Set them in ~/.nanobot/config.json under providers.azure_openai section")
-            console.print("Use the model field to specify the deployment name.")
-            raise typer.Exit(1)
-    elif backend == "openai_compat" and not model.startswith("bedrock/"):
-        needs_key = not (p and p.api_key)
-        exempt = spec and (spec.is_oauth or spec.is_local or spec.is_direct)
-        if needs_key and not exempt:
-            console.print("[red]Error: No API key configured.[/red]")
-            console.print("Set one in ~/.nanobot/config.json under providers section")
-            raise typer.Exit(1)
-
-    # --- instantiation by backend ---
-    if backend == "openai_codex":
-        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
-        provider = OpenAICodexProvider(default_model=model)
-    elif backend == "azure_openai":
-        from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
-        provider = AzureOpenAIProvider(
-            api_key=p.api_key,
-            api_base=p.api_base,
+    # OpenAI Codex (OAuth)
+    if provider_name == "openai_codex" or model.startswith("openai-codex/"):
+        try:
+            from nanobot.providers.openai_codex_app_server_provider import (
+                OpenAICodexAppServerProvider,
+            )
+        except ModuleNotFoundError as exc:
+            console.print(
+                "[red]Error: OpenAI Codex App Server provider is unavailable in this build.[/red]"
+            )
+            raise typer.Exit(1) from exc
+        return OpenAICodexAppServerProvider(
             default_model=model,
-        )
-    elif backend == "anthropic":
-        from nanobot.providers.anthropic_provider import AnthropicProvider
-        provider = AnthropicProvider(
-            api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-        )
-    else:
-        from nanobot.providers.openai_compat_provider import OpenAICompatProvider
-        provider = OpenAICompatProvider(
-            api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-            spec=spec,
+            workspace=config.workspace_path,
+            profile_name=config.codex.profile_name,
+            use_workspace_profile=config.codex.use_workspace_profile is not False,
+            sandbox=config.codex.sandbox,
         )
 
-    defaults = config.agents.defaults
-    provider.generation = GenerationSettings(
-        temperature=defaults.temperature,
-        max_tokens=defaults.max_tokens,
-        reasoning_effort=defaults.reasoning_effort,
+    # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
+    if provider_name == "custom":
+        return CustomProvider(
+            api_key=p.api_key if p else "no-key",
+            api_base=config.get_api_base(model) or "http://localhost:8000/v1",
+            default_model=model,
+        )
+
+    from nanobot.providers.registry import find_by_name
+
+    spec = find_by_name(provider_name)
+    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
+        console.print("[red]Error: No API key configured.[/red]")
+        console.print("Set one in ~/.nanobot/config.json under providers section")
+        raise typer.Exit(1)
+
+    return LiteLLMProvider(
+        api_key=p.api_key if p else None,
+        api_base=config.get_api_base(model),
+        default_model=model,
+        extra_headers=p.extra_headers if p else None,
+        provider_name=provider_name,
     )
-    return provider
 
 
-def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
-    """Load config and optionally override the active workspace."""
-    from nanobot.config.loader import load_config, set_config_path
-
-    config_path = None
-    if config:
-        config_path = Path(config).expanduser().resolve()
-        if not config_path.exists():
-            console.print(f"[red]Error: Config file not found: {config_path}[/red]")
-            raise typer.Exit(1)
-        set_config_path(config_path)
-        console.print(f"[dim]Using config: {config_path}[/dim]")
-
-    loaded = load_config(config_path)
-    _warn_deprecated_config_keys(config_path)
-    if workspace:
-        loaded.agents.defaults.workspace = workspace
-    return loaded
-
-
-def _warn_deprecated_config_keys(config_path: Path | None) -> None:
-    """Hint users to remove obsolete keys from their config file."""
-    import json
-    from nanobot.config.loader import get_config_path
-
-    path = config_path or get_config_path()
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+def _apply_langsmith_config(config: Config) -> None:
+    """Apply LangSmith runtime settings from config.json."""
+    cfg = config.observability.langsmith
+    if not cfg.enabled:
         return
-    if "memoryWindow" in raw.get("agents", {}).get("defaults", {}):
-        console.print(
-            "[dim]Hint: `memoryWindow` in your config is no longer used "
-            "and can be safely removed.[/dim]"
-        )
 
-
-def _migrate_cron_store(config: "Config") -> None:
-    """One-time migration: move legacy global cron store into the workspace."""
-    from nanobot.config.paths import get_cron_dir
-
-    legacy_path = get_cron_dir() / "jobs.json"
-    new_path = config.workspace_path / "cron" / "jobs.json"
-    if legacy_path.is_file() and not new_path.exists():
-        new_path.parent.mkdir(parents=True, exist_ok=True)
-        import shutil
-        shutil.move(str(legacy_path), str(new_path))
+    os.environ["LANGSMITH_TRACING"] = "true"
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+    if cfg.api_key:
+        os.environ["LANGSMITH_API_KEY"] = cfg.api_key
+    if cfg.project:
+        os.environ["LANGSMITH_PROJECT"] = cfg.project
+    if cfg.endpoint:
+        os.environ["LANGSMITH_ENDPOINT"] = cfg.endpoint
 
 
 # ============================================================================
@@ -498,39 +649,35 @@ def _migrate_cron_store(config: "Config") -> None:
 
 @app.command()
 def gateway(
-    port: int | None = typer.Option(None, "--port", "-p", help="Gateway port"),
-    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
 ):
     """Start the nanobot gateway."""
-    from nanobot.agent.loop import AgentLoop
+    from nanobot.config.loader import load_config, get_data_dir
     from nanobot.bus.queue import MessageBus
+    from nanobot.agent.loop import AgentLoop
     from nanobot.channels.manager import ChannelManager
+    from nanobot.session.manager import SessionManager
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
-    from nanobot.session.manager import SessionManager
 
     if verbose:
         import logging
+
         logging.basicConfig(level=logging.DEBUG)
 
-    config = _load_runtime_config(config, workspace)
-    port = port if port is not None else config.gateway.port
+    console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
 
-    console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
+    config = load_config()
     sync_workspace_templates(config.workspace_path)
+    config.channels.web.port = port
     bus = MessageBus()
     provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
 
-    # Preserve existing single-workspace installs, but keep custom workspaces clean.
-    if is_default_workspace(config.workspace_path):
-        _migrate_cron_store(config)
-
-    # Create cron service with workspace-scoped store
-    cron_store_path = config.workspace_path / "cron" / "jobs.json"
+    # Create cron service first (callback set after agent creation)
+    cron_store_path = get_data_dir() / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
     # Create agent with cron service
@@ -539,64 +686,41 @@ def gateway(
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
+        temperature=config.agents.defaults.temperature,
+        max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         context_window_tokens=config.agents.defaults.context_window_tokens,
-        web_search_config=config.tools.web.search,
-        web_proxy=config.tools.web.proxy or None,
+        reasoning_effort=config.agents.defaults.reasoning_effort,
+        brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
-        channels_config=config.channels,
     )
 
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
-        from nanobot.agent.tools.cron import CronTool
-        from nanobot.agent.tools.message import MessageTool
-        from nanobot.utils.evaluator import evaluate_response
-
-        reminder_note = (
-            "[Scheduled Task] Timer finished.\n\n"
-            f"Task '{job.name}' has been triggered.\n"
-            f"Scheduled instruction: {job.payload.message}"
+        outbound = await agent.process_direct(
+            job.payload.message,
+            session_key=f"cron:{job.id}",
+            channel=job.payload.channel or "cli",
+            chat_id=job.payload.to or "direct",
         )
+        response = outbound.content if outbound else ""
+        if job.payload.deliver and job.payload.to:
+            from nanobot.bus.events import OutboundMessage
 
-        cron_tool = agent.tools.get("cron")
-        cron_token = None
-        if isinstance(cron_tool, CronTool):
-            cron_token = cron_tool.set_cron_context(True)
-        try:
-            resp = await agent.process_direct(
-                reminder_note,
-                session_key=f"cron:{job.id}",
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to or "direct",
-            )
-        finally:
-            if isinstance(cron_tool, CronTool) and cron_token is not None:
-                cron_tool.reset_cron_context(cron_token)
-
-        response = resp.content if resp else ""
-
-        message_tool = agent.tools.get("message")
-        if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
-            return response
-
-        if job.payload.deliver and job.payload.to and response:
-            should_notify = await evaluate_response(
-                response, job.payload.message, provider, agent.model,
-            )
-            if should_notify:
-                from nanobot.bus.events import OutboundMessage
-                await bus.publish_outbound(OutboundMessage(
+            await bus.publish_outbound(
+                OutboundMessage(
                     channel=job.payload.channel or "cli",
                     chat_id=job.payload.to,
-                    content=response,
-                ))
+                    content=response or "",
+                )
+            )
         return response
+
     cron.on_job = on_cron_job
 
     # Create channel manager
@@ -605,7 +729,6 @@ def gateway(
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
         enabled = set(channels.enabled_channels)
-        # Prefer the most recently updated non-internal session on an enabled channel.
         for item in session_manager.list_sessions():
             key = item.get("key") or ""
             if ":" not in key:
@@ -615,7 +738,6 @@ def gateway(
                 continue
             if channel in enabled and chat_id:
                 return channel, chat_id
-        # Fallback keeps prior behavior but remains explicit.
         return "cli", "direct"
 
     # Create heartbeat service
@@ -623,31 +745,25 @@ def gateway(
         """Phase 2: execute heartbeat tasks through the full agent loop."""
         channel, chat_id = _pick_heartbeat_target()
 
-        async def _silent(*_args, **_kwargs):
-            pass
+        async def _silent(*_args, **_kwargs) -> None:
+            return
 
-        resp = await agent.process_direct(
+        outbound = await agent.process_direct(
             tasks,
             session_key="heartbeat",
             channel=channel,
             chat_id=chat_id,
             on_progress=_silent,
         )
-
-        # Keep a small tail of heartbeat history so the loop stays bounded
-        # without losing all short-term context between runs.
-        session = agent.sessions.get_or_create("heartbeat")
-        session.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
-        agent.sessions.save(session)
-
-        return resp.content if resp else ""
+        return outbound.content if outbound else ""
 
     async def on_heartbeat_notify(response: str) -> None:
         """Deliver a heartbeat response to the user's channel."""
         from nanobot.bus.events import OutboundMessage
+
         channel, chat_id = _pick_heartbeat_target()
         if channel == "cli":
-            return  # No external channel available to deliver to
+            return
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
 
     hb_cfg = config.gateway.heartbeat
@@ -666,6 +782,11 @@ def gateway(
     else:
         console.print("[yellow]Warning: No channels enabled[/yellow]")
 
+    if config.channels.web.enabled:
+        console.print(
+            f"[green]✓[/green] Web UI: http://{config.channels.web.host}:{config.channels.web.port}/"
+        )
+
     cron_status = cron.status()
     if cron_status["jobs"] > 0:
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
@@ -682,10 +803,6 @@ def gateway(
             )
         except KeyboardInterrupt:
             console.print("\nShutting down...")
-        except Exception:
-            import traceback
-            console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
-            console.print(traceback.format_exc())
         finally:
             await agent.close_mcp()
             heartbeat.stop()
@@ -694,8 +811,6 @@ def gateway(
             await channels.stop_all()
 
     asyncio.run(run())
-
-
 
 
 # ============================================================================
@@ -707,30 +822,28 @@ def gateway(
 def agent(
     message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
     session_id: str = typer.Option("cli:direct", "--session", "-s", help="Session ID"),
-    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
-    markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
-    logs: bool = typer.Option(False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"),
+    markdown: bool = typer.Option(
+        True, "--markdown/--no-markdown", help="Render assistant output as Markdown"
+    ),
+    logs: bool = typer.Option(
+        False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"
+    ),
 ):
     """Interact with the agent directly."""
+    from nanobot.config.loader import load_config, get_data_dir
+    from nanobot.bus.queue import MessageBus
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.cron.service import CronService
     from loguru import logger
 
-    from nanobot.agent.loop import AgentLoop
-    from nanobot.bus.queue import MessageBus
-    from nanobot.cron.service import CronService
-
-    config = _load_runtime_config(config, workspace)
+    config = load_config()
     sync_workspace_templates(config.workspace_path)
 
     bus = MessageBus()
     provider = _make_provider(config)
 
-    # Preserve existing single-workspace installs, but keep custom workspaces clean.
-    if is_default_workspace(config.workspace_path):
-        _migrate_cron_store(config)
-
-    # Create cron service with workspace-scoped store
-    cron_store_path = config.workspace_path / "cron" / "jobs.json"
+    # Create cron service for tool usage (no callback needed for CLI unless running)
+    cron_store_path = get_data_dir() / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
     if logs:
@@ -743,130 +856,69 @@ def agent(
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
+        temperature=config.agents.defaults.temperature,
+        max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         context_window_tokens=config.agents.defaults.context_window_tokens,
-        web_search_config=config.tools.web.search,
-        web_proxy=config.tools.web.proxy or None,
+        reasoning_effort=config.agents.defaults.reasoning_effort,
+        brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
-        channels_config=config.channels,
     )
 
-    # Shared reference for progress callbacks
-    _thinking: ThinkingSpinner | None = None
+    # Show spinner when logs are off (no output to miss); skip when logs are on
+    def _thinking_ctx():
+        if logs:
+            from contextlib import nullcontext
 
-    async def _cli_progress(content: str, *, tool_hint: bool = False) -> None:
-        ch = agent_loop.channels_config
-        if ch and tool_hint and not ch.send_tool_hints:
+            return nullcontext()
+        # Animated spinner is safe to use with prompt_toolkit input handling
+        return console.status("[dim]nanobot is thinking...[/dim]", spinner="dots")
+
+    async def _cli_progress(content: str = "", *, tool_hint: str | None = None) -> None:
+        progress_text = (content or "").strip()
+        hint_text = (tool_hint or "").strip()
+        if not progress_text and not hint_text:
             return
-        if ch and not tool_hint and not ch.send_progress:
+        if progress_text:
+            console.print(f"  [dim]↳ {progress_text}[/dim]")
             return
-        _print_cli_progress_line(content, _thinking)
+        console.print(f"  [dim]↳ {hint_text}[/dim]")
 
     if message:
-        # Single message mode — direct call, no bus needed
+        # Single message mode
         async def run_once():
-            renderer = StreamRenderer(render_markdown=markdown)
-            response = await agent_loop.process_direct(
-                message, session_id,
-                on_progress=_cli_progress,
-                on_stream=renderer.on_delta,
-                on_stream_end=renderer.on_end,
-            )
-            if not renderer.streamed:
-                await renderer.close()
-                _print_agent_response(
-                    response.content if response else "",
-                    render_markdown=markdown,
-                    metadata=response.metadata if response else None,
+            with _thinking_ctx():
+                outbound = await agent_loop.process_direct_message(
+                    message,
+                    session_id,
+                    on_progress=_cli_progress,
                 )
+            _print_agent_response(
+                outbound.content if outbound else "",
+                render_markdown=markdown,
+                metadata=outbound.metadata if outbound else None,
+            )
             await agent_loop.close_mcp()
 
         asyncio.run(run_once())
     else:
-        # Interactive mode — route through bus like other channels
-        from nanobot.bus.events import InboundMessage
+        # Interactive mode
         _init_prompt_session()
-        console.print(f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n")
+        console.print(
+            f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n"
+        )
 
-        if ":" in session_id:
-            cli_channel, cli_chat_id = session_id.split(":", 1)
-        else:
-            cli_channel, cli_chat_id = "cli", session_id
-
-        def _handle_signal(signum, frame):
-            sig_name = signal.Signals(signum).name
+        def _exit_on_sigint(signum, frame):
             _restore_terminal()
-            console.print(f"\nReceived {sig_name}, goodbye!")
-            sys.exit(0)
+            console.print("\nGoodbye!")
+            os._exit(0)
 
-        signal.signal(signal.SIGINT, _handle_signal)
-        signal.signal(signal.SIGTERM, _handle_signal)
-        # SIGHUP is not available on Windows
-        if hasattr(signal, 'SIGHUP'):
-            signal.signal(signal.SIGHUP, _handle_signal)
-        # Ignore SIGPIPE to prevent silent process termination when writing to closed pipes
-        # SIGPIPE is not available on Windows
-        if hasattr(signal, 'SIGPIPE'):
-            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, _exit_on_sigint)
 
         async def run_interactive():
-            bus_task = asyncio.create_task(agent_loop.run())
-            turn_done = asyncio.Event()
-            turn_done.set()
-            turn_response: list[tuple[str, dict]] = []
-            renderer: StreamRenderer | None = None
-
-            async def _consume_outbound():
-                while True:
-                    try:
-                        msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
-
-                        if msg.metadata.get("_stream_delta"):
-                            if renderer:
-                                await renderer.on_delta(msg.content)
-                            continue
-                        if msg.metadata.get("_stream_end"):
-                            if renderer:
-                                await renderer.on_end(
-                                    resuming=msg.metadata.get("_resuming", False),
-                                )
-                            continue
-                        if msg.metadata.get("_streamed"):
-                            turn_done.set()
-                            continue
-
-                        if msg.metadata.get("_progress"):
-                            is_tool_hint = msg.metadata.get("_tool_hint", False)
-                            ch = agent_loop.channels_config
-                            if ch and is_tool_hint and not ch.send_tool_hints:
-                                pass
-                            elif ch and not is_tool_hint and not ch.send_progress:
-                                pass
-                            else:
-                                await _print_interactive_progress_line(msg.content, _thinking)
-                            continue
-
-                        if not turn_done.is_set():
-                            if msg.content:
-                                turn_response.append((msg.content, dict(msg.metadata or {})))
-                            turn_done.set()
-                        elif msg.content:
-                            await _print_interactive_response(
-                                msg.content,
-                                render_markdown=markdown,
-                                metadata=msg.metadata,
-                            )
-
-                    except asyncio.TimeoutError:
-                        continue
-                    except asyncio.CancelledError:
-                        break
-
-            outbound_task = asyncio.create_task(_consume_outbound())
-
             try:
                 while True:
                     try:
@@ -881,30 +933,17 @@ def agent(
                             console.print("\nGoodbye!")
                             break
 
-                        turn_done.clear()
-                        turn_response.clear()
-                        renderer = StreamRenderer(render_markdown=markdown)
-
-                        await bus.publish_inbound(InboundMessage(
-                            channel=cli_channel,
-                            sender_id="user",
-                            chat_id=cli_chat_id,
-                            content=user_input,
-                            metadata={"_wants_stream": True},
-                        ))
-
-                        await turn_done.wait()
-
-                        if turn_response:
-                            content, meta = turn_response[0]
-                            if content and not meta.get("_streamed"):
-                                if renderer:
-                                    await renderer.close()
-                                _print_agent_response(
-                                    content, render_markdown=markdown, metadata=meta,
-                                )
-                        elif renderer and not renderer.streamed:
-                            await renderer.close()
+                        with _thinking_ctx():
+                            outbound = await agent_loop.process_direct_message(
+                                user_input,
+                                session_id,
+                                on_progress=_cli_progress,
+                            )
+                        _print_agent_response(
+                            outbound.content if outbound else "",
+                            render_markdown=markdown,
+                            metadata=outbound.metadata if outbound else None,
+                        )
                     except KeyboardInterrupt:
                         _restore_terminal()
                         console.print("\nGoodbye!")
@@ -914,9 +953,6 @@ def agent(
                         console.print("\nGoodbye!")
                         break
             finally:
-                agent_loop.stop()
-                outbound_task.cancel()
-                await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
                 await agent_loop.close_mcp()
 
         asyncio.run(run_interactive())
@@ -934,7 +970,6 @@ app.add_typer(channels_app, name="channels")
 @channels_app.command("status")
 def channels_status():
     """Show channel status."""
-    from nanobot.channels.registry import discover_all
     from nanobot.config.loader import load_config
 
     config = load_config()
@@ -942,19 +977,37 @@ def channels_status():
     table = Table(title="Channel Status")
     table.add_column("Channel", style="cyan")
     table.add_column("Enabled", style="green")
+    table.add_column("Configuration", style="yellow")
 
-    for name, cls in sorted(discover_all().items()):
-        section = getattr(config.channels, name, None)
-        if section is None:
-            enabled = False
-        elif isinstance(section, dict):
-            enabled = section.get("enabled", False)
-        else:
-            enabled = getattr(section, "enabled", False)
-        table.add_row(
-            cls.display_name,
-            "[green]\u2713[/green]" if enabled else "[dim]\u2717[/dim]",
-        )
+    # WhatsApp
+    wa = config.channels.whatsapp
+    table.add_row("WhatsApp", "✓" if wa.enabled else "✗", wa.bridge_url)
+
+    dc = config.channels.discord
+    table.add_row("Discord", "✓" if dc.enabled else "✗", dc.gateway_url)
+
+    # Feishu
+    fs = config.channels.feishu
+    fs_config = f"app_id: {fs.app_id[:10]}..." if fs.app_id else "[dim]not configured[/dim]"
+    table.add_row("Feishu", "✓" if fs.enabled else "✗", fs_config)
+
+    # Mochat
+    mc = config.channels.mochat
+    mc_base = mc.base_url or "[dim]not configured[/dim]"
+    table.add_row("Mochat", "✓" if mc.enabled else "✗", mc_base)
+
+    # Telegram
+    tg = config.channels.telegram
+    tg_config = f"token: {tg.token[:10]}..." if tg.token else "[dim]not configured[/dim]"
+    table.add_row("Telegram", "✓" if tg.enabled else "✗", tg_config)
+
+    # Slack
+    slack = config.channels.slack
+    slack_config = "socket" if slack.app_token and slack.bot_token else "[dim]not configured[/dim]"
+    table.add_row("Slack", "✓" if slack.enabled else "✗", slack_config)
+
+    web = config.channels.web
+    table.add_row("Web", "✓" if web.enabled else "✗", f"http://{web.host}:{web.port}")
 
     console.print(table)
 
@@ -965,17 +1018,14 @@ def _get_bridge_dir() -> Path:
     import subprocess
 
     # User's bridge location
-    from nanobot.config.paths import get_bridge_install_dir
-
-    user_bridge = get_bridge_install_dir()
+    user_bridge = Path.home() / ".nanobot" / "bridge"
 
     # Check if already built
     if (user_bridge / "dist" / "index.js").exists():
         return user_bridge
 
     # Check for npm
-    npm_path = shutil.which("npm")
-    if not npm_path:
+    if not shutil.which("npm"):
         console.print("[red]npm not found. Please install Node.js >= 18.[/red]")
         raise typer.Exit(1)
 
@@ -1005,10 +1055,10 @@ def _get_bridge_dir() -> Path:
     # Install and build
     try:
         console.print("  Installing dependencies...")
-        subprocess.run([npm_path, "install"], cwd=user_bridge, check=True, capture_output=True)
+        subprocess.run(["npm", "install"], cwd=user_bridge, check=True, capture_output=True)
 
         console.print("  Building...")
-        subprocess.run([npm_path, "run", "build"], cwd=user_bridge, check=True, capture_output=True)
+        subprocess.run(["npm", "run", "build"], cwd=user_bridge, check=True, capture_output=True)
 
         console.print("[green]✓[/green] Bridge ready\n")
     except subprocess.CalledProcessError as e:
@@ -1021,75 +1071,256 @@ def _get_bridge_dir() -> Path:
 
 
 @channels_app.command("login")
-def channels_login(
-    channel_name: str = typer.Argument(..., help="Channel name (e.g. weixin, whatsapp)"),
-    force: bool = typer.Option(False, "--force", "-f", help="Force re-authentication even if already logged in"),
+def channels_login():
+    """Link device via QR code."""
+    import subprocess
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    bridge_dir = _get_bridge_dir()
+
+    console.print(f"{__logo__} Starting bridge...")
+    console.print("Scan the QR code to connect.\n")
+
+    env = {**os.environ}
+    if config.channels.whatsapp.bridge_token:
+        env["BRIDGE_TOKEN"] = config.channels.whatsapp.bridge_token
+
+    try:
+        subprocess.run(["npm", "start"], cwd=bridge_dir, check=True, env=env)
+    except subprocess.CalledProcessError as e:
+        console.print(f"[red]Bridge failed: {e}[/red]")
+    except FileNotFoundError:
+        console.print("[red]npm not found. Please install Node.js.[/red]")
+
+
+# ============================================================================
+# Cron Commands
+# ============================================================================
+
+cron_app = typer.Typer(help="Manage scheduled tasks")
+app.add_typer(cron_app, name="cron")
+
+
+@cron_app.command("list")
+def cron_list(
+    all: bool = typer.Option(False, "--all", "-a", help="Include disabled jobs"),
 ):
-    """Authenticate with a channel via QR code or other interactive login."""
-    from nanobot.channels.registry import discover_all
-    from nanobot.config.loader import load_config
+    """List scheduled jobs."""
+    from nanobot.config.loader import get_data_dir
+    from nanobot.cron.service import CronService
 
-    config = load_config()
-    channel_cfg = getattr(config.channels, channel_name, None) or {}
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
 
-    # Validate channel exists
-    all_channels = discover_all()
-    if channel_name not in all_channels:
-        available = ", ".join(all_channels.keys())
-        console.print(f"[red]Unknown channel: {channel_name}[/red]  Available: {available}")
-        raise typer.Exit(1)
+    jobs = service.list_jobs(include_disabled=all)
 
-    console.print(f"{__logo__} {all_channels[channel_name].display_name} Login\n")
+    if not jobs:
+        console.print("No scheduled jobs.")
+        return
 
-    channel_cls = all_channels[channel_name]
-    channel = channel_cls(channel_cfg, bus=None)
+    table = Table(title="Scheduled Jobs")
+    table.add_column("ID", style="cyan")
+    table.add_column("Name")
+    table.add_column("Schedule")
+    table.add_column("Status")
+    table.add_column("Next Run")
 
-    success = asyncio.run(channel.login(force=force))
+    import time
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
 
-    if not success:
-        raise typer.Exit(1)
-
-
-# ============================================================================
-# Plugin Commands
-# ============================================================================
-
-plugins_app = typer.Typer(help="Manage channel plugins")
-app.add_typer(plugins_app, name="plugins")
-
-
-@plugins_app.command("list")
-def plugins_list():
-    """List all discovered channels (built-in and plugins)."""
-    from nanobot.channels.registry import discover_all, discover_channel_names
-    from nanobot.config.loader import load_config
-
-    config = load_config()
-    builtin_names = set(discover_channel_names())
-    all_channels = discover_all()
-
-    table = Table(title="Channel Plugins")
-    table.add_column("Name", style="cyan")
-    table.add_column("Source", style="magenta")
-    table.add_column("Enabled", style="green")
-
-    for name in sorted(all_channels):
-        cls = all_channels[name]
-        source = "builtin" if name in builtin_names else "plugin"
-        section = getattr(config.channels, name, None)
-        if section is None:
-            enabled = False
-        elif isinstance(section, dict):
-            enabled = section.get("enabled", False)
+    for job in jobs:
+        # Format schedule
+        if job.schedule.kind == "every":
+            sched = f"every {(job.schedule.every_ms or 0) // 1000}s"
+        elif job.schedule.kind == "cron":
+            sched = (
+                f"{job.schedule.expr or ''} ({job.schedule.tz})"
+                if job.schedule.tz
+                else (job.schedule.expr or "")
+            )
         else:
-            enabled = getattr(section, "enabled", False)
-        table.add_row(
-            cls.display_name,
-            source,
-            "[green]yes[/green]" if enabled else "[dim]no[/dim]",
-        )
+            sched = "one-time"
+
+        # Format next run
+        next_run = ""
+        if job.state.next_run_at_ms:
+            ts = job.state.next_run_at_ms / 1000
+            try:
+                tz = ZoneInfo(job.schedule.tz) if job.schedule.tz else None
+                next_run = _dt.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                next_run = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+        status = "[green]enabled[/green]" if job.enabled else "[dim]disabled[/dim]"
+
+        table.add_row(job.id, job.name, sched, status, next_run)
 
     console.print(table)
+
+
+@cron_app.command("add")
+def cron_add(
+    name: str = typer.Option(..., "--name", "-n", help="Job name"),
+    message: str = typer.Option(..., "--message", "-m", help="Message for agent"),
+    every: int = typer.Option(None, "--every", "-e", help="Run every N seconds"),
+    cron_expr: str = typer.Option(None, "--cron", "-c", help="Cron expression (e.g. '0 9 * * *')"),
+    tz: str | None = typer.Option(
+        None, "--tz", help="IANA timezone for cron (e.g. 'America/Vancouver')"
+    ),
+    at: str = typer.Option(None, "--at", help="Run once at time (ISO format)"),
+    deliver: bool = typer.Option(False, "--deliver", "-d", help="Deliver response to channel"),
+    to: str = typer.Option(None, "--to", help="Recipient for delivery"),
+    channel: str = typer.Option(
+        None, "--channel", help="Channel for delivery (e.g. 'telegram', 'whatsapp')"
+    ),
+):
+    """Add a scheduled job."""
+    from nanobot.config.loader import get_data_dir
+    from nanobot.cron.service import CronService
+    from nanobot.cron.types import CronSchedule
+
+    if tz and not cron_expr:
+        console.print("[red]Error: --tz can only be used with --cron[/red]")
+        raise typer.Exit(1)
+
+    # Determine schedule type
+    if every:
+        schedule = CronSchedule(kind="every", every_ms=every * 1000)
+    elif cron_expr:
+        schedule = CronSchedule(kind="cron", expr=cron_expr, tz=tz)
+    elif at:
+        import datetime
+
+        dt = datetime.datetime.fromisoformat(at)
+        schedule = CronSchedule(kind="at", at_ms=int(dt.timestamp() * 1000))
+    else:
+        console.print("[red]Error: Must specify --every, --cron, or --at[/red]")
+        raise typer.Exit(1)
+
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
+
+    try:
+        job = service.add_job(
+            name=name,
+            schedule=schedule,
+            message=message,
+            deliver=deliver,
+            to=to,
+            channel=channel,
+        )
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1) from e
+
+    console.print(f"[green]✓[/green] Added job '{job.name}' ({job.id})")
+
+
+@cron_app.command("remove")
+def cron_remove(
+    job_id: str = typer.Argument(..., help="Job ID to remove"),
+):
+    """Remove a scheduled job."""
+    from nanobot.config.loader import get_data_dir
+    from nanobot.cron.service import CronService
+
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
+
+    if service.remove_job(job_id):
+        console.print(f"[green]✓[/green] Removed job {job_id}")
+    else:
+        console.print(f"[red]Job {job_id} not found[/red]")
+
+
+@cron_app.command("enable")
+def cron_enable(
+    job_id: str = typer.Argument(..., help="Job ID"),
+    disable: bool = typer.Option(False, "--disable", help="Disable instead of enable"),
+):
+    """Enable or disable a job."""
+    from nanobot.config.loader import get_data_dir
+    from nanobot.cron.service import CronService
+
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
+
+    job = service.enable_job(job_id, enabled=not disable)
+    if job:
+        status = "disabled" if disable else "enabled"
+        console.print(f"[green]✓[/green] Job '{job.name}' {status}")
+    else:
+        console.print(f"[red]Job {job_id} not found[/red]")
+
+
+@cron_app.command("run")
+def cron_run(
+    job_id: str = typer.Argument(..., help="Job ID to run"),
+    force: bool = typer.Option(False, "--force", "-f", help="Run even if disabled"),
+):
+    """Manually run a job."""
+    from loguru import logger
+    from nanobot.config.loader import load_config, get_data_dir
+    from nanobot.cron.service import CronService
+    from nanobot.cron.types import CronJob
+    from nanobot.bus.queue import MessageBus
+    from nanobot.agent.loop import AgentLoop
+
+    logger.disable("nanobot")
+
+    config = load_config()
+    sync_workspace_templates(config.workspace_path)
+    provider = _make_provider(config)
+    bus = MessageBus()
+
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
+    agent_loop = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=config.workspace_path,
+        model=config.agents.defaults.model,
+        temperature=config.agents.defaults.temperature,
+        max_tokens=config.agents.defaults.max_tokens,
+        max_iterations=config.agents.defaults.max_tool_iterations,
+        context_window_tokens=config.agents.defaults.context_window_tokens,
+        reasoning_effort=config.agents.defaults.reasoning_effort,
+        brave_api_key=config.tools.web.search.api_key or None,
+        exec_config=config.tools.exec,
+        cron_service=service,
+        restrict_to_workspace=config.tools.restrict_to_workspace,
+        mcp_servers=config.tools.mcp_servers,
+    )
+
+    result_holder: list[str] = []
+
+    async def on_job(job: CronJob) -> str | None:
+        outbound = await agent_loop.process_direct(
+            job.payload.message,
+            session_key=f"cron:{job.id}",
+            channel=job.payload.channel or "cli",
+            chat_id=job.payload.to or "direct",
+        )
+        response = outbound.content if outbound else ""
+        result_holder.append(response)
+        return response
+
+    service.on_job = on_job
+
+    async def run():
+        try:
+            return await service.run_job(job_id, force=force)
+        finally:
+            await agent_loop.close_mcp()
+
+    if asyncio.run(run()):
+        console.print(f"[green]✓[/green] Job executed")
+        if result_holder:
+            _print_agent_response(result_holder[0], render_markdown=True)
+    else:
+        console.print(f"[red]Failed to run job {job_id}[/red]")
 
 
 # ============================================================================
@@ -1097,10 +1328,194 @@ def plugins_list():
 # ============================================================================
 
 
+privileged_app = typer.Typer(help="Manage privileged runner")
+app.add_typer(privileged_app, name="privileged")
+
+
+@privileged_app.command("setup")
+def privileged_setup(
+    socket: str = typer.Option("/run/nanobot-privileged.sock", "--socket", help="Unix socket path"),
+    audit_log: str = typer.Option(
+        "/var/log/nanobot-privileged.log", "--audit-log", help="Audit log JSONL path"
+    ),
+    socket_group: str | None = typer.Option(
+        None,
+        "--socket-group",
+        help="Group for privileged socket access (default: auto-detect invoking user group).",
+    ),
+    approval_ttl_sec: int = typer.Option(600, "--approval-ttl-sec", help="Approval TTL in seconds"),
+    install_service: bool = typer.Option(
+        True,
+        "--install-service/--no-install-service",
+        help="Install and start systemd service (requires root).",
+    ),
+):
+    """Configure privileged execution and optionally install system service."""
+    _ensure_posix_for_privileged()
+
+    try:
+        _configure_privileged_settings(
+            socket=socket,
+            approval_ttl_sec=approval_ttl_sec,
+            single_pending_per_chat=True,
+            enabled=True,
+        )
+        console.print("[green]✓[/green] Config updated: privileged execution enabled.")
+    except OSError as e:
+        console.print(f"[red]Failed to update config: {e}[/red]")
+        raise typer.Exit(1)
+
+    if not install_service:
+        console.print("[dim]Skipped service installation.[/dim]")
+        return
+
+    resolved_group = _resolve_socket_group(socket_group)
+    if resolved_group:
+        console.print(f"[dim]Privileged socket group: {resolved_group}[/dim]")
+    else:
+        console.print(
+            "[yellow]Could not auto-detect socket group; default ownership will be used.[/yellow]"
+        )
+
+    ok, msg = _install_or_update_privileged_service(
+        socket=socket,
+        audit_log=audit_log,
+        socket_group=resolved_group,
+    )
+    if ok:
+        console.print(f"[green]✓[/green] {msg}")
+    else:
+        console.print(f"[yellow]{msg}[/yellow]")
+
+
+@privileged_app.command("disable")
+def privileged_disable(
+    stop_service: bool = typer.Option(
+        False,
+        "--stop-service",
+        help="Also stop/disable systemd service (requires root).",
+    ),
+):
+    """Disable approval-gated privileged execution in config."""
+    _ensure_posix_for_privileged()
+
+    from nanobot.config.loader import load_config, save_config
+
+    try:
+        config = load_config()
+        config.tools.exec.privileged_enabled = False
+        save_config(config)
+        console.print("[green]✓[/green] Config updated: privileged execution disabled.")
+    except OSError as e:
+        console.print(f"[red]Failed to update config: {e}[/red]")
+        raise typer.Exit(1)
+
+    if stop_service:
+        ok, msg = _stop_privileged_service()
+        if ok:
+            console.print(f"[green]✓[/green] {msg}")
+        else:
+            console.print(f"[yellow]{msg}[/yellow]")
+
+
+@privileged_app.command("run")
+def privileged_run(
+    socket: str = typer.Option("/run/nanobot-privileged.sock", "--socket", help="Unix socket path"),
+    audit_log: str = typer.Option(
+        "/var/log/nanobot-privileged.log", "--audit-log", help="Audit log JSONL path"
+    ),
+    socket_group: str | None = typer.Option(
+        None,
+        "--socket-group",
+        help="Group for privileged socket access (default: auto-detect invoking user group).",
+    ),
+    daemon: bool = typer.Option(
+        False,
+        "-d",
+        "--daemon",
+        help="Run in background and return immediately.",
+    ),
+    daemon_log: str | None = typer.Option(
+        None,
+        "--daemon-log",
+        help="Detached process stdout/stderr log path (used with -d).",
+    ),
+):
+    """Run privileged runner (should be started with root privileges)."""
+    _ensure_posix_for_privileged()
+
+    from nanobot.privileged.runner import PrivilegedRunner
+
+    resolved_group = _resolve_socket_group(socket_group)
+    if daemon:
+        ok, msg = _launch_privileged_runner_daemon(
+            socket=socket,
+            audit_log=audit_log,
+            daemon_log=daemon_log,
+            socket_group=resolved_group,
+        )
+        if ok:
+            console.print(f"[green]✓[/green] {msg}")
+            return
+        console.print(f"[red]{msg}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"{__logo__} Starting privileged runner")
+    console.print(f"Socket: {socket}")
+    console.print(f"Audit log: {audit_log}")
+    if resolved_group:
+        console.print(f"Socket group: {resolved_group}")
+    runner = PrivilegedRunner(
+        socket_path=socket,
+        audit_log_path=audit_log,
+        socket_group=resolved_group,
+    )
+    asyncio.run(runner.serve())
+
+
+@privileged_app.command("status")
+def privileged_status(
+    socket: str | None = typer.Option(
+        None,
+        "--socket",
+        help="Unix socket path (defaults to configured privilegedSocket)",
+    ),
+):
+    """Check privileged runner socket status."""
+    _ensure_posix_for_privileged()
+
+    from nanobot.config.loader import load_config
+
+    cfg = load_config().tools.exec
+    console.print(f"Configured privilegedEnabled: {cfg.privileged_enabled}")
+    console.print(f"Configured privilegedSocket: {cfg.privileged_socket}")
+    console.print(f"Configured approvalTtlSec: {cfg.approval_ttl_sec}")
+
+    resolved_socket = socket or cfg.privileged_socket
+    sock = Path(resolved_socket)
+    console.print(f"Checking socket: {sock}")
+    if sock.exists():
+        console.print(f"[green]✓[/green] Socket exists: {sock}")
+        try:
+            import grp
+            import pwd
+            import stat as statmod
+
+            st = sock.stat()
+            owner = pwd.getpwuid(st.st_uid).pw_name
+            group = grp.getgrgid(st.st_gid).gr_name
+            mode = statmod.S_IMODE(st.st_mode)
+            console.print(f"Socket permissions: {oct(mode)} {owner}:{group}")
+        except Exception:
+            pass
+    else:
+        console.print(f"[red]✗[/red] Socket not found: {sock}")
+
+
 @app.command()
 def status():
     """Show nanobot status."""
-    from nanobot.config.loader import get_config_path, load_config
+    from nanobot.config.loader import load_config, get_config_path
 
     config_path = get_config_path()
     config = load_config()
@@ -1108,8 +1523,12 @@ def status():
 
     console.print(f"{__logo__} nanobot Status\n")
 
-    console.print(f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}")
-    console.print(f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
+    console.print(
+        f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}"
+    )
+    console.print(
+        f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}"
+    )
 
     if config_path.exists():
         from nanobot.providers.registry import PROVIDERS
@@ -1131,7 +1550,9 @@ def status():
                     console.print(f"{spec.label}: [dim]not set[/dim]")
             else:
                 has_key = bool(p.api_key)
-                console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
+                console.print(
+                    f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}"
+                )
 
 
 # ============================================================================
@@ -1149,12 +1570,15 @@ def _register_login(name: str):
     def decorator(fn):
         _LOGIN_HANDLERS[name] = fn
         return fn
+
     return decorator
 
 
 @provider_app.command("login")
 def provider_login(
-    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
+    provider: str = typer.Argument(
+        ..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"
+    ),
 ):
     """Authenticate with an OAuth provider."""
     from nanobot.providers.registry import PROVIDERS
@@ -1179,6 +1603,7 @@ def provider_login(
 def _login_openai_codex() -> None:
     try:
         from oauth_cli_kit import get_token, login_oauth_interactive
+
         token = None
         try:
             token = get_token()
@@ -1193,7 +1618,9 @@ def _login_openai_codex() -> None:
         if not (token and token.access):
             console.print("[red]✗ Authentication failed[/red]")
             raise typer.Exit(1)
-        console.print(f"[green]✓ Authenticated with OpenAI Codex[/green]  [dim]{token.account_id}[/dim]")
+        console.print(
+            f"[green]✓ Authenticated with OpenAI Codex[/green]  [dim]{token.account_id}[/dim]"
+        )
     except ImportError:
         console.print("[red]oauth_cli_kit not installed. Run: pip install oauth-cli-kit[/red]")
         raise typer.Exit(1)
@@ -1203,17 +1630,13 @@ def _login_openai_codex() -> None:
 def _login_github_copilot() -> None:
     import asyncio
 
-    from openai import AsyncOpenAI
-
     console.print("[cyan]Starting GitHub Copilot device flow...[/cyan]\n")
 
     async def _trigger():
-        client = AsyncOpenAI(
-            api_key="dummy",
-            base_url="https://api.githubcopilot.com",
-        )
-        await client.chat.completions.create(
-            model="gpt-4o",
+        from litellm import acompletion
+
+        await acompletion(
+            model="github_copilot/gpt-4o",
             messages=[{"role": "user", "content": "hi"}],
             max_tokens=1,
         )

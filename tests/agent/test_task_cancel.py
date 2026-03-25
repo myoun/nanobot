@@ -139,6 +139,43 @@ class TestDispatch:
         assert order == ["start-a", "end-a", "start-b", "end-b"]
 
 
+class TestShutdown:
+    @pytest.mark.asyncio
+    async def test_close_mcp_finishes_provider_shutdown_when_cancelled(self):
+        from nanobot.agent.loop import AgentLoop
+        from nanobot.bus.queue import MessageBus
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        closed = asyncio.Event()
+
+        class Provider:
+            def get_default_model(self):
+                return "test-model"
+
+            async def aclose(self) -> None:
+                started.set()
+                await release.wait()
+                closed.set()
+
+        bus = MessageBus()
+        workspace = MagicMock()
+        workspace.__truediv__ = MagicMock(return_value=MagicMock())
+
+        with patch("nanobot.agent.loop.ContextBuilder"), \
+             patch("nanobot.agent.loop.SessionManager"), \
+             patch("nanobot.agent.loop.SubagentManager"):
+            loop = AgentLoop(bus=bus, provider=Provider(), workspace=workspace)
+
+        task = asyncio.create_task(loop.close_mcp())
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        task.cancel()
+        release.set()
+
+        await asyncio.wait_for(task, timeout=1.0)
+        assert closed.is_set()
+
+
 class TestSubagentCancellation:
     @pytest.mark.asyncio
     async def test_cancel_by_session(self):

@@ -41,11 +41,10 @@ class HeartbeatService:
     """
     Periodic heartbeat service that wakes the agent to check for tasks.
 
-    Phase 1 (decision): reads HEARTBEAT.md and asks the LLM — via a virtual
-    tool call — whether there are active tasks.  This avoids free-text parsing
-    and the unreliable HEARTBEAT_OK token.
+    Phase 1 (decision): reads HEARTBEAT.md and asks the LLM - via a virtual
+    tool call - whether there are active tasks.
 
-    Phase 2 (execution): only triggered when Phase 1 returns ``run``.  The
+    Phase 2 (execution): only triggered when Phase 1 returns ``run``. The
     ``on_execute`` callback runs the task through the full agent loop and
     returns the result to deliver.
     """
@@ -83,20 +82,20 @@ class HeartbeatService:
         return None
 
     async def _decide(self, content: str) -> tuple[str, str]:
-        """Phase 1: ask LLM to decide skip/run via virtual tool call.
-
-        Returns (action, tasks) where action is 'skip' or 'run'.
-        """
-        from nanobot.utils.helpers import current_time_str
-
-        response = await self.provider.chat_with_retry(
+        """Phase 1: ask LLM to decide skip/run via virtual tool call."""
+        response = await self.provider.chat(
             messages=[
-                {"role": "system", "content": "You are a heartbeat agent. Call the heartbeat tool to report your decision."},
-                {"role": "user", "content": (
-                    f"Current Time: {current_time_str()}\n\n"
-                    "Review the following HEARTBEAT.md and decide whether there are active tasks.\n\n"
-                    f"{content}"
-                )},
+                {
+                    "role": "system",
+                    "content": "You are a heartbeat agent. Call the heartbeat tool to report your decision.",
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Review the following HEARTBEAT.md and decide whether there are active tasks.\n\n"
+                        f"{content}"
+                    ),
+                },
             ],
             tools=_HEARTBEAT_TOOL,
             model=self.model,
@@ -142,8 +141,6 @@ class HeartbeatService:
 
     async def _tick(self) -> None:
         """Execute a single heartbeat tick."""
-        from nanobot.utils.evaluator import evaluate_response
-
         content = self._read_heartbeat_file()
         if not content:
             logger.debug("Heartbeat: HEARTBEAT.md missing or empty")
@@ -161,16 +158,9 @@ class HeartbeatService:
             logger.info("Heartbeat: tasks found, executing...")
             if self.on_execute:
                 response = await self.on_execute(tasks)
-
-                if response:
-                    should_notify = await evaluate_response(
-                        response, tasks, self.provider, self.model,
-                    )
-                    if should_notify and self.on_notify:
-                        logger.info("Heartbeat: completed, delivering response")
-                        await self.on_notify(response)
-                    else:
-                        logger.info("Heartbeat: silenced by post-run evaluation")
+                if response and self.on_notify:
+                    logger.info("Heartbeat: completed, delivering response")
+                    await self.on_notify(response)
         except Exception:
             logger.exception("Heartbeat execution failed")
 
@@ -183,3 +173,4 @@ class HeartbeatService:
         if action != "run" or not self.on_execute:
             return None
         return await self.on_execute(tasks)
+

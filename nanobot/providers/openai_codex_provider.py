@@ -5,17 +5,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Awaitable, Callable
 from typing import Any, AsyncGenerator
 
 import httpx
 from loguru import logger
-from oauth_cli_kit import get_token as get_codex_token
 
+from oauth_cli_kit import get_token as get_codex_token
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "nanobot"
+BUILTIN_WEB_SEARCH_TOOL = {"type": "web_search"}
 
 
 class OpenAICodexProvider(LLMProvider):
@@ -25,18 +25,18 @@ class OpenAICodexProvider(LLMProvider):
         super().__init__(api_key=None, api_base=None)
         self.default_model = default_model
 
-    async def _call_codex(
+    async def chat(
         self,
         messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None,
-        model: str | None,
-        reasoning_effort: str | None,
-        tool_choice: str | dict[str, Any] | None,
-        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.3,
+        reasoning_effort: str | None = None,
     ) -> LLMResponse:
-        """Shared request logic for both chat() and chat_stream()."""
         model = model or self.default_model
-        system_prompt, input_items = _convert_messages(messages)
+        sanitized_messages = self._sanitize_empty_content(messages)
+        system_prompt, input_items = _convert_messages(sanitized_messages)
 
         token = await asyncio.to_thread(get_codex_token)
         headers = _build_headers(token.account_id, token.access)
@@ -48,58 +48,53 @@ class OpenAICodexProvider(LLMProvider):
             "instructions": system_prompt,
             "input": input_items,
             "text": {"verbosity": "medium"},
-            "include": ["reasoning.encrypted_content"],
-            "prompt_cache_key": _prompt_cache_key(messages),
-            "tool_choice": tool_choice or "auto",
+            "include": [
+                "reasoning.encrypted_content",
+                "web_search_call.action.sources",
+            ],
+            "prompt_cache_key": _prompt_cache_key(sanitized_messages),
+            "tool_choice": "auto",
             "parallel_tool_calls": True,
         }
-        if reasoning_effort:
-            body["reasoning"] = {"effort": reasoning_effort}
-        if tools:
-            body["tools"] = _convert_tools(tools)
+
+        # Always expose Codex built-in web search and filter out legacy function
+        # tools named "web_search" to avoid ambiguous tool selection.
+        body["tools"] = _build_response_tools(tools)
+
+        url = DEFAULT_CODEX_URL
 
         try:
             try:
-                content, tool_calls, finish_reason = await _request_codex(
-                    DEFAULT_CODEX_URL, headers, body, verify=True,
-                    on_content_delta=on_content_delta,
-                )
+                content, tool_calls, finish_reason, metadata = await _request_codex(url, headers, body, verify=True)
             except Exception as e:
                 if "CERTIFICATE_VERIFY_FAILED" not in str(e):
                     raise
-                logger.warning("SSL verification failed for Codex API; retrying with verify=False")
-                content, tool_calls, finish_reason = await _request_codex(
-                    DEFAULT_CODEX_URL, headers, body, verify=False,
-                    on_content_delta=on_content_delta,
-                )
-            return LLMResponse(content=content, tool_calls=tool_calls, finish_reason=finish_reason)
+                logger.warning("SSL certificate verification failed for Codex API; retrying with verify=False")
+                content, tool_calls, finish_reason, metadata = await _request_codex(url, headers, body, verify=False)
+            response = LLMResponse(
+                content=content,
+                tool_calls=tool_calls,
+                finish_reason=finish_reason,
+                metadata=metadata,
+            )
+            self._log_response_debug(response, model=model)
+            return response
         except Exception as e:
-            return LLMResponse(content=f"Error calling Codex: {e}", finish_reason="error")
-
-    async def chat(
-        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
-        model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
-        reasoning_effort: str | None = None,
-        tool_choice: str | dict[str, Any] | None = None,
-    ) -> LLMResponse:
-        return await self._call_codex(messages, tools, model, reasoning_effort, tool_choice)
-
-    async def chat_stream(
-        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
-        model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
-        reasoning_effort: str | None = None,
-        tool_choice: str | dict[str, Any] | None = None,
-        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
-    ) -> LLMResponse:
-        return await self._call_codex(messages, tools, model, reasoning_effort, tool_choice, on_content_delta)
+            error_response = LLMResponse(
+                content=f"Error calling Codex: {str(e)}",
+                finish_reason="error",
+            )
+            self._log_response_debug(error_response, model=model)
+            return error_response
 
     def get_default_model(self) -> str:
         return self.default_model
 
 
 def _strip_model_prefix(model: str) -> str:
-    if model.startswith("openai-codex/") or model.startswith("openai_codex/"):
-        return model.split("/", 1)[1]
+    for prefix in ("openai-codex/", "openai_codex/"):
+        if model.startswith(prefix):
+            return model[len(prefix):]
     return model
 
 
@@ -120,14 +115,13 @@ async def _request_codex(
     headers: dict[str, str],
     body: dict[str, Any],
     verify: bool,
-    on_content_delta: Callable[[str], Awaitable[None]] | None = None,
-) -> tuple[str, list[ToolCallRequest], str]:
+) -> tuple[str, list[ToolCallRequest], str, dict[str, Any]]:
     async with httpx.AsyncClient(timeout=60.0, verify=verify) as client:
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code != 200:
                 text = await response.aread()
                 raise RuntimeError(_friendly_error(response.status_code, text.decode("utf-8", "ignore")))
-            return await _consume_sse(response, on_content_delta)
+            return await _consume_sse(response)
 
 
 def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -148,8 +142,19 @@ def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return converted
 
 
+def _build_response_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Build Responses API tools with built-in web search enabled."""
+    converted = _convert_tools(tools or [])
+    filtered = [
+        tool for tool in converted
+        if not (tool.get("type") == "function" and tool.get("name") == "web_search")
+    ]
+    filtered.append(BUILTIN_WEB_SEARCH_TOOL.copy())
+    return filtered
+
+
 def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
-    system_prompt = ""
+    system_prompts: list[str] = []
     input_items: list[dict[str, Any]] = []
 
     for idx, msg in enumerate(messages):
@@ -157,7 +162,8 @@ def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[st
         content = msg.get("content")
 
         if role == "system":
-            system_prompt = content if isinstance(content, str) else ""
+            if isinstance(content, str) and content.strip():
+                system_prompts.append(content.strip())
             continue
 
         if role == "user":
@@ -165,29 +171,47 @@ def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[st
             continue
 
         if role == "assistant":
+            # Handle text first.
             if isinstance(content, str) and content:
-                input_items.append({
-                    "type": "message", "role": "assistant",
-                    "content": [{"type": "output_text", "text": content}],
-                    "status": "completed", "id": f"msg_{idx}",
-                })
+                input_items.append(
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": content}],
+                        "status": "completed",
+                        "id": f"msg_{idx}",
+                    }
+                )
+            # Then handle tool calls.
             for tool_call in msg.get("tool_calls", []) or []:
                 fn = tool_call.get("function") or {}
                 call_id, item_id = _split_tool_call_id(tool_call.get("id"))
-                input_items.append({
-                    "type": "function_call",
-                    "id": item_id or f"fc_{idx}",
-                    "call_id": call_id or f"call_{idx}",
-                    "name": fn.get("name"),
-                    "arguments": fn.get("arguments") or "{}",
-                })
+                call_id = call_id or f"call_{idx}"
+                item_id = item_id or f"fc_{idx}"
+                input_items.append(
+                    {
+                        "type": "function_call",
+                        "id": item_id,
+                        "call_id": call_id,
+                        "name": fn.get("name"),
+                        "arguments": fn.get("arguments") or "{}",
+                    }
+                )
             continue
 
         if role == "tool":
             call_id, _ = _split_tool_call_id(msg.get("tool_call_id"))
-            output_text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
-            input_items.append({"type": "function_call_output", "call_id": call_id, "output": output_text})
+            output_text = content if isinstance(content, str) else json.dumps(content)
+            input_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output_text,
+                }
+            )
+            continue
 
+    system_prompt = "\n\n---\n\n".join(system_prompts)
     return system_prompt, input_items
 
 
@@ -229,28 +253,27 @@ async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], 
     async for line in response.aiter_lines():
         if line == "":
             if buffer:
-                data_lines = [l[5:].strip() for l in buffer if l.startswith("data:")]
+                parsed = _parse_sse_buffer(buffer)
                 buffer = []
-                if not data_lines:
-                    continue
-                data = "\n".join(data_lines).strip()
-                if not data or data == "[DONE]":
-                    continue
-                try:
-                    yield json.loads(data)
-                except Exception:
-                    continue
+                if parsed is not None:
+                    yield parsed
             continue
         buffer.append(line)
+    # Some servers terminate the stream without a trailing blank line.
+    if buffer:
+        parsed = _parse_sse_buffer(buffer)
+        if parsed is not None:
+            yield parsed
 
 
-async def _consume_sse(
-    response: httpx.Response,
-    on_content_delta: Callable[[str], Awaitable[None]] | None = None,
-) -> tuple[str, list[ToolCallRequest], str]:
-    content = ""
+async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequest], str, dict[str, Any]]:
+    text_segments: dict[str, str] = {}
+    text_segment_order: list[str] = []
+    message_text_fallback_parts: list[str] = []
     tool_calls: list[ToolCallRequest] = []
     tool_call_buffers: dict[str, dict[str, Any]] = {}
+    web_search_trace: list[dict[str, Any]] = []
+    seen_web_actions: set[str] = set()
     finish_reason = "stop"
 
     async for event in _iter_sse(response):
@@ -267,10 +290,19 @@ async def _consume_sse(
                     "arguments": item.get("arguments") or "",
                 }
         elif event_type == "response.output_text.delta":
-            delta_text = event.get("delta") or ""
-            content += delta_text
-            if on_content_delta and delta_text:
-                await on_content_delta(delta_text)
+            _append_text_segment(
+                text_segments,
+                text_segment_order,
+                _text_segment_key(event),
+                event.get("delta") or "",
+            )
+        elif event_type == "response.output_text.done":
+            _merge_text_segment(
+                text_segments,
+                text_segment_order,
+                _text_segment_key(event),
+                _output_text_done_value(event),
+            )
         elif event_type == "response.function_call_arguments.delta":
             call_id = event.get("call_id")
             if call_id and call_id in tool_call_buffers:
@@ -298,20 +330,190 @@ async def _consume_sse(
                         arguments=args,
                     )
                 )
+            elif item.get("type") == "web_search_call":
+                _append_web_search_action(
+                    web_search_trace,
+                    seen_web_actions,
+                    _normalize_web_search_action(item.get("action")),
+                )
+            elif item.get("type") == "message":
+                text = _extract_message_output_text(item)
+                if text:
+                    message_text_fallback_parts.append(text)
+        elif event_type.startswith("response.web_search_call."):
+            web_item = event.get("web_search_call") or {}
+            _append_web_search_action(
+                web_search_trace,
+                seen_web_actions,
+                _normalize_web_search_action(web_item.get("action") or event.get("action")),
+            )
         elif event_type == "response.completed":
             status = (event.get("response") or {}).get("status")
             finish_reason = _map_finish_reason(status)
         elif event_type in {"error", "response.failed"}:
             raise RuntimeError("Codex response failed")
 
-    return content, tool_calls, finish_reason
+    content = "".join(text_segments[key] for key in text_segment_order if text_segments.get(key))
+    if not content and message_text_fallback_parts:
+        # Fallback for variants that only emit final message items.
+        content = "".join(message_text_fallback_parts)
+
+    metadata: dict[str, Any] = {}
+    if web_search_trace:
+        metadata["web_search_trace"] = web_search_trace
+    return content, tool_calls, finish_reason, metadata
 
 
 _FINISH_REASON_MAP = {"completed": "stop", "incomplete": "length", "failed": "error", "cancelled": "error"}
 
 
+def _parse_sse_buffer(buffer: list[str]) -> dict[str, Any] | None:
+    data_lines = [line[5:].strip() for line in buffer if line.startswith("data:")]
+    if not data_lines:
+        return None
+    data = "\n".join(data_lines).strip()
+    if not data or data == "[DONE]":
+        return None
+    try:
+        parsed = json.loads(data)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def _text_segment_key(event: dict[str, Any]) -> str:
+    item_id = event.get("item_id")
+    output_index = event.get("output_index")
+    content_index = event.get("content_index")
+    if any(value is not None for value in (item_id, output_index, content_index)):
+        return f"{item_id or 'item'}:{output_index or 0}:{content_index or 0}"
+    return "global"
+
+
+def _append_text_segment(
+    segments: dict[str, str],
+    order: list[str],
+    key: str,
+    text: str,
+) -> None:
+    if not text:
+        return
+    if key not in segments:
+        segments[key] = ""
+        order.append(key)
+    segments[key] += text
+
+
+def _merge_text_segment(
+    segments: dict[str, str],
+    order: list[str],
+    key: str,
+    text: str,
+) -> None:
+    if not text:
+        return
+    if key not in segments:
+        segments[key] = text
+        order.append(key)
+        return
+    current = segments[key]
+    if not current:
+        segments[key] = text
+        return
+    if text.startswith(current):
+        segments[key] = text
+        return
+    if current.startswith(text) or current.endswith(text):
+        return
+    if text.endswith(current):
+        segments[key] = text
+        return
+    segments[key] = current + text
+
+
+def _output_text_done_value(event: dict[str, Any]) -> str:
+    text = event.get("text")
+    if isinstance(text, str):
+        return text
+    output_text = event.get("output_text")
+    if isinstance(output_text, str):
+        return output_text
+    if isinstance(output_text, dict):
+        nested_text = output_text.get("text")
+        if isinstance(nested_text, str):
+            return nested_text
+    return ""
+
+
+def _extract_message_output_text(item: dict[str, Any]) -> str:
+    content = item.get("content")
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for entry in content:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("type") == "output_text":
+            text = entry.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "".join(parts)
+
+
 def _map_finish_reason(status: str | None) -> str:
     return _FINISH_REASON_MAP.get(status or "completed", "stop")
+
+
+def _append_web_search_action(
+    trace: list[dict[str, Any]],
+    seen: set[str],
+    action: dict[str, Any] | None,
+) -> None:
+    if not action:
+        return
+    key = json.dumps(action, ensure_ascii=True, sort_keys=True)
+    if key in seen:
+        return
+    seen.add(key)
+    trace.append(action)
+
+
+def _normalize_web_search_action(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    action_type = raw.get("type")
+    if not isinstance(action_type, str) or not action_type:
+        return None
+
+    normalized: dict[str, Any] = {"type": action_type}
+
+    query = raw.get("query")
+    if isinstance(query, str) and query:
+        normalized["query"] = query
+
+    queries = raw.get("queries")
+    if isinstance(queries, list):
+        cleaned_queries = [q for q in queries if isinstance(q, str) and q]
+        if cleaned_queries:
+            normalized["queries"] = cleaned_queries
+
+    url = raw.get("url")
+    if isinstance(url, str) and url:
+        normalized["url"] = url
+
+    pattern = raw.get("pattern")
+    if isinstance(pattern, str) and pattern:
+        normalized["pattern"] = pattern
+
+    sources = raw.get("sources")
+    if isinstance(sources, list):
+        cleaned_sources = [s for s in sources if isinstance(s, dict)]
+        if cleaned_sources:
+            normalized["sources"] = cleaned_sources
+
+    return normalized
 
 
 def _friendly_error(status_code: int, raw: str) -> str:

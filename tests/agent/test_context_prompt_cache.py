@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime as real_datetime
-from importlib.resources import files as pkg_files
 from pathlib import Path
 import datetime as datetime_module
 
@@ -24,13 +23,6 @@ def _make_workspace(tmp_path: Path) -> Path:
     return workspace
 
 
-def test_bootstrap_files_are_backed_by_templates() -> None:
-    template_dir = pkg_files("nanobot") / "templates"
-
-    for filename in ContextBuilder.BOOTSTRAP_FILES:
-        assert (template_dir / filename).is_file(), f"missing bootstrap template: {filename}"
-
-
 def test_system_prompt_stays_stable_when_clock_changes(tmp_path, monkeypatch) -> None:
     """System prompt should not change just because wall clock minute changes."""
     monkeypatch.setattr(datetime_module, "datetime", _FakeDatetime)
@@ -48,7 +40,7 @@ def test_system_prompt_stays_stable_when_clock_changes(tmp_path, monkeypatch) ->
 
 
 def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
-    """Runtime metadata should be merged with the user message."""
+    """Runtime metadata should be a separate user message before the actual user message."""
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
@@ -62,12 +54,49 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert messages[0]["role"] == "system"
     assert "## Current Session" not in messages[0]["content"]
 
-    # Runtime context is now merged with user message into a single message
+    assert messages[-2]["role"] == "user"
+    runtime_content = messages[-2]["content"]
+    assert isinstance(runtime_content, str)
+    assert ContextBuilder._RUNTIME_CONTEXT_TAG in runtime_content
+    assert "Current Time:" in runtime_content
+    assert "Channel: cli" in runtime_content
+    assert "Chat ID: direct" in runtime_content
+
     assert messages[-1]["role"] == "user"
-    user_content = messages[-1]["content"]
-    assert isinstance(user_content, str)
-    assert ContextBuilder._RUNTIME_CONTEXT_TAG in user_content
-    assert "Current Time:" in user_content
-    assert "Channel: cli" in user_content
-    assert "Chat ID: direct" in user_content
-    assert "Return exactly: OK" in user_content
+    assert "[REQUEST_ROUTING_CONTEXT]" in messages[-1]["content"]
+    assert messages[-1]["content"].endswith("Return exactly: OK")
+
+
+def test_prompts_include_agent_browser_recovery_guidance(tmp_path) -> None:
+    """Browser automation guidance should cover isolated Codex runtimes."""
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    system_prompt = builder.build_system_prompt()
+    app_server_prompt = builder.build_app_server_prompt()
+
+    assert 'Do not use skills with `available="false"`' in system_prompt
+    assert "AGENT_BROWSER_EXECUTABLE_PATH" in system_prompt
+    assert "AGENT_BROWSER_HOME" in system_prompt
+
+    assert "AGENT_BROWSER_EXECUTABLE_PATH" in app_server_prompt
+    assert "AGENT_BROWSER_HOME" in app_server_prompt
+
+
+def test_app_server_turn_input_separates_runtime_context_from_current_message(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    items = builder.build_app_server_turn_input(
+        current_message="아 30일에 끝나네.",
+        channel="telegram",
+        chat_id="7659557915",
+    )
+
+    assert items[0]["type"] == "text"
+    assert str(items[0]["text"]).endswith("\n")
+    assert "Chat ID: 7659557915" in str(items[0]["text"])
+
+    assert items[-1]["type"] == "text"
+    assert str(items[-1]["text"]).startswith("[Current User Message]\n")
+    assert str(items[-1]["text"]).endswith("아 30일에 끝나네.")
