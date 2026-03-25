@@ -931,6 +931,21 @@ def _show_summary(config: Config) -> None:
         _print_summary_panel(_summarize_model(model), title)
 
 
+def _pause_after_summary() -> None:
+    """Pause after rendering the summary so the user can actually read it."""
+    prompt = getattr(_get_questionary(), "press_any_key_to_continue", None)
+    if callable(prompt):
+        prompt("Press any key to return to the main menu").ask()
+        return
+    console.input("[dim]Press Enter to return to the main menu[/dim]")
+
+
+def _view_summary(config: Config) -> None:
+    """Render the summary screen and wait for the user before returning."""
+    _show_summary(config)
+    _pause_after_summary()
+
+
 # --- Main Entry Point ---
 
 
@@ -1019,7 +1034,7 @@ def run_onboard(initial_config: Config | None = None) -> OnboardResult:
             "[A] Agent Settings": lambda: _configure_general_settings(config, "Agent Settings"),
             "[G] Gateway": lambda: _configure_general_settings(config, "Gateway"),
             "[T] Tools": lambda: _configure_general_settings(config, "Tools"),
-            "[V] View Configuration Summary": lambda: _show_summary(config),
+            "[V] View Configuration Summary": lambda: _view_summary(config),
         }
 
         if answer == "[S] Save and Exit":

@@ -557,3 +557,43 @@ class TestRunOnboardExitBehavior:
 
         assert result.should_save is False
         assert result.config.model_dump(by_alias=True) == initial_config.model_dump(by_alias=True)
+
+    def test_view_summary_pauses_before_returning_to_main_menu(self, monkeypatch):
+        initial_config = Config()
+        responses = iter(
+            [
+                "[V] View Configuration Summary",
+                "[X] Exit Without Saving",
+            ]
+        )
+        events: list[str] = []
+
+        class FakePrompt:
+            def __init__(self, response):
+                self.response = response
+
+            def ask(self):
+                events.append("pause")
+                return self.response
+
+        def fake_select(*_args, **_kwargs):
+            return SimpleNamespace(ask=lambda: next(responses))
+
+        def fake_press_any_key_to_continue(*_args, **_kwargs):
+            return FakePrompt(None)
+
+        monkeypatch.setattr(onboard_wizard, "_show_main_menu_header", lambda: None)
+        monkeypatch.setattr(onboard_wizard, "_show_summary", lambda _config: events.append("summary"))
+        monkeypatch.setattr(
+            onboard_wizard,
+            "questionary",
+            SimpleNamespace(
+                select=fake_select,
+                press_any_key_to_continue=fake_press_any_key_to_continue,
+            ),
+        )
+
+        result = run_onboard(initial_config=initial_config)
+
+        assert result.should_save is False
+        assert events == ["summary", "pause"]
