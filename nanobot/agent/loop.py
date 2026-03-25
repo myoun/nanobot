@@ -121,6 +121,7 @@ class AgentLoop:
     _AGENT_BROWSER_AUTO_CLOSE_CMD = "agent-browser close >/dev/null 2>&1 || true"
     _APP_SERVER_PROGRESS_MIN_CHARS = 24
     _APP_SERVER_PROGRESS_FORCE_FLUSH_CHARS = 160
+    _TOOL_DETAIL_PREVIEW_MAX_CHARS = 1200
 
     def __init__(
         self,
@@ -702,6 +703,12 @@ class AgentLoop:
                     tool_name or "(unknown)",
                     "ok" if event.get("success") else "failed",
                 )
+                result_hint = self._app_server_tool_result_hint(
+                    tool_name,
+                    str(event.get("result_preview") or ""),
+                )
+                if result_hint and on_progress:
+                    await on_progress("", tool_hint=result_hint)
                 return
 
             if event_type == "agent_delta":
@@ -1386,22 +1393,99 @@ class AgentLoop:
 
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
-        names: list[str] = []
         for tc in tool_calls:
             name = getattr(tc, "name", None)
             if not isinstance(name, str) or not name:
                 continue
-            if name not in names:
-                names.append(name)
-        if not names:
-            return ""
-        return f"Using tool: {names[0]}"
+            arguments = getattr(tc, "arguments", None)
+            if not isinstance(arguments, dict):
+                arguments = {}
+            return AgentLoop._format_tool_call_hint(name, arguments)
+        return ""
 
     @staticmethod
-    def _app_server_tool_hint(tool_name: str, arguments: dict[str, Any]) -> str:
+    def _sanitize_tool_detail(text: str) -> str:
+        return text.replace("\x00", "").strip()
+
+    @classmethod
+    def _tool_detail_block(cls, text: str, *, language: str = "text") -> str:
+        detail = cls._sanitize_tool_detail(text)
+        if not detail:
+            return ""
+        return f"~~~{language}\n{detail}\n~~~"
+
+    @classmethod
+    def _tool_call_detail(cls, tool_name: str, arguments: dict[str, Any]) -> tuple[str, str]:
+        if tool_name == "exec":
+            command = str(arguments.get("command") or "").strip()
+            if command:
+                return "bash", cls._truncate_preview(command, max_len=cls._TOOL_DETAIL_PREVIEW_MAX_CHARS)
+            return "text", ""
+
+        if tool_name == "read_file":
+            path = str(arguments.get("path") or "").strip()
+            offset = arguments.get("offset")
+            limit = arguments.get("limit")
+            lines = [path] if path else []
+            if isinstance(offset, int) and offset > 0 and isinstance(limit, int) and limit > 0:
+                lines.append(f"lines {offset}-{offset + limit - 1}")
+            elif isinstance(offset, int) and offset > 0:
+                lines.append(f"from line {offset}")
+            return "text", "\n".join(lines)
+
+        if tool_name in {"write_file", "edit_file"}:
+            path = str(arguments.get("path") or "").strip()
+            return "text", path
+
+        if tool_name == "list_dir":
+            path = str(arguments.get("path") or "").strip() or "."
+            return "text", path
+
+        if tool_name == "web_fetch":
+            return "text", str(arguments.get("url") or "").strip()
+
+        if tool_name == "web_search":
+            return "text", str(arguments.get("query") or "").strip()
+
+        if tool_name == "cron":
+            return "json", cls._truncate_preview(
+                json.dumps(arguments, ensure_ascii=False, indent=2),
+                max_len=cls._TOOL_DETAIL_PREVIEW_MAX_CHARS,
+            )
+
+        if not arguments:
+            return "text", ""
+
+        return "json", cls._truncate_preview(
+            json.dumps(arguments, ensure_ascii=False, indent=2),
+            max_len=cls._TOOL_DETAIL_PREVIEW_MAX_CHARS,
+        )
+
+    @classmethod
+    def _format_tool_call_hint(cls, tool_name: str, arguments: dict[str, Any]) -> str:
         if not tool_name:
             return ""
-        return f"Using tool: {tool_name}"
+        language, detail = cls._tool_call_detail(tool_name, arguments)
+        block = cls._tool_detail_block(detail, language=language)
+        if not block:
+            return f"Using tool: {tool_name}"
+        return f"Using tool: {tool_name}\n{block}"
+
+    @classmethod
+    def _app_server_tool_hint(cls, tool_name: str, arguments: dict[str, Any]) -> str:
+        return cls._format_tool_call_hint(tool_name, arguments)
+
+    @classmethod
+    def _app_server_tool_result_hint(cls, tool_name: str, result_preview: str) -> str:
+        if not tool_name:
+            return ""
+        preview = cls._truncate_preview(
+            cls._sanitize_tool_detail(result_preview),
+            max_len=cls._TOOL_DETAIL_PREVIEW_MAX_CHARS,
+        )
+        if not preview:
+            return ""
+        return f"Tool result: {tool_name}\n{cls._tool_detail_block(preview)}"
 
     @staticmethod
     def _trace_content_text(content: Any) -> str:
@@ -2718,6 +2802,7 @@ Respond with ONLY valid JSON, no markdown fences."""
         session_key: str = "cli:direct",
         channel: str = "cli",
         chat_id: str = "direct",
+        metadata: dict[str, Any] | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """
@@ -2728,6 +2813,7 @@ Respond with ONLY valid JSON, no markdown fences."""
             session_key: Session identifier (overrides channel:chat_id for session lookup).
             channel: Source channel (for tool context routing).
             chat_id: Source chat ID (for tool context routing).
+            metadata: Optional inbound metadata to preserve channel-specific routing context.
             on_progress: Optional callback for intermediate progress output.
 
         Returns:
@@ -2738,6 +2824,7 @@ Respond with ONLY valid JSON, no markdown fences."""
             session_key=session_key,
             channel=channel,
             chat_id=chat_id,
+            metadata=metadata,
             on_progress=on_progress,
         )
 
@@ -2747,11 +2834,18 @@ Respond with ONLY valid JSON, no markdown fences."""
         session_key: str = "cli:direct",
         channel: str = "cli",
         chat_id: str = "direct",
+        metadata: dict[str, Any] | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the full outbound payload."""
         await self._connect_mcp()
-        msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
+        msg = InboundMessage(
+            channel=channel,
+            sender_id="user",
+            chat_id=chat_id,
+            content=content,
+            metadata=metadata or {},
+        )
 
         async with self._process_lock:
             kwargs: dict[str, Any] = {

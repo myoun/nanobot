@@ -14,6 +14,7 @@ from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
 
+from nanobot.bus.events import OutboundMessage
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
@@ -21,6 +22,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 from nanobot import __version__, __logo__
 from nanobot.config.schema import Config
+from nanobot.cron.targeting import resolve_delivery_target
 from nanobot.utils.helpers import get_workspace_path, sync_workspace_templates
 
 app = typer.Typer(
@@ -697,21 +699,26 @@ def gateway(
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
+        delivery_channel = job.payload.channel or "cli"
+        delivery_chat_id, delivery_metadata = resolve_delivery_target(
+            delivery_channel,
+            job.payload.to,
+        )
         outbound = await agent.process_direct(
             job.payload.message,
             session_key=f"cron:{job.id}",
-            channel=job.payload.channel or "cli",
-            chat_id=job.payload.to or "direct",
+            channel=delivery_channel,
+            chat_id=delivery_chat_id,
+            metadata=delivery_metadata,
         )
         response = outbound.content if outbound else ""
         if job.payload.deliver and job.payload.to:
-            from nanobot.bus.events import OutboundMessage
-
             await bus.publish_outbound(
                 OutboundMessage(
-                    channel=job.payload.channel or "cli",
-                    chat_id=job.payload.to,
+                    channel=delivery_channel,
+                    chat_id=delivery_chat_id,
                     content=response or "",
+                    metadata=delivery_metadata,
                 )
             )
         return response
@@ -1296,11 +1303,17 @@ def cron_run(
     result_holder: list[str] = []
 
     async def on_job(job: CronJob) -> str | None:
+        delivery_channel = job.payload.channel or "cli"
+        delivery_chat_id, delivery_metadata = resolve_delivery_target(
+            delivery_channel,
+            job.payload.to,
+        )
         outbound = await agent_loop.process_direct(
             job.payload.message,
             session_key=f"cron:{job.id}",
-            channel=job.payload.channel or "cli",
-            chat_id=job.payload.to or "direct",
+            channel=delivery_channel,
+            chat_id=delivery_chat_id,
+            metadata=delivery_metadata,
         )
         response = outbound.content if outbound else ""
         result_holder.append(response)

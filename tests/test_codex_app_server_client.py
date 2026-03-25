@@ -139,6 +139,7 @@ for raw in sys.stdin:
     assert metadata["token_usage"]["total"]["totalTokens"] == 12
     assert [event["type"] for event in events] == ["tool_call", "tool_result", "agent_delta", "token_usage"]
     assert events[0]["tool"] == "echo"
+    assert events[1]["result_preview"] == "echo:hello"
     assert events[2]["delta"] == "final hello"
     await client.aclose()
 

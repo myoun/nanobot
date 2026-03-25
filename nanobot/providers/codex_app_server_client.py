@@ -661,6 +661,9 @@ class CodexAppServerClient:
         if method == "item/completed":
             item = params.get("item") or {}
             if isinstance(item, dict) and str(item.get("type") or "") == "dynamicToolCall":
+                content_items = item.get("contentItems")
+                if not isinstance(content_items, list):
+                    content_items = []
                 return {
                     "type": "tool_result",
                     "thread_id": accumulator.thread_id,
@@ -668,6 +671,8 @@ class CodexAppServerClient:
                     "call_id": str(item.get("id") or ""),
                     "tool": str(item.get("tool") or ""),
                     "success": bool(item.get("success")),
+                    "content_items": content_items,
+                    "result_preview": CodexAppServerClient._content_items_preview(content_items),
                 }
 
         if method == "thread/tokenUsage/updated":
@@ -679,6 +684,22 @@ class CodexAppServerClient:
             }
 
         return None
+
+    @staticmethod
+    def _content_items_preview(content_items: list[dict[str, Any]]) -> str:
+        parts: list[str] = []
+        for item in content_items:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "")
+            if item_type == "inputText":
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+                continue
+            if item_type == "inputImage":
+                parts.append("[image content]")
+        return "\n\n".join(parts).strip()
 
     def _fail_pending(self, exc: Exception) -> None:
         for future in self._pending.values():
