@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from nanobot.cli import onboard as onboard_wizard
 
 # Import functions to test
-from nanobot.cli.commands import _merge_missing_defaults
+from nanobot.cli.commands import _configure_codex_profile_on_onboard, _merge_missing_defaults
 from nanobot.cli.onboard import (
     _BACK_PRESSED,
     _configure_channel,
@@ -597,3 +597,96 @@ class TestRunOnboardExitBehavior:
 
         assert result.should_save is False
         assert events == ["summary", "pause"]
+
+    def test_main_menu_exposes_codex_settings(self, monkeypatch):
+        initial_config = Config()
+        responses = iter(
+            [
+                "[O] Codex",
+                "[X] Exit Without Saving",
+            ]
+        )
+        visited: list[str] = []
+
+        monkeypatch.setattr(onboard_wizard, "_show_main_menu_header", lambda: None)
+        monkeypatch.setattr(
+            onboard_wizard,
+            "questionary",
+            SimpleNamespace(select=lambda *_args, **_kwargs: SimpleNamespace(ask=lambda: next(responses))),
+        )
+        monkeypatch.setattr(
+            onboard_wizard,
+            "_configure_general_settings",
+            lambda _config, section: visited.append(section),
+        )
+
+        result = run_onboard(initial_config=initial_config)
+
+        assert result.should_save is False
+        assert visited == ["Codex"]
+
+
+class TestCodexOnboardSync:
+    def test_existing_true_setting_applies_without_prompt(self, monkeypatch, tmp_path):
+        config = Config()
+        config.codex.use_workspace_profile = True
+        calls: list[str] = []
+
+        class FakeManager:
+            def __init__(self, workspace, profile_name):
+                calls.append(f"init:{workspace}:{profile_name}")
+
+            def ensure_profile(self):
+                calls.append("ensure")
+
+            def remove_managed_profile(self):
+                calls.append("remove")
+                return False
+
+        def fail_confirm(*_args, **_kwargs):
+            raise AssertionError("confirm should not be called when setting already exists")
+
+        monkeypatch.setattr("nanobot.providers.codex_profile.CodexProfileManager", FakeManager)
+        monkeypatch.setattr("nanobot.cli.commands.typer.confirm", fail_confirm)
+
+        changed = _configure_codex_profile_on_onboard(
+            config,
+            tmp_path,
+            prompt_if_unset=True,
+        )
+
+        assert changed is False
+        assert "ensure" in calls
+        assert "remove" not in calls
+
+    def test_existing_false_setting_skips_prompt_and_removes_profile(self, monkeypatch, tmp_path):
+        config = Config()
+        config.codex.use_workspace_profile = False
+        calls: list[str] = []
+
+        class FakeManager:
+            def __init__(self, workspace, profile_name):
+                calls.append(f"init:{workspace}:{profile_name}")
+
+            def ensure_profile(self):
+                calls.append("ensure")
+
+            def remove_managed_profile(self):
+                calls.append("remove")
+                return True
+
+        def fail_confirm(*_args, **_kwargs):
+            raise AssertionError("confirm should not be called when setting already exists")
+
+        monkeypatch.setattr("nanobot.providers.codex_profile.CodexProfileManager", FakeManager)
+        monkeypatch.setattr("nanobot.cli.commands.typer.confirm", fail_confirm)
+
+        changed = _configure_codex_profile_on_onboard(
+            config,
+            tmp_path,
+            prompt_if_unset=True,
+        )
+
+        assert changed is False
+        assert "remove" in calls
+        assert "ensure" not in calls

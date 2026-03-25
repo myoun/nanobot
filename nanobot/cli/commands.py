@@ -482,8 +482,12 @@ def onboard(
 
     sync_workspace_templates(workspace_path)
 
-    if not wizard and sys.stdin.isatty() and sys.stdout.isatty():
-        _configure_codex_profile_on_onboard(runtime_config, workspace_path)
+    codex_config_changed = _configure_codex_profile_on_onboard(
+        runtime_config,
+        workspace_path,
+        prompt_if_unset=(not wizard and sys.stdin.isatty() and sys.stdout.isatty()),
+    )
+    if codex_config_changed:
         save_config(runtime_config, config_path)
 
     agent_cmd = 'nanobot agent -m "Hello!"'
@@ -546,29 +550,47 @@ def _onboard_plugins(config_path: Path) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def _configure_codex_profile_on_onboard(config: Config, workspace: Path) -> None:
-    """Ask whether nanobot should manage a workspace-local Codex profile."""
+def _configure_codex_profile_on_onboard(
+    config: Config,
+    workspace: Path,
+    *,
+    prompt_if_unset: bool,
+) -> bool:
+    """Apply or prompt for workspace-local Codex profile management.
+
+    Returns True when the config object was updated in-memory.
+    """
     from nanobot.providers.codex_profile import CodexProfileManager
 
+    apply_profile = config.codex.use_workspace_profile
+    changed = False
+
+    if apply_profile is None and prompt_if_unset:
+        apply_profile = typer.confirm(
+            "Apply nanobot-managed Codex profile for Codex App Server in this workspace?",
+            default=True,
+        )
+        config.codex.use_workspace_profile = apply_profile
+        changed = True
+
+    if apply_profile is None:
+        return changed
+
     manager = CodexProfileManager(workspace, profile_name=config.codex.profile_name)
-    apply_profile = typer.confirm(
-        "Apply nanobot-managed Codex profile for Codex App Server in this workspace?",
-        default=True,
-    )
-    config.codex.use_workspace_profile = apply_profile
     if apply_profile:
         manager.ensure_profile()
         console.print(
             f"[green]✓[/green] Enabled Codex workspace profile "
             f"[cyan]{config.codex.profile_name}[/cyan]"
         )
-        return
+        return changed
 
     removed = manager.remove_managed_profile()
     if removed:
         console.print("[green]✓[/green] Removed nanobot-managed Codex workspace profile files")
     else:
         console.print("[dim]Skipped Codex workspace profile setup[/dim]")
+    return changed
 
 
 def _make_provider(config: Config):
