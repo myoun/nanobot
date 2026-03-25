@@ -770,12 +770,22 @@ def _get_channel_config_class(channel: str) -> type[BaseModel] | None:
     return entry[1] if entry else None
 
 
+def _coerce_channel_config_model(current_value: Any, config_cls: type[BaseModel]) -> BaseModel:
+    """Normalize stored channel config into the config class used by the wizard."""
+    if current_value is None:
+        return config_cls()
+    if isinstance(current_value, config_cls):
+        return current_value.model_copy(deep=True)
+    if isinstance(current_value, BaseModel):
+        return config_cls.model_validate(current_value.model_dump(by_alias=True, exclude_none=False))
+    if isinstance(current_value, dict):
+        return config_cls.model_validate(current_value)
+    return config_cls.model_validate(current_value)
+
+
 def _configure_channel(config: Config, channel_name: str) -> None:
     """Configure a single channel."""
-    channel_dict = getattr(config.channels, channel_name, None)
-    if channel_dict is None:
-        channel_dict = {}
-        setattr(config.channels, channel_name, channel_dict)
+    channel_value = getattr(config.channels, channel_name, None)
 
     display_name = _get_channel_names().get(channel_name, channel_name)
     config_cls = _get_channel_config_class(channel_name)
@@ -784,15 +794,14 @@ def _configure_channel(config: Config, channel_name: str) -> None:
         console.print(f"[red]No configuration class found for {display_name}[/red]")
         return
 
-    model = config_cls.model_validate(channel_dict) if channel_dict else config_cls()
+    model = _coerce_channel_config_model(channel_value, config_cls)
 
     updated_channel = _configure_pydantic_model(
         model,
         display_name,
     )
     if updated_channel is not None:
-        new_dict = updated_channel.model_dump(by_alias=True, exclude_none=True)
-        setattr(config.channels, channel_name, new_dict)
+        setattr(config.channels, channel_name, updated_channel)
 
 
 def _configure_channels(config: Config) -> None:

@@ -18,6 +18,7 @@ from nanobot.cli import onboard as onboard_wizard
 from nanobot.cli.commands import _merge_missing_defaults
 from nanobot.cli.onboard import (
     _BACK_PRESSED,
+    _configure_channel,
     _configure_pydantic_model,
     _format_value,
     _get_field_display_name,
@@ -379,6 +380,69 @@ class TestProviderChannelInfo:
         for provider_name, value in info.items():
             assert isinstance(value, tuple)
             assert len(value) == 4  # (display_name, needs_api_key, needs_api_base, env_var)
+
+    def test_configure_channel_accepts_existing_schema_model_of_different_class(self, monkeypatch):
+        class ExistingConfig(BaseModel):
+            enabled: bool = True
+            token: str = "token-1"
+
+        class WizardConfig(BaseModel):
+            enabled: bool = False
+            token: str = ""
+            streaming: bool = True
+
+        class FakeChannels:
+            telegram = ExistingConfig()
+
+        class FakeConfig:
+            channels = FakeChannels()
+
+        captured: dict[str, Any] = {}
+
+        monkeypatch.setattr(onboard_wizard, "_get_channel_names", lambda: {"telegram": "Telegram"})
+        monkeypatch.setattr(onboard_wizard, "_get_channel_config_class", lambda _name: WizardConfig)
+
+        def fake_configure(model, _display_name):
+            captured["model"] = model
+            model.streaming = False
+            return model
+
+        monkeypatch.setattr(onboard_wizard, "_configure_pydantic_model", fake_configure)
+
+        config = FakeConfig()
+        _configure_channel(config, "telegram")
+
+        assert isinstance(captured["model"], WizardConfig)
+        assert captured["model"].enabled is True
+        assert captured["model"].token == "token-1"
+        assert isinstance(config.channels.telegram, WizardConfig)
+        assert config.channels.telegram.streaming is False
+
+    def test_config_schema_accepts_extended_telegram_fields(self):
+        config = Config.model_validate(
+            {
+                "channels": {
+                    "telegram": {
+                        "enabled": True,
+                        "token": "telegram-token",
+                        "reactEmoji": "eyes",
+                        "groupPolicy": "mention",
+                        "connectionPoolSize": 16,
+                        "poolTimeout": 3.5,
+                        "streaming": False,
+                    }
+                }
+            }
+        )
+
+        telegram = config.channels.telegram
+        assert telegram.enabled is True
+        assert telegram.token == "telegram-token"
+        assert telegram.react_emoji == "eyes"
+        assert telegram.group_policy == "mention"
+        assert telegram.connection_pool_size == 16
+        assert telegram.pool_timeout == 3.5
+        assert telegram.streaming is False
 
 
 class _SimpleDraftModel(BaseModel):

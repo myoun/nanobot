@@ -32,6 +32,11 @@ class TelegramConfig(Base):
         None  # HTTP/SOCKS5 proxy URL, e.g. "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
     )
     reply_to_message: bool = False  # If true, bot replies quote the original message
+    react_emoji: str = "👀"
+    group_policy: Literal["open", "mention"] = "mention"
+    connection_pool_size: int = 32
+    pool_timeout: float = 5.0
+    streaming: bool = True
 
 
 class FeishuConfig(Base):
@@ -43,6 +48,9 @@ class FeishuConfig(Base):
     encrypt_key: str = ""  # Encrypt Key for event subscription (optional)
     verification_token: str = ""  # Verification Token for event subscription (optional)
     allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
+    react_emoji: str = "THUMBSUP"
+    group_policy: Literal["open", "mention"] = "mention"
+    reply_to_message: bool = False
 
 
 class DingTalkConfig(Base):
@@ -62,6 +70,7 @@ class DiscordConfig(Base):
     allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs
     gateway_url: str = "wss://gateway.discord.gg/?v=10&encoding=json"
     intents: int = 37377  # GUILDS + GUILD_MESSAGES + DIRECT_MESSAGES + MESSAGE_CONTENT
+    group_policy: Literal["mention", "open"] = "mention"
 
 
 class EmailConfig(Base):
@@ -156,6 +165,8 @@ class SlackConfig(Base):
     user_token_read_only: bool = True
     reply_in_thread: bool = True
     react_emoji: str = "eyes"
+    done_emoji: str = "white_check_mark"
+    allow_from: list[str] = Field(default_factory=list)
     group_policy: str = "mention"  # "mention", "open", "allowlist"
     group_allow_from: list[str] = Field(default_factory=list)  # Allowed channel IDs if allowlist
     dm: SlackDMConfig = Field(default_factory=SlackDMConfig)
