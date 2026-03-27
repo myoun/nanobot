@@ -279,6 +279,7 @@ class HeartbeatConfig(Base):
 
     enabled: bool = True
     interval_s: int = 30 * 60  # 30 minutes
+    keep_recent_messages: int = 8
 
 
 class GatewayConfig(Base):
@@ -311,10 +312,6 @@ class ExecToolConfig(Base):
     timeout: int = 60
     path_append: str = ""  # Additional PATH entries appended for exec tool
     deny_patterns: list[str] | None = None
-    privileged_enabled: bool = False
-    privileged_socket: str = "/run/nanobot-privileged.sock"
-    approval_ttl_sec: int = 600
-    single_pending_per_chat: bool = True
 
 
 class MCPServerConfig(Base):

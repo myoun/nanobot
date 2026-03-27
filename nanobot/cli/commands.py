@@ -1,6 +1,7 @@
 """CLI commands for nanobot."""
 
 import asyncio
+import json
 import os
 import signal
 from pathlib import Path
@@ -168,206 +169,58 @@ def _is_exit_command(command: str) -> bool:
     return command.lower() in EXIT_COMMANDS
 
 
-def _configure_privileged_settings(
-    *,
-    socket: str,
-    approval_ttl_sec: int,
-    single_pending_per_chat: bool,
-    enabled: bool,
-) -> None:
-    """Persist privileged execution settings in config.json."""
-    from nanobot.config.loader import load_config, save_config
-
-    config = load_config()
-    exec_cfg = config.tools.exec
-    exec_cfg.privileged_enabled = enabled
-    exec_cfg.privileged_socket = socket
-    exec_cfg.approval_ttl_sec = max(60, approval_ttl_sec)
-    exec_cfg.single_pending_per_chat = single_pending_per_chat
-    save_config(config)
+def _contains_config_key(value: Any, key: str) -> bool:
+    if isinstance(value, dict):
+        if key in value:
+            return True
+        return any(_contains_config_key(item, key) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_config_key(item, key) for item in value)
+    return False
 
 
-def _default_socket_group() -> str | None:
-    """Best-effort socket group for non-root clients (Unix/Linux)."""
-    if os.name != "posix":
-        return None
+def _warn_deprecated_config_fields(config_path: Path | None) -> None:
+    if not config_path or not config_path.exists():
+        return
     try:
-        import grp
-        import pwd
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
     except Exception:
-        return None
-
-    sudo_user = os.environ.get("SUDO_USER")
-    if sudo_user:
-        try:
-            user = pwd.getpwnam(sudo_user)
-            return grp.getgrgid(user.pw_gid).gr_name
-        except Exception:
-            pass
-
-    try:
-        return grp.getgrgid(os.getgid()).gr_name
-    except Exception:
-        return None
+        return
+    if _contains_config_key(raw, "memoryWindow"):
+        print("Config field `memoryWindow` is no longer used and will be ignored.")
 
 
-def _resolve_socket_group(socket_group: str | None) -> str | None:
-    group = (socket_group or "").strip()
-    if group:
-        return group
-    return _default_socket_group()
-
-
-def _install_or_update_privileged_service(
+def _load_runtime_config(
     *,
-    socket: str,
-    audit_log: str,
-    socket_group: str | None = None,
-) -> tuple[bool, str]:
-    """Install/update and start systemd service for privileged runner."""
-    import shutil
-    import subprocess
+    workspace: str | None = None,
+    config: str | None = None,
+) -> tuple[Config, Path | None]:
+    from nanobot.config.loader import load_config, set_config_path
 
-    if os.name != "posix":
-        return False, "System service setup is only supported on Unix/Linux."
-
-    systemctl = shutil.which("systemctl")
-    if not systemctl:
-        return False, "systemctl not found. Install service manually."
-
-    if hasattr(os, "geteuid") and os.geteuid() != 0:
-        return False, (
-            "Root privileges required to install service. Run: sudo nanobot privileged setup"
-        )
-
-    unit_path = Path("/etc/systemd/system/nanobot-privileged.service")
-    runner_cmd = shutil.which("nanobot") or f"{sys.executable} -m nanobot"
-    group_arg = f" --socket-group {socket_group}" if socket_group else ""
-    unit = f"""[Unit]
-Description=nanobot privileged runner
-After=network.target
-
-[Service]
-Type=simple
-ExecStart={runner_cmd} privileged run --socket {socket} --audit-log {audit_log}{group_arg}
-Restart=on-failure
-RestartSec=2
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/run /var/log
-
-[Install]
-WantedBy=multi-user.target
-"""
-    unit_path.write_text(unit, encoding="utf-8")
-    subprocess.run([systemctl, "daemon-reload"], check=True)
-    subprocess.run([systemctl, "enable", "--now", "nanobot-privileged.service"], check=True)
-    active = subprocess.run(
-        [systemctl, "is-active", "nanobot-privileged.service"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if active.returncode == 0 and active.stdout.strip() == "active":
-        return True, "nanobot-privileged.service is active."
-    return (
-        False,
-        "Service installed but not active. Check: systemctl status nanobot-privileged.service",
-    )
+    config_path = Path(config).expanduser().resolve() if config else None
+    if config_path is not None:
+        set_config_path(config_path)
+    loaded = load_config(config_path)
+    _warn_deprecated_config_fields(config_path)
+    if workspace:
+        loaded.agents.defaults.workspace = str(Path(workspace).expanduser().resolve())
+    return loaded, config_path
 
 
-def _stop_privileged_service() -> tuple[bool, str]:
-    """Disable and stop systemd privileged runner service."""
-    import shutil
-    import subprocess
-
-    if os.name != "posix":
-        return False, "Service stop is only supported on Unix/Linux."
-    systemctl = shutil.which("systemctl")
-    if not systemctl:
-        return False, "systemctl not found."
-    if hasattr(os, "geteuid") and os.geteuid() != 0:
-        return (
-            False,
-            "Root privileges required. Run: sudo nanobot privileged disable --stop-service",
-        )
-
-    subprocess.run([systemctl, "disable", "--now", "nanobot-privileged.service"], check=False)
-    return True, "nanobot-privileged.service disabled/stopped."
+def _workspace_cron_store_path(config: Config) -> Path:
+    return config.workspace_path / "cron" / "jobs.json"
 
 
-def _launch_privileged_runner_daemon(
-    *,
-    socket: str,
-    audit_log: str,
-    daemon_log: str | None,
-    socket_group: str | None,
-) -> tuple[bool, str]:
-    """Launch privileged runner as a detached background process."""
-    import subprocess
-    import time
+def _migrate_cron_store(config: Config) -> None:
+    from nanobot.config.paths import get_cron_dir
 
-    log_path = Path(daemon_log) if daemon_log else Path(audit_log).with_suffix(".runner.log")
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_store = get_cron_dir() / "jobs.json"
+    workspace_store = _workspace_cron_store_path(config)
+    if workspace_store.exists() or not legacy_store.exists():
+        return
 
-    cmd = [
-        sys.executable,
-        "-m",
-        "nanobot",
-        "privileged",
-        "run",
-        "--socket",
-        socket,
-        "--audit-log",
-        audit_log,
-    ]
-    if socket_group:
-        cmd.extend(["--socket-group", socket_group])
-
-    with log_path.open("ab") as lf:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=lf,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
-        )
-
-    sock = Path(socket)
-    for _ in range(30):
-        if sock.exists():
-            return True, (
-                f"Started privileged runner in background (pid={proc.pid}). "
-                f"Socket: {socket}, log: {log_path}"
-            )
-        if proc.poll() is not None:
-            break
-        time.sleep(0.1)
-
-    if proc.poll() is not None:
-        tail = ""
-        try:
-            text = log_path.read_text(encoding="utf-8", errors="replace")
-            tail = text[-400:].strip()
-        except Exception:
-            tail = ""
-        detail = f" Last log: {tail}" if tail else ""
-        return False, f"Failed to start privileged runner daemon.{detail}"
-
-    return True, (
-        f"Started privileged runner in background (pid={proc.pid}), "
-        f"socket initialization is still in progress. Log: {log_path}"
-    )
-
-
-def _ensure_posix_for_privileged() -> None:
-    """Privileged runner is supported only on Unix/Linux."""
-    if os.name != "posix":
-        console.print("[red]Privileged execution is supported only on Unix/Linux.[/red]")
-        raise typer.Exit(1)
+    workspace_store.parent.mkdir(parents=True, exist_ok=True)
+    legacy_store.replace(workspace_store)
 
 
 async def _read_interactive_input_async() -> str:
@@ -506,7 +359,6 @@ def onboard(
     else:
         console.print("  1. Authenticate Codex: [cyan]nanobot codex login[/cyan]")
         console.print(f"  2. Chat: [cyan]{agent_cmd}[/cyan]")
-        console.print("  3. Optional privileged setup: [cyan]nanobot privileged setup[/cyan]")
     console.print(
         "\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]"
     )
@@ -644,12 +496,12 @@ def _apply_langsmith_config(config: Config) -> None:
 
 @app.command()
 def gateway(
-    port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
+    port: int | None = typer.Option(None, "--port", "-p", help="Gateway port"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """Start the nanobot gateway."""
-    from nanobot.config.loader import load_config
-    from nanobot.config.paths import get_data_dir
     from nanobot.bus.queue import MessageBus
     from nanobot.agent.loop import AgentLoop
     from nanobot.channels.manager import ChannelManager
@@ -657,23 +509,26 @@ def gateway(
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
+    from nanobot.config.paths import is_default_workspace
 
     if verbose:
         import logging
 
         logging.basicConfig(level=logging.DEBUG)
 
-    console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
-
-    config = load_config()
+    config, _ = _load_runtime_config(workspace=workspace, config=config)
+    resolved_port = port if port is not None else config.gateway.port
+    console.print(f"{__logo__} Starting nanobot gateway on port {resolved_port}...")
     sync_workspace_templates(config.workspace_path)
-    config.channels.web.port = port
+    config.channels.web.port = resolved_port
     bus = MessageBus()
     provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
 
     # Create cron service first (callback set after agent creation)
-    cron_store_path = get_data_dir() / "cron" / "jobs.json"
+    if is_default_workspace(config.workspace_path):
+        _migrate_cron_store(config)
+    cron_store_path = _workspace_cron_store_path(config)
     cron = CronService(cron_store_path)
 
     # Create agent with cron service
@@ -824,6 +679,8 @@ def gateway(
 def agent(
     message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
     session_id: str = typer.Option("cli:direct", "--session", "-s", help="Session ID"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
     markdown: bool = typer.Option(
         True, "--markdown/--no-markdown", help="Render assistant output as Markdown"
     ),
@@ -832,21 +689,22 @@ def agent(
     ),
 ):
     """Interact with the agent directly."""
-    from nanobot.config.loader import load_config
-    from nanobot.config.paths import get_data_dir
     from nanobot.bus.queue import MessageBus
     from nanobot.agent.loop import AgentLoop
     from nanobot.cron.service import CronService
+    from nanobot.config.paths import is_default_workspace
     from loguru import logger
 
-    config = load_config()
+    config, _ = _load_runtime_config(workspace=workspace, config=config)
     sync_workspace_templates(config.workspace_path)
 
     bus = MessageBus()
     provider = _make_provider(config)
 
     # Create cron service for tool usage (no callback needed for CLI unless running)
-    cron_store_path = get_data_dir() / "cron" / "jobs.json"
+    if is_default_workspace(config.workspace_path):
+        _migrate_cron_store(config)
+    cron_store_path = _workspace_cron_store_path(config)
     cron = CronService(cron_store_path)
 
     if logs:
@@ -895,7 +753,7 @@ def agent(
         # Single message mode
         async def run_once():
             with _thinking_ctx():
-                outbound = await agent_loop.process_direct_message(
+                outbound = await agent_loop.process_direct(
                     message,
                     session_id,
                     on_progress=_cli_progress,
@@ -938,7 +796,7 @@ def agent(
                             break
 
                         with _thinking_ctx():
-                            outbound = await agent_loop.process_direct_message(
+                            outbound = await agent_loop.process_direct(
                                 user_input,
                                 session_id,
                                 on_progress=_cli_progress,
@@ -1075,10 +933,16 @@ def _get_bridge_dir() -> Path:
 
 
 @channels_app.command("login")
-def channels_login():
+def channels_login(
+    channel: str = typer.Argument(..., help="Channel name to log in"),
+):
     """Link device via QR code."""
     import subprocess
     from nanobot.config.loader import load_config
+
+    if channel.lower() != "whatsapp":
+        console.print(f"[red]Channel login is not supported for {channel}.[/red]")
+        raise typer.Exit(1)
 
     config = load_config()
     bridge_dir = _get_bridge_dir()
@@ -1338,191 +1202,6 @@ def cron_run(
 # ============================================================================
 # Status Commands
 # ============================================================================
-
-
-privileged_app = typer.Typer(help="Manage privileged runner")
-app.add_typer(privileged_app, name="privileged")
-
-
-@privileged_app.command("setup")
-def privileged_setup(
-    socket: str = typer.Option("/run/nanobot-privileged.sock", "--socket", help="Unix socket path"),
-    audit_log: str = typer.Option(
-        "/var/log/nanobot-privileged.log", "--audit-log", help="Audit log JSONL path"
-    ),
-    socket_group: str | None = typer.Option(
-        None,
-        "--socket-group",
-        help="Group for privileged socket access (default: auto-detect invoking user group).",
-    ),
-    approval_ttl_sec: int = typer.Option(600, "--approval-ttl-sec", help="Approval TTL in seconds"),
-    install_service: bool = typer.Option(
-        True,
-        "--install-service/--no-install-service",
-        help="Install and start systemd service (requires root).",
-    ),
-):
-    """Configure privileged execution and optionally install system service."""
-    _ensure_posix_for_privileged()
-
-    try:
-        _configure_privileged_settings(
-            socket=socket,
-            approval_ttl_sec=approval_ttl_sec,
-            single_pending_per_chat=True,
-            enabled=True,
-        )
-        console.print("[green]✓[/green] Config updated: privileged execution enabled.")
-    except OSError as e:
-        console.print(f"[red]Failed to update config: {e}[/red]")
-        raise typer.Exit(1)
-
-    if not install_service:
-        console.print("[dim]Skipped service installation.[/dim]")
-        return
-
-    resolved_group = _resolve_socket_group(socket_group)
-    if resolved_group:
-        console.print(f"[dim]Privileged socket group: {resolved_group}[/dim]")
-    else:
-        console.print(
-            "[yellow]Could not auto-detect socket group; default ownership will be used.[/yellow]"
-        )
-
-    ok, msg = _install_or_update_privileged_service(
-        socket=socket,
-        audit_log=audit_log,
-        socket_group=resolved_group,
-    )
-    if ok:
-        console.print(f"[green]✓[/green] {msg}")
-    else:
-        console.print(f"[yellow]{msg}[/yellow]")
-
-
-@privileged_app.command("disable")
-def privileged_disable(
-    stop_service: bool = typer.Option(
-        False,
-        "--stop-service",
-        help="Also stop/disable systemd service (requires root).",
-    ),
-):
-    """Disable approval-gated privileged execution in config."""
-    _ensure_posix_for_privileged()
-
-    from nanobot.config.loader import load_config, save_config
-
-    try:
-        config = load_config()
-        config.tools.exec.privileged_enabled = False
-        save_config(config)
-        console.print("[green]✓[/green] Config updated: privileged execution disabled.")
-    except OSError as e:
-        console.print(f"[red]Failed to update config: {e}[/red]")
-        raise typer.Exit(1)
-
-    if stop_service:
-        ok, msg = _stop_privileged_service()
-        if ok:
-            console.print(f"[green]✓[/green] {msg}")
-        else:
-            console.print(f"[yellow]{msg}[/yellow]")
-
-
-@privileged_app.command("run")
-def privileged_run(
-    socket: str = typer.Option("/run/nanobot-privileged.sock", "--socket", help="Unix socket path"),
-    audit_log: str = typer.Option(
-        "/var/log/nanobot-privileged.log", "--audit-log", help="Audit log JSONL path"
-    ),
-    socket_group: str | None = typer.Option(
-        None,
-        "--socket-group",
-        help="Group for privileged socket access (default: auto-detect invoking user group).",
-    ),
-    daemon: bool = typer.Option(
-        False,
-        "-d",
-        "--daemon",
-        help="Run in background and return immediately.",
-    ),
-    daemon_log: str | None = typer.Option(
-        None,
-        "--daemon-log",
-        help="Detached process stdout/stderr log path (used with -d).",
-    ),
-):
-    """Run privileged runner (should be started with root privileges)."""
-    _ensure_posix_for_privileged()
-
-    from nanobot.privileged.runner import PrivilegedRunner
-
-    resolved_group = _resolve_socket_group(socket_group)
-    if daemon:
-        ok, msg = _launch_privileged_runner_daemon(
-            socket=socket,
-            audit_log=audit_log,
-            daemon_log=daemon_log,
-            socket_group=resolved_group,
-        )
-        if ok:
-            console.print(f"[green]✓[/green] {msg}")
-            return
-        console.print(f"[red]{msg}[/red]")
-        raise typer.Exit(1)
-
-    console.print(f"{__logo__} Starting privileged runner")
-    console.print(f"Socket: {socket}")
-    console.print(f"Audit log: {audit_log}")
-    if resolved_group:
-        console.print(f"Socket group: {resolved_group}")
-    runner = PrivilegedRunner(
-        socket_path=socket,
-        audit_log_path=audit_log,
-        socket_group=resolved_group,
-    )
-    asyncio.run(runner.serve())
-
-
-@privileged_app.command("status")
-def privileged_status(
-    socket: str | None = typer.Option(
-        None,
-        "--socket",
-        help="Unix socket path (defaults to configured privilegedSocket)",
-    ),
-):
-    """Check privileged runner socket status."""
-    _ensure_posix_for_privileged()
-
-    from nanobot.config.loader import load_config
-
-    cfg = load_config().tools.exec
-    console.print(f"Configured privilegedEnabled: {cfg.privileged_enabled}")
-    console.print(f"Configured privilegedSocket: {cfg.privileged_socket}")
-    console.print(f"Configured approvalTtlSec: {cfg.approval_ttl_sec}")
-
-    resolved_socket = socket or cfg.privileged_socket
-    sock = Path(resolved_socket)
-    console.print(f"Checking socket: {sock}")
-    if sock.exists():
-        console.print(f"[green]✓[/green] Socket exists: {sock}")
-        try:
-            import grp
-            import pwd
-            import stat as statmod
-
-            st = sock.stat()
-            owner = pwd.getpwuid(st.st_uid).pw_name
-            group = grp.getgrgid(st.st_gid).gr_name
-            mode = statmod.S_IMODE(st.st_mode)
-            console.print(f"Socket permissions: {oct(mode)} {owner}:{group}")
-        except Exception:
-            pass
-    else:
-        console.print(f"[red]✗[/red] Socket not found: {sock}")
-
 
 @app.command()
 def status():

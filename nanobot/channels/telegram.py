@@ -285,8 +285,6 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(CommandHandler("help", self._on_help))
         self._app.add_handler(CommandHandler("model", self._forward_command))
         self._app.add_handler(CommandHandler("routing", self._forward_command))
-        self._app.add_handler(CommandHandler("approve", self._forward_command))
-        self._app.add_handler(CommandHandler("deny", self._forward_command))
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
             MessageHandler(

@@ -132,7 +132,3 @@ def register_builtin_commands(router: CommandRouter) -> None:
     """Register the default set of slash commands."""
     router.priority("/stop", cmd_stop)
     router.priority("/restart", cmd_restart)
-    router.priority("/status", cmd_status)
-    router.exact("/new", cmd_new)
-    router.exact("/status", cmd_status)
-    router.exact("/help", cmd_help)

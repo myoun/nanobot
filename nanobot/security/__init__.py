@@ -1,4 +1,4 @@
-"""Security utilities for network safety and approval-gated execution."""
+"""Security utilities for network safety."""
 
 from nanobot.security.network import (
     contains_internal_url,
