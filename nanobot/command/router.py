@@ -41,6 +41,25 @@ class CommandRouter:
         self._prefix: list[tuple[str, Handler]] = []
         self._interceptors: list[Handler] = []
 
+    @staticmethod
+    def _normalize(text: str) -> str:
+        """Normalize Telegram-style /command@bot syntax to plain /command."""
+        raw = text.strip()
+        if not raw:
+            return raw
+
+        parts = raw.split(maxsplit=1)
+        head = parts[0]
+        tail = parts[1] if len(parts) > 1 else ""
+
+        if head.startswith("/") and "@" in head:
+            head = head.split("@", 1)[0]
+
+        normalized = head
+        if tail:
+            normalized += f" {tail}"
+        return normalized
+
     def priority(self, cmd: str, handler: Handler) -> None:
         self._priority[cmd] = handler
 
@@ -55,17 +74,20 @@ class CommandRouter:
         self._interceptors.append(handler)
 
     def is_priority(self, text: str) -> bool:
-        return text.strip().lower() in self._priority
+        return self._normalize(text).lower() in self._priority
 
     async def dispatch_priority(self, ctx: CommandContext) -> OutboundMessage | None:
         """Dispatch a priority command. Called from run() without the lock."""
-        handler = self._priority.get(ctx.raw.lower())
+        normalized = self._normalize(ctx.raw)
+        handler = self._priority.get(normalized.lower())
         if handler:
+            ctx.raw = normalized
             return await handler(ctx)
         return None
 
     async def dispatch(self, ctx: CommandContext) -> OutboundMessage | None:
         """Try exact, prefix, then interceptors. Returns None if unhandled."""
+        ctx.raw = self._normalize(ctx.raw)
         cmd = ctx.raw.lower()
 
         if handler := self._exact.get(cmd):

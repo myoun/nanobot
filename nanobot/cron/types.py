@@ -45,6 +45,7 @@ class CronJobState:
     last_run_at_ms: int | None = None
     last_status: Literal["ok", "error", "skipped"] | None = None
     last_error: str | None = None
+    lease_until_ms: int | None = None
     run_history: list[CronRunRecord] = field(default_factory=list)
 
 

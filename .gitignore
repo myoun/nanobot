@@ -27,3 +27,4 @@ tests/*
 !tests/test_agent_loop_app_server.py
 !tests/test_session_file_artifacts.py
 !tests/test_session_search_index.py
+!tests/test_cron_service.py

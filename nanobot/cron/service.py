@@ -1,9 +1,12 @@
 """Cron service for scheduling agent tasks."""
 
 import asyncio
+import copy
+import os
 import json
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Coroutine
@@ -11,6 +14,11 @@ from typing import Any, Callable, Coroutine
 from loguru import logger
 
 from nanobot.cron.types import CronJob, CronJobState, CronPayload, CronRunRecord, CronSchedule, CronStore
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Unix cron workers use fcntl
+    fcntl = None
 
 
 def _now_ms() -> int:
@@ -64,6 +72,7 @@ class CronService:
     """Service for managing and executing scheduled jobs."""
 
     _MAX_RUN_HISTORY = 20
+    _RUN_LEASE_MS = 15 * 60 * 1000
 
     def __init__(
         self,
@@ -76,6 +85,32 @@ class CronService:
         self._last_mtime: float = 0.0
         self._timer_task: asyncio.Task | None = None
         self._running = False
+
+    @property
+    def _lock_path(self) -> Path:
+        return self.store_path.with_name(f"{self.store_path.name}.lock")
+
+    @staticmethod
+    def _has_active_lease(job: CronJob, now_ms: int) -> bool:
+        return bool(job.state.lease_until_ms and now_ms < job.state.lease_until_ms)
+
+    @contextmanager
+    def _store_lock(self):
+        self.store_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock_path.touch(exist_ok=True)
+        lock_fd = os.open(self._lock_path, os.O_RDWR)
+        try:
+            if fcntl is not None:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            self._store = None
+            self._last_mtime = 0.0
+            yield
+        finally:
+            self._store = None
+            self._last_mtime = 0.0
+            if fcntl is not None:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
 
     def _load_store(self) -> CronStore:
         """Load jobs from disk. Reloads automatically if file was modified externally."""
@@ -115,6 +150,7 @@ class CronService:
                             last_run_at_ms=j.get("state", {}).get("lastRunAtMs"),
                             last_status=j.get("state", {}).get("lastStatus"),
                             last_error=j.get("state", {}).get("lastError"),
+                            lease_until_ms=j.get("state", {}).get("leaseUntilMs"),
                             run_history=[
                                 CronRunRecord(
                                     run_at_ms=r["runAtMs"],
@@ -171,6 +207,7 @@ class CronService:
                         "lastRunAtMs": j.state.last_run_at_ms,
                         "lastStatus": j.state.last_status,
                         "lastError": j.state.last_error,
+                        "leaseUntilMs": j.state.lease_until_ms,
                         "runHistory": [
                             {
                                 "runAtMs": r.run_at_ms,
@@ -221,9 +258,73 @@ class CronService:
         """Get the earliest next run time across all jobs."""
         if not self._store:
             return None
-        times = [j.state.next_run_at_ms for j in self._store.jobs
-                 if j.enabled and j.state.next_run_at_ms]
+        now = _now_ms()
+        times = [
+            j.state.lease_until_ms if self._has_active_lease(j, now) else j.state.next_run_at_ms
+            for j in self._store.jobs
+            if j.enabled and (j.state.next_run_at_ms or self._has_active_lease(j, now))
+        ]
         return min(times) if times else None
+
+    def _claim_due_jobs(self, now_ms: int) -> list[CronJob]:
+        """Claim due jobs so only one process executes each run."""
+        claimed: list[CronJob] = []
+        with self._store_lock():
+            store = self._load_store()
+            dirty = False
+            for job in store.jobs:
+                if not job.enabled or not job.state.next_run_at_ms or now_ms < job.state.next_run_at_ms:
+                    continue
+                if self._has_active_lease(job, now_ms):
+                    continue
+                job.state.lease_until_ms = now_ms + self._RUN_LEASE_MS
+                claimed.append(copy.deepcopy(job))
+                dirty = True
+            if dirty:
+                self._save_store()
+        return claimed
+
+    def _finalize_job_run(
+        self,
+        job_id: str,
+        start_ms: int,
+        end_ms: int,
+        status: str,
+        error: str | None,
+    ) -> None:
+        """Persist the result of a claimed job run."""
+        with self._store_lock():
+            store = self._load_store()
+            job = next((item for item in store.jobs if item.id == job_id), None)
+            if not job:
+                return
+
+            job.state.last_status = status
+            job.state.last_error = error
+            job.state.last_run_at_ms = start_ms
+            job.state.lease_until_ms = None
+            job.updated_at_ms = end_ms
+
+            job.state.run_history.append(CronRunRecord(
+                run_at_ms=start_ms,
+                status=status,
+                duration_ms=end_ms - start_ms,
+                error=error,
+            ))
+            job.state.run_history = job.state.run_history[-self._MAX_RUN_HISTORY:]
+
+            if job.schedule.kind == "at":
+                if job.delete_after_run:
+                    store.jobs = [item for item in store.jobs if item.id != job.id]
+                else:
+                    job.enabled = False
+                    job.state.next_run_at_ms = None
+            else:
+                job.state.next_run_at_ms = _compute_next_run(job.schedule, end_ms)
+
+            self._save_store()
+
+        self._arm_timer()
 
     def _arm_timer(self) -> None:
         """Schedule the next timer tick."""
@@ -246,62 +347,31 @@ class CronService:
 
     async def _on_timer(self) -> None:
         """Handle timer tick - run due jobs."""
-        self._load_store()
-        if not self._store:
-            return
-
         now = _now_ms()
-        due_jobs = [
-            j for j in self._store.jobs
-            if j.enabled and j.state.next_run_at_ms and now >= j.state.next_run_at_ms
-        ]
+        due_jobs = self._claim_due_jobs(now)
+        self._arm_timer()
 
         for job in due_jobs:
             await self._execute_job(job)
-
-        self._save_store()
-        self._arm_timer()
 
     async def _execute_job(self, job: CronJob) -> None:
         """Execute a single job."""
         start_ms = _now_ms()
         logger.info("Cron: executing job '{}' ({})", job.name, job.id)
 
+        status = "ok"
+        error: str | None = None
         try:
             if self.on_job:
                 await self.on_job(job)
-
-            job.state.last_status = "ok"
-            job.state.last_error = None
             logger.info("Cron: job '{}' completed", job.name)
-
         except Exception as e:
-            job.state.last_status = "error"
-            job.state.last_error = str(e)
+            status = "error"
+            error = str(e)
             logger.error("Cron: job '{}' failed: {}", job.name, e)
 
         end_ms = _now_ms()
-        job.state.last_run_at_ms = start_ms
-        job.updated_at_ms = end_ms
-
-        job.state.run_history.append(CronRunRecord(
-            run_at_ms=start_ms,
-            status=job.state.last_status,
-            duration_ms=end_ms - start_ms,
-            error=job.state.last_error,
-        ))
-        job.state.run_history = job.state.run_history[-self._MAX_RUN_HISTORY:]
-
-        # Handle one-shot jobs
-        if job.schedule.kind == "at":
-            if job.delete_after_run:
-                self._store.jobs = [j for j in self._store.jobs if j.id != job.id]
-            else:
-                job.enabled = False
-                job.state.next_run_at_ms = None
-        else:
-            # Compute next run
-            job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+        self._finalize_job_run(job.id, start_ms, end_ms, status, error)
 
     # ========== Public API ==========
 
