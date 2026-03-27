@@ -128,6 +128,8 @@ class _TurnAccumulator:
 class CodexAppServerClient:
     """Minimal JSON-RPC client for `codex app-server --listen stdio://`."""
 
+    _STDIO_LIMIT = 4 * 1024 * 1024
+
     def __init__(
         self,
         *,
@@ -226,6 +228,7 @@ class CodexAppServerClient:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=self._STDIO_LIMIT,
                 cwd=self.cwd,
             )
             self._reader_task = asyncio.create_task(self._reader_loop())

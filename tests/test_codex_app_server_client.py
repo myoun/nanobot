@@ -193,6 +193,91 @@ for raw in sys.stdin:
 
 
 @pytest.mark.asyncio
+async def test_codex_app_server_client_handles_large_jsonl_notifications(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "fake_large_event_server.py"
+    script.write_text(
+        """
+import json
+import sys
+
+thread_id = "thread-large"
+turn_id = "turn-large"
+
+for raw in sys.stdin:
+    msg = json.loads(raw)
+    method = msg.get("method")
+    request_id = msg.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "unix", "platformOs": "linux"}}), flush=True)
+    elif method == "initialized":
+        continue
+    elif method == "thread/start":
+        print(json.dumps({"id": request_id, "result": {"thread": {"id": thread_id}}}), flush=True)
+    elif method == "turn/start":
+        print(json.dumps({"id": request_id, "result": {"turn": {"id": turn_id, "status": "inProgress", "items": [], "error": None}}}), flush=True)
+        print(json.dumps({"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "inProgress", "items": [], "error": None}}}), flush=True)
+        print(json.dumps({"method": "item/tool/call", "id": 9, "params": {"threadId": thread_id, "turnId": turn_id, "callId": "call-large", "tool": "echo", "arguments": {"text": "payload"}}}), flush=True)
+    elif request_id == 9:
+        print(json.dumps({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": "dynamicToolCall", "id": "call-large", "tool": "echo", "arguments": {"text": "payload"}, "status": "completed", "contentItems": msg["result"]["contentItems"], "success": msg["result"]["success"]}}}), flush=True)
+        print(json.dumps({"method": "item/started", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": "agentMessage", "id": "msg-large", "text": "", "phase": "final_answer"}}}), flush=True)
+        print(json.dumps({"method": "item/agentMessage/delta", "params": {"threadId": thread_id, "turnId": turn_id, "itemId": "msg-large", "delta": "large response ok"}}), flush=True)
+        print(json.dumps({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": "agentMessage", "id": "msg-large", "text": "large response ok", "phase": "final_answer"}}}), flush=True)
+        print(json.dumps({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "items": [], "error": None}}}), flush=True)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    client = CodexAppServerClient(
+        command=[sys.executable, str(script)],
+        cwd=tmp_path,
+        client_name="pytest",
+        client_title="pytest",
+        client_version="0",
+    )
+    thread_id = await client.ensure_thread(
+        thread_id=None,
+        dynamic_tools=[{
+            "name": "echo",
+            "description": "Echo input text",
+            "inputSchema": EchoTool().parameters,
+        }],
+        developer_instructions="Use the echo tool before answering.",
+        cwd=str(tmp_path),
+    )
+
+    large_text = "x" * 80_000
+
+    async def exec_tool(name: str, args: dict[str, object]) -> dict[str, object]:
+        assert name == "echo"
+        assert args == {"text": "payload"}
+        return {"contentItems": [{"type": "inputText", "text": large_text}], "success": True}
+
+    events: list[dict[str, object]] = []
+
+    async def on_event(event: dict[str, object]) -> None:
+        events.append(event)
+
+    turn_id, final_text, tools_used, metadata = await client.run_turn(
+        thread_id=thread_id,
+        input_items=[{"type": "text", "text": "Send a large tool result", "text_elements": []}],
+        tool_executor=exec_tool,
+        event_callback=on_event,
+        cwd=str(tmp_path),
+    )
+
+    assert thread_id == "thread-large"
+    assert turn_id == "turn-large"
+    assert final_text == "large response ok"
+    assert tools_used == ["echo"]
+    assert metadata == {}
+    assert [event["type"] for event in events] == ["tool_call", "tool_result", "agent_delta"]
+    assert len(str(events[1]["result_preview"])) == 80_000
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_openai_codex_app_server_provider_uses_dynamic_tools_and_filters_complete_task(
     tmp_path: Path,
 ) -> None:
