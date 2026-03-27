@@ -369,6 +369,12 @@ class AgentLoop:
             return override
         return self.routing_enabled
 
+    def _tool_hints_enabled(self, session: Session) -> bool:
+        override = session.metadata.get("tool_hints_enabled")
+        if isinstance(override, bool):
+            return override
+        return True
+
     async def _get_provider_runtime_status(self) -> dict[str, Any]:
         """Fetch best-effort provider runtime status when supported."""
         getter = getattr(self.provider, "get_runtime_status", None)
@@ -534,6 +540,7 @@ class AgentLoop:
         lines.append(
             f"Routing: {'enabled' if self._request_routing_enabled(session) else 'disabled'}"
         )
+        lines.append(f"Tool hints: {'enabled' if self._tool_hints_enabled(session) else 'disabled'}")
         if fixed_session_mode:
             lines.append(f"Session: {session.id or '(unsaved)'}")
             lines.append(f"Session key: {session.key}")
@@ -2122,6 +2129,58 @@ class AgentLoop:
                 chat_id=msg.chat_id,
                 content="Usage: /routing on | /routing off | /routing reset",
             )
+        if cmd_name == "/toolhint":
+            session = self._refresh_session(session)
+            parts = raw_cmd.split(maxsplit=1)
+            current_enabled = self._tool_hints_enabled(session)
+            override = session.metadata.get("tool_hints_enabled")
+            if len(parts) == 1:
+                lines = [
+                    f"Tool hints: {'enabled' if current_enabled else 'disabled'}",
+                    "Default: enabled",
+                    (
+                        f"Session override: {'enabled' if override else 'disabled'}"
+                        if isinstance(override, bool)
+                        else "Session override: none"
+                    ),
+                    "Usage: /toolhint on | /toolhint off | /toolhint reset",
+                ]
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="\n".join(lines),
+                )
+
+            requested = parts[1].strip().lower()
+            if requested in {"on", "enable", "enabled"}:
+                session.metadata["tool_hints_enabled"] = True
+                self.sessions.save(session)
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Enabled tool hints for this session.",
+                )
+            if requested in {"off", "disable", "disabled"}:
+                session.metadata["tool_hints_enabled"] = False
+                self.sessions.save(session)
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Disabled tool hints for this session.",
+                )
+            if requested in {"reset", "default"}:
+                session.metadata.pop("tool_hints_enabled", None)
+                self.sessions.save(session)
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Cleared the session tool-hint override. Using default: enabled.",
+                )
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="Usage: /toolhint on | /toolhint off | /toolhint reset",
+            )
         if cmd_name == "/status":
             session = self._refresh_session(session)
             lines = await self._build_status_lines(
@@ -2191,6 +2250,7 @@ class AgentLoop:
                         "/new - Clear current fixed session history\n"
                         "/model - Show or change the current fixed session model\n"
                         "/routing - Toggle intent/execution routing for this session\n"
+                        "/toolhint - Toggle tool usage hints for this session\n"
                         "/status - Show current model, session, and Codex limits\n"
                         "/rebase - Start a fresh Codex thread for the current fixed session\n"
                         "/help - Show available commands"
@@ -2204,6 +2264,7 @@ class AgentLoop:
                     "/new - Start a new session in this conversation\n"
                     "/model - Show or change the current session model\n"
                     "/routing - Toggle intent/execution routing for this session\n"
+                    "/toolhint - Toggle tool usage hints for this session\n"
                     "/status - Show current model, session, and Codex limits\n"
                     "/rebase - Start a fresh Codex thread for the current session\n"
                         "/session list - List sessions in this conversation\n"
@@ -2292,7 +2353,25 @@ class AgentLoop:
                 )
             )
 
-        progress_cb = on_progress or _bus_progress
+        raw_progress_cb = on_progress or _bus_progress
+
+        async def progress_cb(content: str = "", *, tool_hint: str | None = None) -> None:
+            if tool_hint and not self._tool_hints_enabled(session):
+                tool_hint = None
+            if not content and not tool_hint:
+                return
+            try:
+                await raw_progress_cb(content, tool_hint=tool_hint)
+                return
+            except TypeError:
+                pass
+
+            text = (content or "").strip()
+            if not text and tool_hint:
+                text = tool_hint.strip()
+            if not text:
+                return
+            await raw_progress_cb(text)
 
         if self._uses_app_server_runtime():
             final_content, tools_used, llm_metadata = await self._run_app_server_primary_turn(

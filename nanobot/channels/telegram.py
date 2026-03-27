@@ -197,6 +197,7 @@ class TelegramChannel(BaseChannel):
         BotCommand("stop", "Stop the current task"),
         BotCommand("model", "Show or change the current model"),
         BotCommand("routing", "Toggle intent/execution routing"),
+        BotCommand("toolhint", "Toggle tool usage hints"),
         BotCommand("status", "Show current session and Codex status"),
         BotCommand("help", "Show available commands"),
         BotCommand("restart", "Restart the bot"),
@@ -285,6 +286,7 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(CommandHandler("help", self._on_help))
         self._app.add_handler(CommandHandler("model", self._forward_command))
         self._app.add_handler(CommandHandler("routing", self._forward_command))
+        self._app.add_handler(CommandHandler("toolhint", self._forward_command))
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
             MessageHandler(
@@ -564,6 +566,7 @@ class TelegramChannel(BaseChannel):
             "/stop — Stop the current task\n"
             "/model — Show or change the current model\n"
             "/routing — Toggle intent/execution routing\n"
+            "/toolhint — Toggle tool usage hints\n"
             "/restart — Restart the bot\n"
             "/status — Show current session and Codex status\n"
             "/help — Show available commands"

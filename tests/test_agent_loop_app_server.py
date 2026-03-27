@@ -446,6 +446,7 @@ async def test_status_command_reports_session_limits_and_context_window(
         assert response is not None
         assert "Model: openai-codex/gpt-5.1-codex" in response.content
         assert "Routing: enabled" in response.content
+        assert "Tool hints: enabled" in response.content
         assert "Session: " in response.content
         assert "Conversation: cli:status-info" in response.content
         assert "App Server thread: thread-status-1" in response.content
@@ -454,6 +455,55 @@ async def test_status_command_reports_session_limits_and_context_window(
         assert "5h limit: 42% used" in response.content
         assert "Weekly limit: 18% used" in response.content
         assert "Context left: ~94% (187,200 / 200,000 tokens remaining in auto-compact budget" in response.content
+    finally:
+        await loop.close_mcp()
+
+
+@pytest.mark.asyncio
+async def test_toolhint_command_hides_app_server_tool_progress_for_session(
+    tmp_path: Path,
+) -> None:
+    fake_client = FakeAppServerClient()
+    provider = OpenAICodexAppServerProvider(
+        default_model="openai-codex/gpt-5.1-codex",
+        workspace=tmp_path,
+        app_server_client=fake_client,  # type: ignore[arg-type]
+    )
+    loop = _make_loop(tmp_path, provider)
+
+    async def fake_classify(session, user_text):
+        return "TASK", "OPTIONAL", "test classifier"
+
+    loop._classify_request = fake_classify  # type: ignore[method-assign]
+
+    try:
+        disable_response = await loop._process_message(
+            InboundMessage(
+                channel="cli",
+                sender_id="user",
+                chat_id="toolhint-progress",
+                content="/toolhint off",
+            )
+        )
+
+        assert disable_response is not None
+        assert disable_response.content == "Disabled tool hints for this session."
+
+        response = await loop._process_message(
+            InboundMessage(
+                channel="cli",
+                sender_id="user",
+                chat_id="toolhint-progress",
+                content="continue",
+            )
+        )
+
+        assert response is not None
+        assert response.content == "final answer from app server"
+        progress = await loop.bus.consume_outbound()
+        assert progress.content == "agent-browser 스킬로 직접 확인한다."
+        assert progress.metadata["_progress"] is True
+        assert loop.bus.outbound_size == 0
     finally:
         await loop.close_mcp()
 

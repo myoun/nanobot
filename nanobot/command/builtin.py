@@ -116,6 +116,7 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
         "/stop — Stop the current task",
         "/model — Show or change the current model",
         "/routing — Toggle intent/execution routing",
+        "/toolhint — Toggle tool usage hints",
         "/restart — Restart the bot",
         "/status — Show current session and Codex status",
         "/help — Show available commands",
