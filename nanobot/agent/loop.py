@@ -173,6 +173,7 @@ class AgentLoop:
         self.tools = ToolRegistry()
 
         self._running = False
+        self._restart_requested = False
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
@@ -586,6 +587,20 @@ class AgentLoop:
         session.metadata.pop("app_server_model", None)
         return had_binding
 
+    @staticmethod
+    def _is_stale_app_server_thread_error(exc: Exception) -> bool:
+        """Whether an App Server error indicates the saved remote thread is gone."""
+        message = str(exc or "").strip().lower()
+        if not message:
+            return False
+        markers = (
+            "no rollout found for thread id",
+            "thread not found",
+            "unknown thread",
+            "invalid thread",
+        )
+        return any(marker in message for marker in markers)
+
     async def _run_app_server_primary_turn(
         self,
         *,
@@ -598,24 +613,27 @@ class AgentLoop:
         active_model = self._resolve_session_model(session)
         existing_thread_id = str(session.metadata.get("app_server_thread_id") or "").strip() or None
         history = session.get_history(max_messages=self.memory_window)
-        working_set_path = None
-        working_set_text = ""
-        if existing_thread_id is None and (
-            session.messages or session.summary.strip() or session.title.strip()
-        ):
-            working_set_path, working_set_text = self.sessions.artifacts.load_working_set(session)
-        input_items = self.context.build_app_server_turn_input(
-            current_message=msg.content,
-            history=history,
-            media=msg.media if msg.media else None,
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-            bootstrap_history=existing_thread_id is None and bool(history),
-            working_set_text=working_set_text,
-            working_set_path=str(working_set_path) if working_set_path else None,
-        )
         progress_buffer = ""
         progress_phase = ""
+
+        def _build_input_items(*, thread_id: str | None) -> list[dict[str, Any]]:
+            working_set_path = None
+            working_set_text = ""
+            should_bootstrap = thread_id is None
+            if should_bootstrap and (
+                session.messages or session.summary.strip() or session.title.strip()
+            ):
+                working_set_path, working_set_text = self.sessions.artifacts.load_working_set(session)
+            return self.context.build_app_server_turn_input(
+                current_message=msg.content,
+                history=history,
+                media=msg.media if msg.media else None,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                bootstrap_history=should_bootstrap and bool(history),
+                working_set_text=working_set_text,
+                working_set_path=str(working_set_path) if working_set_path else None,
+            )
 
         def _should_flush_progress(text: str, *, force: bool) -> bool:
             if not text:
@@ -690,17 +708,36 @@ class AgentLoop:
                 await _flush_progress(force=False)
                 return
 
-        result = await self.provider.run_app_server_turn(
-            thread_id=existing_thread_id,
-            input_items=input_items,
-            tools=self.tools,
-            developer_instructions=self.context.build_app_server_prompt(),
-            event_callback=_app_server_event,
-            cwd=str(self.workspace),
-            model=active_model,
-            reasoning_effort=self.reasoning_effort,
-            exclude_tool_names=[self._COMPLETE_TOOL_NAME],
-        )
+        async def _execute_turn(thread_id: str | None):
+            return await self.provider.run_app_server_turn(
+                thread_id=thread_id,
+                input_items=_build_input_items(thread_id=thread_id),
+                tools=self.tools,
+                developer_instructions=self.context.build_app_server_prompt(),
+                event_callback=_app_server_event,
+                cwd=str(self.workspace),
+                model=active_model,
+                reasoning_effort=self.reasoning_effort,
+                exclude_tool_names=[self._COMPLETE_TOOL_NAME],
+            )
+
+        try:
+            result = await _execute_turn(existing_thread_id)
+        except Exception as exc:
+            if not existing_thread_id or not self._is_stale_app_server_thread_error(exc):
+                raise
+            logger.warning(
+                "App Server thread {} is stale for session {}. Retrying with a fresh thread.",
+                existing_thread_id,
+                session.key,
+            )
+            progress_buffer = ""
+            progress_phase = ""
+            self._clear_app_server_binding(session)
+            self.sessions.save(session)
+            if on_progress:
+                await on_progress("Remote Codex thread expired. Starting a fresh thread...")
+            result = await _execute_turn(None)
         await _flush_progress(force=True)
         session.metadata["app_server_thread_id"] = result.thread_id
         session.metadata["app_server_last_turn_id"] = result.turn_id
@@ -1107,6 +1144,36 @@ class AgentLoop:
 
         merged["_nanobot"] = nanobot_meta
         return merged
+
+    @staticmethod
+    def _merge_message_metadata(
+        base: dict[str, Any] | None,
+        override: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Merge channel metadata while preserving nested nanobot traces."""
+        merged = dict(base or {})
+        if not override:
+            return merged
+
+        for key, value in override.items():
+            if key == "_nanobot" and isinstance(merged.get(key), dict) and isinstance(value, dict):
+                merged[key] = {**merged[key], **value}
+            else:
+                merged[key] = value
+        return merged
+
+    def _inherit_outbound_context(
+        self,
+        msg: InboundMessage,
+        response: OutboundMessage | None,
+    ) -> OutboundMessage | None:
+        """Carry channel reply context from the inbound message into a response."""
+        if response is None:
+            return None
+
+        if response.channel == msg.channel and response.chat_id == msg.chat_id:
+            response.metadata = self._merge_message_metadata(msg.metadata, response.metadata)
+        return response
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -1806,7 +1873,7 @@ class AgentLoop:
                 ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, loop=self)
                 result = await self.commands.dispatch_priority(ctx)
                 if result:
-                    await self.bus.publish_outbound(result)
+                    await self.bus.publish_outbound(self._inherit_outbound_context(msg, result))
                 continue
 
             asyncio.create_task(self._dispatch(msg))
@@ -1865,6 +1932,17 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
 
+    def request_restart(self) -> None:
+        """Ask the outer runtime to shut down and restart this process."""
+        self._restart_requested = True
+        self._running = False
+        logger.info("Agent loop restart requested")
+
+    @property
+    def restart_requested(self) -> bool:
+        """Whether a graceful restart has been requested."""
+        return self._restart_requested
+
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -1904,7 +1982,22 @@ class AgentLoop:
             loop=self,
         )
         if result := await self.commands.dispatch(command_ctx):
-            return result
+            return self._inherit_outbound_context(msg, result)
+
+        def respond(
+            *,
+            content: str,
+            metadata: dict[str, Any] | None = None,
+        ) -> OutboundMessage:
+            return self._inherit_outbound_context(
+                msg,
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=content,
+                    metadata=metadata or {},
+                ),
+            )
 
         # Handle slash commands
         raw_cmd = msg.content.strip()
@@ -1927,20 +2020,14 @@ class AgentLoop:
                     archive_all=True,
                 )
                 if not archive_ok:
-                    return OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
+                    return respond(
                         content="Failed to archive fixed session history. Session was left unchanged.",
                     )
                 self._clear_app_server_binding(session)
                 session.clear()
                 self.sessions.save(session)
                 self._consolidation_scheduled_counts.pop(session.key, None)
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                content="Cleared fixed session history.",
-                )
+                return respond(content="Cleared fixed session history.")
 
             if self._uses_app_server_runtime():
                 created = self.sessions.create_session(conversation_key, switch_to=True)
@@ -1948,11 +2035,7 @@ class AgentLoop:
                     f"New session started. Switched to session {created['id']}. "
                     "The previous session remains available in local session artifacts."
                 )
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content=content,
-                )
+                return respond(content=content)
 
             temp_session = Session(
                 key=session.key,
@@ -1965,41 +2048,29 @@ class AgentLoop:
                 archive_all=True,
             )
             if not archive_ok:
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
+                return respond(
                     content="Failed to archive current session. New session was not created.",
                 )
 
             created = self.sessions.create_session(conversation_key, switch_to=True)
             content = f"New session started. Switched to session {created['id']}."
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=content,
-            )
+            return respond(content=content)
         if cmd_name == "/rebase":
             if not self._uses_app_server_runtime():
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
+                return respond(
                     content="Rebase is only available when nanobot is using Codex App Server.",
                 )
             session = self._refresh_session(session)
             had_remote_thread = self._clear_app_server_binding(session)
             self.sessions.save(session)
             if had_remote_thread:
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
+                return respond(
                     content=(
                         "Cleared the current App Server thread binding. "
                         "The next turn will start a fresh Codex thread from local working set and recent history."
                     ),
                 )
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
+            return respond(
                 content="This session is already detached from any remote App Server thread.",
             )
         if cmd_name == "/model":
@@ -2017,40 +2088,28 @@ class AgentLoop:
                     lines.append("Session override: none")
                 lines.append("Usage: /model <name> | /model reset")
                 lines.append(f"Scope: {scope}")
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content="\n".join(lines),
-                )
+                return respond(content="\n".join(lines))
 
             requested = parts[1].strip()
             if not requested:
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
+                return respond(
                     content="Usage: /model <name> | /model reset",
                 )
 
             if requested.lower() in {"reset", "default"}:
                 if not override_model:
-                    return OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
+                    return respond(
                         content=f"This session is already using the default model: {base_model}",
                     )
                 session.metadata.pop("model_override", None)
                 self.sessions.save(session)
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
+                return respond(
                     content=f"Reset this session to the default model: {base_model}.",
                 )
 
             normalized_model = self._normalize_model_name(requested)
             if not normalized_model:
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
+                return respond(
                     content="Usage: /model <name> | /model reset",
                 )
 
@@ -2058,9 +2117,7 @@ class AgentLoop:
                 if normalized_model == base_model:
                     session.metadata.pop("model_override", None)
                     self.sessions.save(session)
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
+                return respond(
                     content=f"This session is already using {normalized_model}.",
                 )
 
@@ -2069,9 +2126,7 @@ class AgentLoop:
             else:
                 session.metadata["model_override"] = normalized_model
             self.sessions.save(session)
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
+            return respond(
                 content=f"Switched this session to model {normalized_model}.",
             )
         if cmd_name == "/routing":
@@ -2090,43 +2145,31 @@ class AgentLoop:
                     ),
                     "Usage: /routing on | /routing off | /routing reset",
                 ]
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content="\n".join(lines),
-                )
+                return respond(content="\n".join(lines))
 
             requested = parts[1].strip().lower()
             if requested in {"on", "enable", "enabled"}:
                 session.metadata["routing_enabled"] = True
                 self.sessions.save(session)
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
+                return respond(
                     content="Enabled intent/execution routing for this session.",
                 )
             if requested in {"off", "disable", "disabled"}:
                 session.metadata["routing_enabled"] = False
                 self.sessions.save(session)
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
+                return respond(
                     content="Disabled intent/execution routing for this session.",
                 )
             if requested in {"reset", "default"}:
                 session.metadata.pop("routing_enabled", None)
                 self.sessions.save(session)
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
+                return respond(
                     content=(
                         "Cleared the session routing override. "
                         f"Using default: {'enabled' if self.routing_enabled else 'disabled'}."
                     ),
                 )
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
+            return respond(
                 content="Usage: /routing on | /routing off | /routing reset",
             )
         if cmd_name == "/toolhint":
@@ -2145,40 +2188,28 @@ class AgentLoop:
                     ),
                     "Usage: /toolhint on | /toolhint off | /toolhint reset",
                 ]
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content="\n".join(lines),
-                )
+                return respond(content="\n".join(lines))
 
             requested = parts[1].strip().lower()
             if requested in {"on", "enable", "enabled"}:
                 session.metadata["tool_hints_enabled"] = True
                 self.sessions.save(session)
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
+                return respond(
                     content="Enabled tool hints for this session.",
                 )
             if requested in {"off", "disable", "disabled"}:
                 session.metadata["tool_hints_enabled"] = False
                 self.sessions.save(session)
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
+                return respond(
                     content="Disabled tool hints for this session.",
                 )
             if requested in {"reset", "default"}:
                 session.metadata.pop("tool_hints_enabled", None)
                 self.sessions.save(session)
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
+                return respond(
                     content="Cleared the session tool-hint override. Using default: enabled.",
                 )
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
+            return respond(
                 content="Usage: /toolhint on | /toolhint off | /toolhint reset",
             )
         if cmd_name == "/status":
@@ -2188,16 +2219,10 @@ class AgentLoop:
                 conversation_key=conversation_key,
                 fixed_session_mode=fixed_session_mode,
             )
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content="\n".join(lines),
-            )
+            return respond(content="\n".join(lines))
         if cmd_name == "/session":
             if fixed_session_mode:
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
+                return respond(
                     content="Session management commands are unavailable in fixed-session mode.",
                 )
             parts = msg.content.strip().split()
@@ -2208,43 +2233,29 @@ class AgentLoop:
                     marker = "*" if item["id"] == snapshot["active_session_id"] else "-"
                     title = str(item.get("title") or "(untitled)")
                     lines.append(f"{marker} {item['id']} {title}")
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content="\n".join(lines),
-                )
+                return respond(content="\n".join(lines))
             if len(parts) >= 3 and parts[1].lower() == "switch":
                 try:
                     switched = self.sessions.switch_session(conversation_key, parts[2])
                 except ValueError as exc:
-                    return OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
+                    return respond(
                         content=str(exc),
                     )
                 title = str(switched.get("title") or "(untitled)")
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
+                return respond(
                     content=f"Switched to session {switched['id']} ({title}).",
                 )
             if len(parts) >= 2 and parts[1].lower() == "new":
                 created = self.sessions.create_session(conversation_key, switch_to=True)
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
+                return respond(
                     content=f"Created and switched to session {created['id']}.",
                 )
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
+            return respond(
                 content="Usage: /session list | /session new | /session switch <id>",
             )
         if cmd_name == "/help":
             if fixed_session_mode:
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
+                return respond(
                     content=(
                         "nanobot fixed-session mode:\n"
                         "/new - Clear current fixed session history\n"
@@ -2256,9 +2267,7 @@ class AgentLoop:
                         "/help - Show available commands"
                     ),
                 )
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
+            return respond(
                 content=(
                     "nanobot commands:\n"
                     "/new - Start a new session in this conversation\n"
@@ -2304,9 +2313,7 @@ class AgentLoop:
                     "request_execution": request_execution,
                 },
             )
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
+            return respond(
                 content=final_content,
                 metadata=outbound_metadata,
             )
@@ -2698,10 +2705,13 @@ Respond with ONLY valid JSON, no markdown fences."""
         except Exception as e:
             logger.error("Error processing message for session {}: {}", msg.session_key, e)
             await self.bus.publish_outbound(
-                OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content=f"Sorry, I encountered an error: {e}",
+                self._inherit_outbound_context(
+                    msg,
+                    OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=f"Sorry, I encountered an error: {e}",
+                    ),
                 )
             )
         finally:

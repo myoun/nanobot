@@ -73,6 +73,7 @@ class CronService:
 
     _MAX_RUN_HISTORY = 20
     _RUN_LEASE_MS = 15 * 60 * 1000
+    _STORE_POLL_INTERVAL_MS = 5 * 1000
 
     def __init__(
         self,
@@ -256,12 +257,13 @@ class CronService:
 
     def _get_next_wake_ms(self) -> int | None:
         """Get the earliest next run time across all jobs."""
-        if not self._store:
+        store = self._load_store()
+        if not store:
             return None
         now = _now_ms()
         times = [
             j.state.lease_until_ms if self._has_active_lease(j, now) else j.state.next_run_at_ms
-            for j in self._store.jobs
+            for j in store.jobs
             if j.enabled and (j.state.next_run_at_ms or self._has_active_lease(j, now))
         ]
         return min(times) if times else None
@@ -328,20 +330,34 @@ class CronService:
 
     def _arm_timer(self) -> None:
         """Schedule the next timer tick."""
-        if self._timer_task:
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        if self._timer_task and self._timer_task is not current_task:
             self._timer_task.cancel()
 
-        next_wake = self._get_next_wake_ms()
-        if not next_wake or not self._running:
+        if not self._running:
+            if self._timer_task is current_task:
+                self._timer_task = None
             return
 
-        delay_ms = max(0, next_wake - _now_ms())
+        next_wake = self._get_next_wake_ms()
+        if next_wake is None:
+            delay_ms = self._STORE_POLL_INTERVAL_MS
+        else:
+            delay_ms = max(0, next_wake - _now_ms())
+            delay_ms = min(delay_ms, self._STORE_POLL_INTERVAL_MS)
         delay_s = delay_ms / 1000
 
         async def tick():
-            await asyncio.sleep(delay_s)
-            if self._running:
-                await self._on_timer()
+            try:
+                await asyncio.sleep(delay_s)
+                if self._running:
+                    await self._on_timer()
+            finally:
+                if self._timer_task is asyncio.current_task():
+                    self._timer_task = None
 
         self._timer_task = asyncio.create_task(tick())
 
@@ -361,10 +377,16 @@ class CronService:
 
         status = "ok"
         error: str | None = None
+        cancelled = False
         try:
             if self.on_job:
                 await self.on_job(job)
             logger.info("Cron: job '{}' completed", job.name)
+        except asyncio.CancelledError:
+            status = "error"
+            error = "cancelled"
+            cancelled = True
+            logger.warning("Cron: job '{}' was cancelled", job.name)
         except Exception as e:
             status = "error"
             error = str(e)
@@ -372,6 +394,8 @@ class CronService:
 
         end_ms = _now_ms()
         self._finalize_job_run(job.id, start_ms, end_ms, status, error)
+        if cancelled:
+            raise asyncio.CancelledError
 
     # ========== Public API ==========
 

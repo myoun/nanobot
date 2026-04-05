@@ -188,6 +188,15 @@ class CodexAppServerClient:
                 profile_name,
             )
 
+        codex_home = os.environ.get("CODEX_HOME", "").strip()
+        if codex_home:
+            env_fallback = Path(codex_home).expanduser() / "bin" / "wsl" / "codex"
+            if env_fallback.exists():
+                return CodexAppServerClient._inject_profile(
+                    [str(env_fallback), "app-server", "--listen", "stdio://"],
+                    profile_name,
+                )
+
         fallback = Path.home() / ".codex" / "bin" / "wsl" / "codex"
         if fallback.exists():
             return CodexAppServerClient._inject_profile(

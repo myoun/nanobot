@@ -207,20 +207,75 @@ def _load_runtime_config(
     return loaded, config_path
 
 
-def _workspace_cron_store_path(config: Config) -> Path:
-    return config.workspace_path / "cron" / "jobs.json"
-
-
-def _migrate_cron_store(config: Config) -> None:
+def _cron_store_path() -> Path:
     from nanobot.config.paths import get_cron_dir
 
-    legacy_store = get_cron_dir() / "jobs.json"
-    workspace_store = _workspace_cron_store_path(config)
-    if workspace_store.exists() or not legacy_store.exists():
+    return get_cron_dir() / "jobs.json"
+
+
+def _migrate_workspace_cron_store(config: Config) -> None:
+    """Merge legacy workspace cron data into the canonical instance store."""
+    workspace_store = config.workspace_path / "cron" / "jobs.json"
+    target_store = _cron_store_path()
+    if not workspace_store.exists():
         return
 
-    workspace_store.parent.mkdir(parents=True, exist_ok=True)
-    legacy_store.replace(workspace_store)
+    if not target_store.exists():
+        target_store.parent.mkdir(parents=True, exist_ok=True)
+        workspace_store.replace(target_store)
+        return
+
+    try:
+        workspace_doc = json.loads(workspace_store.read_text(encoding="utf-8"))
+        target_doc = json.loads(target_store.read_text(encoding="utf-8"))
+    except Exception:
+        return
+
+    workspace_jobs = workspace_doc.get("jobs")
+    target_jobs = target_doc.get("jobs")
+    if not isinstance(workspace_jobs, list) or not isinstance(target_jobs, list):
+        return
+
+    merged_jobs: list[dict[str, Any]] = []
+    merged_index: dict[str, int] = {}
+    for raw_job in target_jobs:
+        if not isinstance(raw_job, dict):
+            continue
+        job_id = raw_job.get("id")
+        if not isinstance(job_id, str) or not job_id:
+            continue
+        merged_index[job_id] = len(merged_jobs)
+        merged_jobs.append(raw_job)
+
+    for raw_job in workspace_jobs:
+        if not isinstance(raw_job, dict):
+            continue
+        job_id = raw_job.get("id")
+        if not isinstance(job_id, str) or not job_id:
+            continue
+        existing_idx = merged_index.get(job_id)
+        if existing_idx is None:
+            merged_index[job_id] = len(merged_jobs)
+            merged_jobs.append(raw_job)
+            continue
+        existing = merged_jobs[existing_idx]
+        existing_updated = existing.get("updatedAtMs")
+        incoming_updated = raw_job.get("updatedAtMs")
+        if not isinstance(existing_updated, int):
+            existing_updated = -1
+        if not isinstance(incoming_updated, int):
+            incoming_updated = -1
+        if incoming_updated >= existing_updated:
+            merged_jobs[existing_idx] = raw_job
+
+    version = target_doc.get("version", workspace_doc.get("version", 1))
+    if not isinstance(version, int):
+        version = 1
+    target_store.write_text(
+        json.dumps({"version": version, "jobs": merged_jobs}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    workspace_store.unlink(missing_ok=True)
 
 
 async def _read_interactive_input_async() -> str:
@@ -509,8 +564,6 @@ def gateway(
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
-    from nanobot.config.paths import is_default_workspace
-
     if verbose:
         import logging
 
@@ -526,9 +579,8 @@ def gateway(
     session_manager = SessionManager(config.workspace_path)
 
     # Create cron service first (callback set after agent creation)
-    if is_default_workspace(config.workspace_path):
-        _migrate_cron_store(config)
-    cron_store_path = _workspace_cron_store_path(config)
+    _migrate_workspace_cron_store(config)
+    cron_store_path = _cron_store_path()
     cron = CronService(cron_store_path)
 
     # Create agent with cron service
@@ -559,14 +611,38 @@ def gateway(
             delivery_channel,
             job.payload.to,
         )
-        outbound = await agent.process_direct(
-            job.payload.message,
-            session_key=f"cron:{job.id}",
-            channel=delivery_channel,
-            chat_id=delivery_chat_id,
-            metadata=delivery_metadata,
+        # Run scheduled turns in an isolated AgentLoop so cron work cannot stall
+        # behind the gateway's shared inbound-processing lock.
+        cron_provider = _make_provider(config)
+        cron_agent = AgentLoop(
+            bus=bus,
+            provider=cron_provider,
+            workspace=config.workspace_path,
+            model=config.agents.defaults.model,
+            temperature=config.agents.defaults.temperature,
+            max_tokens=config.agents.defaults.max_tokens,
+            max_iterations=config.agents.defaults.max_tool_iterations,
+            context_window_tokens=config.agents.defaults.context_window_tokens,
+            reasoning_effort=config.agents.defaults.reasoning_effort,
+            routing_enabled=config.agents.defaults.intent_execution_routing_enabled,
+            brave_api_key=config.tools.web.search.api_key or None,
+            exec_config=config.tools.exec,
+            cron_service=cron,
+            restrict_to_workspace=config.tools.restrict_to_workspace,
+            session_manager=session_manager,
+            mcp_servers=config.tools.mcp_servers,
         )
-        response = outbound.content if outbound else ""
+        try:
+            outbound = await cron_agent.process_direct(
+                job.payload.message,
+                session_key=f"cron:{job.id}",
+                channel=delivery_channel,
+                chat_id=delivery_chat_id,
+                metadata=delivery_metadata,
+            )
+            response = outbound.content if outbound else ""
+        finally:
+            await cron_agent.close_mcp()
         if job.payload.deliver and job.payload.to:
             await bus.publish_outbound(
                 OutboundMessage(
@@ -651,21 +727,40 @@ def gateway(
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
 
     async def run():
+        agent_task: asyncio.Task[Any] | None = None
+        channels_task: asyncio.Task[Any] | None = None
         try:
             await cron.start()
             await heartbeat.start()
-            await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
+            agent_task = asyncio.create_task(agent.run())
+            channels_task = asyncio.create_task(channels.start_all())
+
+            done, _pending = await asyncio.wait(
+                {agent_task, channels_task},
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            for task in done:
+                if task.cancelled():
+                    continue
+                exc = task.exception()
+                if exc is not None:
+                    raise exc
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         finally:
-            await agent.close_mcp()
             heartbeat.stop()
             cron.stop()
             agent.stop()
+            if agent.restart_requested:
+                await channels.drain_outbound(timeout=1.0)
             await channels.stop_all()
+            for task in (agent_task, channels_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            pending_tasks = [task for task in (agent_task, channels_task) if task is not None]
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+            await agent.close_mcp()
 
     asyncio.run(run())
 
@@ -692,7 +787,6 @@ def agent(
     from nanobot.bus.queue import MessageBus
     from nanobot.agent.loop import AgentLoop
     from nanobot.cron.service import CronService
-    from nanobot.config.paths import is_default_workspace
     from loguru import logger
 
     config, _ = _load_runtime_config(workspace=workspace, config=config)
@@ -702,9 +796,8 @@ def agent(
     provider = _make_provider(config)
 
     # Create cron service for tool usage (no callback needed for CLI unless running)
-    if is_default_workspace(config.workspace_path):
-        _migrate_cron_store(config)
-    cron_store_path = _workspace_cron_store_path(config)
+    _migrate_workspace_cron_store(config)
+    cron_store_path = _cron_store_path()
     cron = CronService(cron_store_path)
 
     if logs:
@@ -975,10 +1068,9 @@ def cron_list(
     all: bool = typer.Option(False, "--all", "-a", help="Include disabled jobs"),
 ):
     """List scheduled jobs."""
-    from nanobot.config.paths import get_data_dir
     from nanobot.cron.service import CronService
 
-    store_path = get_data_dir() / "cron" / "jobs.json"
+    store_path = _cron_store_path()
     service = CronService(store_path)
 
     jobs = service.list_jobs(include_disabled=all)
@@ -1045,7 +1137,6 @@ def cron_add(
     ),
 ):
     """Add a scheduled job."""
-    from nanobot.config.paths import get_data_dir
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronSchedule
 
@@ -1067,7 +1158,7 @@ def cron_add(
         console.print("[red]Error: Must specify --every, --cron, or --at[/red]")
         raise typer.Exit(1)
 
-    store_path = get_data_dir() / "cron" / "jobs.json"
+    store_path = _cron_store_path()
     service = CronService(store_path)
 
     try:
@@ -1091,10 +1182,9 @@ def cron_remove(
     job_id: str = typer.Argument(..., help="Job ID to remove"),
 ):
     """Remove a scheduled job."""
-    from nanobot.config.paths import get_data_dir
     from nanobot.cron.service import CronService
 
-    store_path = get_data_dir() / "cron" / "jobs.json"
+    store_path = _cron_store_path()
     service = CronService(store_path)
 
     if service.remove_job(job_id):
@@ -1109,10 +1199,9 @@ def cron_enable(
     disable: bool = typer.Option(False, "--disable", help="Disable instead of enable"),
 ):
     """Enable or disable a job."""
-    from nanobot.config.paths import get_data_dir
     from nanobot.cron.service import CronService
 
-    store_path = get_data_dir() / "cron" / "jobs.json"
+    store_path = _cron_store_path()
     service = CronService(store_path)
 
     job = service.enable_job(job_id, enabled=not disable)
@@ -1131,7 +1220,6 @@ def cron_run(
     """Manually run a job."""
     from loguru import logger
     from nanobot.config.loader import load_config
-    from nanobot.config.paths import get_data_dir
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.bus.queue import MessageBus
@@ -1144,7 +1232,7 @@ def cron_run(
     provider = _make_provider(config)
     bus = MessageBus()
 
-    store_path = get_data_dir() / "cron" / "jobs.json"
+    store_path = _cron_store_path()
     service = CronService(store_path)
     agent_loop = AgentLoop(
         bus=bus,

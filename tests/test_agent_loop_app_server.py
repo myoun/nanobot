@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -139,6 +140,18 @@ class FakeAppServerClient:
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+class StaleThreadAppServerClient(FakeAppServerClient):
+    async def ensure_thread(self, **kwargs: Any) -> str:
+        self.ensure_thread_calls.append(kwargs)
+        thread_id = kwargs.get("thread_id")
+        if thread_id:
+            raise RuntimeError(
+                "{'code': -32600, 'message': 'no rollout found for thread id "
+                f"{thread_id}'}}"
+            )
+        return "thread-fresh-456"
 
 
 def _make_loop(workspace: Path, provider: OpenAICodexAppServerProvider) -> AgentLoop:
@@ -384,6 +397,78 @@ async def test_rebase_clears_remote_thread_binding_but_keeps_session_history(
 
 
 @pytest.mark.asyncio
+async def test_stale_app_server_thread_binding_retries_with_fresh_thread(
+    tmp_path: Path,
+) -> None:
+    fake_client = StaleThreadAppServerClient()
+    provider = OpenAICodexAppServerProvider(
+        default_model="openai-codex/gpt-5.1-codex",
+        workspace=tmp_path,
+        app_server_client=fake_client,  # type: ignore[arg-type]
+    )
+    loop = _make_loop(tmp_path, provider)
+
+    async def fake_classify(session, user_text):
+        return "TASK", "OPTIONAL", "test classifier"
+
+    loop._classify_request = fake_classify  # type: ignore[method-assign]
+
+    session = loop.sessions.get_active_session("cli:stale-thread")
+    session.title = "Stale thread recovery"
+    session.summary = "Recover the prior Codex context if the remote thread disappears."
+    session.metadata["app_server_thread_id"] = "thread-stale-123"
+    session.metadata["app_server_last_turn_id"] = "turn-stale-123"
+    session.add_message("user", "First preserved turn.")
+    session.add_message("assistant", "Acknowledged the first turn.")
+    session.add_message("user", "Second preserved turn.")
+    session.add_message("assistant", "Captured the second turn.")
+    session.add_message("user", "Third preserved turn.")
+    session.add_message("assistant", "Captured the third turn.")
+    loop.sessions.save(session)
+
+    try:
+        response = await loop._process_message(
+            InboundMessage(
+                channel="cli",
+                sender_id="user",
+                chat_id="stale-thread",
+                content="continue after stale thread",
+            )
+        )
+
+        assert response is not None
+        assert response.content == "final answer from app server"
+        assert len(fake_client.ensure_thread_calls) == 2
+        assert fake_client.ensure_thread_calls[0]["thread_id"] == "thread-stale-123"
+        assert fake_client.ensure_thread_calls[1]["thread_id"] is None
+        assert fake_client.run_turn_calls[-1]["thread_id"] == "thread-fresh-456"
+        input_items = fake_client.run_turn_calls[-1]["input_items"]
+        working_set_items = [
+            item for item in input_items
+            if item["type"] == "text" and "[Local Session Working Set]" in item["text"]
+        ]
+        history_items = [
+            item for item in input_items
+            if item["type"] == "text" and "[Local Session Bootstrap]" in item["text"]
+        ]
+        assert working_set_items
+        assert history_items
+        assert "Recover the prior Codex context if the remote thread disappears." in working_set_items[0]["text"]
+        assert "Third preserved turn." in history_items[0]["text"]
+        assert "continue after stale thread" not in history_items[0]["text"]
+
+        progress = await loop.bus.consume_outbound()
+        assert progress.content == "Remote Codex thread expired. Starting a fresh thread..."
+        assert progress.metadata["_progress"] is True
+
+        refreshed = loop.sessions.get_active_session("cli:stale-thread")
+        assert refreshed.metadata["app_server_thread_id"] == "thread-fresh-456"
+        assert refreshed.messages[-1]["content"] == "final answer from app server"
+    finally:
+        await loop.close_mcp()
+
+
+@pytest.mark.asyncio
 async def test_model_command_reports_current_session_model(
     tmp_path: Path,
 ) -> None:
@@ -505,6 +590,91 @@ async def test_toolhint_command_hides_app_server_tool_progress_for_session(
         assert progress.metadata["_progress"] is True
         assert loop.bus.outbound_size == 0
     finally:
+        await loop.close_mcp()
+
+
+@pytest.mark.asyncio
+async def test_toolhint_command_preserves_slack_thread_metadata(
+    tmp_path: Path,
+) -> None:
+    fake_client = FakeAppServerClient()
+    provider = OpenAICodexAppServerProvider(
+        default_model="openai-codex/gpt-5.1-codex",
+        workspace=tmp_path,
+        app_server_client=fake_client,  # type: ignore[arg-type]
+    )
+    loop = _make_loop(tmp_path, provider)
+    thread_ts = "1743235200.123456"
+
+    try:
+        response = await loop._process_message(
+            InboundMessage(
+                channel="slack",
+                sender_id="user",
+                chat_id="C123",
+                content="/toolhint off",
+                metadata={
+                    "slack": {
+                        "thread_ts": thread_ts,
+                        "channel_type": "channel",
+                        "event": {"ts": thread_ts},
+                    }
+                },
+                session_key_override=f"slack:C123:{thread_ts}",
+            )
+        )
+
+        assert response is not None
+        assert response.content == "Disabled tool hints for this session."
+        assert response.metadata["slack"]["thread_ts"] == thread_ts
+        assert response.metadata["slack"]["channel_type"] == "channel"
+    finally:
+        await loop.close_mcp()
+
+
+@pytest.mark.asyncio
+async def test_restart_priority_command_preserves_slack_thread_metadata(
+    tmp_path: Path,
+) -> None:
+    fake_client = FakeAppServerClient()
+    provider = OpenAICodexAppServerProvider(
+        default_model="openai-codex/gpt-5.1-codex",
+        workspace=tmp_path,
+        app_server_client=fake_client,  # type: ignore[arg-type]
+    )
+    loop = _make_loop(tmp_path, provider)
+    thread_ts = "1743235200.123456"
+    run_task = asyncio.create_task(loop.run())
+
+    try:
+        await loop.bus.publish_inbound(
+            InboundMessage(
+                channel="slack",
+                sender_id="user",
+                chat_id="C123",
+                content="/restart",
+                metadata={
+                    "slack": {
+                        "thread_ts": thread_ts,
+                        "channel_type": "channel",
+                        "event": {"ts": thread_ts},
+                    }
+                },
+                session_key_override=f"slack:C123:{thread_ts}",
+            )
+        )
+
+        response = await asyncio.wait_for(loop.bus.consume_outbound(), timeout=2)
+
+        assert response.content == "Restart requested. Shutting down..."
+        assert response.metadata["slack"]["thread_ts"] == thread_ts
+        assert response.metadata["slack"]["channel_type"] == "channel"
+        await asyncio.wait_for(run_task, timeout=2)
+        assert loop.restart_requested is True
+    finally:
+        if not run_task.done():
+            loop.stop()
+            await asyncio.wait_for(run_task, timeout=2)
         await loop.close_mcp()
 
 

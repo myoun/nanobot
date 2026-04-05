@@ -458,6 +458,31 @@ def test_codex_app_server_default_command_injects_profile() -> None:
     assert command == ["codex", "--profile", "nanobot", "app-server", "--listen", "stdio://"]
 
 
+def test_codex_app_server_default_command_uses_codex_home_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / ".codex-home"
+    codex_bin = codex_home / "bin" / "wsl"
+    codex_bin.mkdir(parents=True)
+    codex_path = codex_bin / "codex"
+    codex_path.write_text("", encoding="utf-8")
+    monkeypatch.delenv("NANOBOT_CODEX_APP_SERVER_COMMAND", raising=False)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+
+    command = CodexAppServerClient._default_command(profile_name="nanobot")
+
+    assert command == [
+        str(codex_path),
+        "--profile",
+        "nanobot",
+        "app-server",
+        "--listen",
+        "stdio://",
+    ]
+
+
 def test_codex_app_server_client_can_skip_workspace_profile_injection(tmp_path: Path) -> None:
     client = CodexAppServerClient(
         command=["codex", "app-server", "--listen", "stdio://"],

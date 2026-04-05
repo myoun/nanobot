@@ -110,6 +110,15 @@ class ChannelManager:
             except Exception as e:
                 logger.error("Error stopping {}: {}", name, e)
 
+    async def drain_outbound(self, timeout: float = 1.0, poll_interval: float = 0.05) -> None:
+        """Give the outbound dispatcher a short chance to flush queued messages."""
+        if self._dispatch_task is None:
+            return
+        deadline = asyncio.get_running_loop().time() + max(timeout, 0.0)
+        while self.bus.outbound_size > 0 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(max(poll_interval, 0.01))
+        await asyncio.sleep(0)
+
     async def _dispatch_outbound(self) -> None:
         """Dispatch outbound messages to the appropriate channel."""
         logger.info("Outbound dispatcher started")
