@@ -12,6 +12,66 @@ if TYPE_CHECKING:
 Handler = Callable[["CommandContext"], Awaitable["OutboundMessage | None"]]
 
 
+def normalize_command_text(text: str) -> str:
+    """Normalize Telegram-style `/command@bot` syntax to plain `/command`."""
+    raw = text.strip()
+    if not raw:
+        return raw
+
+    parts = raw.split(maxsplit=1)
+    head = parts[0]
+    tail = parts[1] if len(parts) > 1 else ""
+
+    if head.startswith("/") and "@" in head:
+        head = head.split("@", 1)[0]
+
+    normalized = head
+    if tail:
+        normalized += f" {tail}"
+    return normalized
+
+
+def command_bypasses_busy_gate(text: str) -> bool:
+    """Return whether a slash command should bypass channel busy gating."""
+    normalized = normalize_command_text(text).lower()
+    if not normalized.startswith("/"):
+        return False
+
+    parts = normalized.split(maxsplit=1)
+    command = parts[0]
+    args = parts[1].strip() if len(parts) > 1 else ""
+
+    if command in {"/stop", "/restart"}:
+        return True
+
+    if command in {"/help", "/status", "/model", "/routing", "/toolhint"}:
+        return not args
+
+    if command == "/session":
+        return not args or args == "list"
+
+    return False
+
+
+def command_allows_parallel_dispatch(text: str) -> bool:
+    """Return whether a command is safe to execute outside session/process locks."""
+    normalized = normalize_command_text(text).lower()
+    if not normalized.startswith("/"):
+        return False
+
+    parts = normalized.split(maxsplit=1)
+    command = parts[0]
+    args = parts[1].strip() if len(parts) > 1 else ""
+
+    if command in {"/help", "/status", "/model", "/routing", "/toolhint"}:
+        return not args
+
+    if command == "/session":
+        return not args or args == "list"
+
+    return False
+
+
 @dataclass
 class CommandContext:
     """Everything a command handler needs to produce a response."""
@@ -43,22 +103,7 @@ class CommandRouter:
 
     @staticmethod
     def _normalize(text: str) -> str:
-        """Normalize Telegram-style /command@bot syntax to plain /command."""
-        raw = text.strip()
-        if not raw:
-            return raw
-
-        parts = raw.split(maxsplit=1)
-        head = parts[0]
-        tail = parts[1] if len(parts) > 1 else ""
-
-        if head.startswith("/") and "@" in head:
-            head = head.split("@", 1)[0]
-
-        normalized = head
-        if tail:
-            normalized += f" {tail}"
-        return normalized
+        return normalize_command_text(text)
 
     def priority(self, cmd: str, handler: Handler) -> None:
         self._priority[cmd] = handler

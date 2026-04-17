@@ -11,6 +11,7 @@ KEY_TEXT = "text"
 KEY_SID = "sid"
 KEY_TS = "ts"
 KEY_CODE = "code"
+KEY_CLEARS_BUSY = "clearsBusy"
 
 TYPE_HELLO = "hello"
 TYPE_USER_MESSAGE = "user_message"

@@ -136,6 +136,31 @@ class TestDispatch:
         await asyncio.gather(t1, t2)
         assert order == ["start-a", "end-a", "start-b", "end-b"]
 
+    @pytest.mark.asyncio
+    async def test_readonly_commands_bypass_processing_lock(self):
+        from nanobot.bus.events import InboundMessage, OutboundMessage
+
+        loop, bus = _make_loop()
+        running = 0
+        max_running = 0
+
+        async def mock_process(m, **kwargs):
+            nonlocal running, max_running
+            running += 1
+            max_running = max(max_running, running)
+            await asyncio.sleep(0.05)
+            running -= 1
+            return OutboundMessage(channel="test", chat_id="c1", content=m.content)
+
+        loop._process_message = mock_process
+        msg1 = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/status")
+        msg2 = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/help")
+
+        t1 = asyncio.create_task(loop._dispatch(msg1))
+        t2 = asyncio.create_task(loop._dispatch(msg2))
+        await asyncio.gather(t1, t2)
+        assert max_running == 2
+
 
 class TestShutdown:
     @pytest.mark.asyncio

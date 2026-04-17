@@ -9,6 +9,7 @@ from typer.testing import CliRunner
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.cli.commands import _make_provider, app
+from nanobot.command.router import command_allows_parallel_dispatch, command_bypasses_busy_gate
 from nanobot.config.schema import Config
 from nanobot.providers.openai_codex_app_server_provider import OpenAICodexAppServerProvider
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
@@ -233,6 +234,26 @@ def test_make_provider_returns_codex_app_server_provider(tmp_path: Path):
     assert provider.get_default_model() == config.agents.defaults.model
     assert provider.workspace == str(config.workspace_path.resolve())
     assert provider.sandbox == "read-only"
+
+
+def test_busy_bypass_command_policy():
+    assert command_bypasses_busy_gate("/stop")
+    assert command_bypasses_busy_gate("/status")
+    assert command_bypasses_busy_gate("/model")
+    assert command_bypasses_busy_gate("/session list")
+    assert not command_bypasses_busy_gate("/model gpt-5.4")
+    assert not command_bypasses_busy_gate("/session switch abc123")
+    assert not command_bypasses_busy_gate("hello")
+
+
+def test_parallel_dispatch_command_policy():
+    assert command_allows_parallel_dispatch("/help")
+    assert command_allows_parallel_dispatch("/routing")
+    assert command_allows_parallel_dispatch("/toolhint")
+    assert command_allows_parallel_dispatch("/session")
+    assert not command_allows_parallel_dispatch("/restart")
+    assert not command_allows_parallel_dispatch("/routing off")
+    assert not command_allows_parallel_dispatch("/new")
 
 
 @pytest.fixture

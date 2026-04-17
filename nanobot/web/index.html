@@ -592,7 +592,47 @@
     function updateSendState() {
       const connected = ws && ws.readyState === WebSocket.OPEN;
       const text = els.composer.value.trim();
-      els.sendBtn.disabled = !connected || !text || busy;
+      els.sendBtn.disabled = !connected || !text || (busy && !allowsBusyBypass(text));
+    }
+
+    function normalizeCommandText(text) {
+      const raw = String(text || "").trim();
+      if (!raw) {
+        return "";
+      }
+      const firstSpace = raw.search(/\s/);
+      let head = firstSpace === -1 ? raw : raw.slice(0, firstSpace);
+      const tail = firstSpace === -1 ? "" : raw.slice(firstSpace).trim();
+      if (head.startsWith("/") && head.includes("@")) {
+        head = head.split("@", 1)[0];
+      }
+      return tail ? `${head} ${tail}` : head;
+    }
+
+    function allowsBusyBypass(text) {
+      const normalized = normalizeCommandText(text).toLowerCase();
+      if (!normalized.startsWith("/")) {
+        return false;
+      }
+      const firstSpace = normalized.indexOf(" ");
+      const command = firstSpace === -1 ? normalized : normalized.slice(0, firstSpace);
+      const args = firstSpace === -1 ? "" : normalized.slice(firstSpace + 1).trim();
+      if (command === "/stop" || command === "/restart") {
+        return true;
+      }
+      if (
+        command === "/help" ||
+        command === "/status" ||
+        command === "/model" ||
+        command === "/routing" ||
+        command === "/toolhint"
+      ) {
+        return !args;
+      }
+      if (command === "/session") {
+        return !args || args === "list";
+      }
+      return false;
     }
 
     function reconnectNow(resetSession) {
@@ -678,21 +718,27 @@
           return;
         }
         if (type === "assistant_message") {
+          const clearsBusy = payload.clearsBusy !== false;
           clearProgress();
           pushMessage("assistant", payload.text || "");
-          busy = false;
+          if (clearsBusy) {
+            busy = false;
+            hint("");
+          }
           updateSendState();
-          hint("");
           return;
         }
         if (type === "error") {
+          const clearsBusy = payload.clearsBusy !== false;
           if (payload.code === "busy") {
             hint("agent is still working on your previous message");
           } else {
             hint(payload.text || "request failed");
           }
           pushMessage("error", payload.text || payload.code || "error");
-          busy = false;
+          if (clearsBusy) {
+            busy = false;
+          }
           updateSendState();
           return;
         }
@@ -708,11 +754,14 @@
         hint("not connected");
         return;
       }
+      const bypassesBusy = allowsBusyBypass(text);
       ws.send(JSON.stringify({ type: "user_message", text }));
       pushMessage("user", text);
       els.composer.value = "";
-      busy = true;
-      hint("waiting for response...");
+      if (!bypassesBusy) {
+        busy = true;
+        hint("waiting for response...");
+      }
       updateSendState();
       els.composer.focus();
     }

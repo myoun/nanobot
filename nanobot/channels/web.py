@@ -24,6 +24,7 @@ from nanobot.channels.web_protocol import (
     ERR_RATE_LIMIT,
     ERR_UNAUTHORIZED,
     KEY_CODE,
+    KEY_CLEARS_BUSY,
     KEY_SID,
     KEY_TEXT,
     KEY_TS,
@@ -37,6 +38,7 @@ from nanobot.channels.web_protocol import (
     new_session_id,
     safe_json_loads,
 )
+from nanobot.command.router import command_bypasses_busy_gate
 from nanobot.config.schema import WebConfig
 
 
@@ -96,12 +98,14 @@ class WebChannel(BaseChannel):
             return
 
         is_progress = bool((msg.metadata or {}).get("is_progress_update"))
+        clears_busy = bool((msg.metadata or {}).get("_web_blocking_request"))
         payload_type = TYPE_PROGRESS_UPDATE if is_progress else TYPE_ASSISTANT_MESSAGE
         payload = {
             KEY_TYPE: payload_type,
             KEY_TEXT: msg.content,
             KEY_SID: sid,
             KEY_TS: int(time.time()),
+            KEY_CLEARS_BUSY: clears_busy,
         }
 
         targets = list(self._connections.get(sid, set()))
@@ -116,7 +120,7 @@ class WebChannel(BaseChannel):
             for ws in dead:
                 self._connections[sid].discard(ws)
 
-        if payload_type == TYPE_ASSISTANT_MESSAGE:
+        if payload_type == TYPE_ASSISTANT_MESSAGE and clears_busy:
             self._pending.discard(sid)
 
     def _load_index_html(self) -> str:
@@ -213,7 +217,8 @@ class WebChannel(BaseChannel):
                     )
                     continue
 
-                if sid in self._pending:
+                bypasses_busy_gate = command_bypasses_busy_gate(text)
+                if sid in self._pending and not bypasses_busy_gate:
                     await self._send_error(websocket, sid, ERR_BUSY, "request already in progress")
                     continue
 
@@ -221,12 +226,16 @@ class WebChannel(BaseChannel):
                     await self._send_error(websocket, sid, ERR_RATE_LIMIT, "rate limit exceeded")
                     continue
 
-                self._pending.add(sid)
+                if not bypasses_busy_gate:
+                    self._pending.add(sid)
                 await self._handle_message(
                     sender_id=sid,
                     chat_id=sid,
                     content=text,
-                    metadata={"web": {"sid": sid}},
+                    metadata={
+                        "web": {"sid": sid},
+                        "_web_blocking_request": not bypasses_busy_gate,
+                    },
                 )
         except Exception as e:
             logger.warning(f"WebSocket session ended for sid={sid}: {e}")
@@ -235,13 +244,22 @@ class WebChannel(BaseChannel):
             if not self._connections[sid]:
                 self._connections.pop(sid, None)
 
-    async def _send_error(self, websocket: Any, sid: str, code: str, text: str) -> None:
+    async def _send_error(
+        self,
+        websocket: Any,
+        sid: str,
+        code: str,
+        text: str,
+        *,
+        clears_busy: bool = False,
+    ) -> None:
         payload = {
             KEY_TYPE: TYPE_ERROR,
             KEY_CODE: code,
             KEY_TEXT: text,
             KEY_SID: sid,
             KEY_TS: int(time.time()),
+            KEY_CLEARS_BUSY: clears_busy,
         }
         await websocket.send(json.dumps(payload, ensure_ascii=True))
 

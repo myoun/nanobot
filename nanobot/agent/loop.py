@@ -32,6 +32,7 @@ from nanobot.agent.memory import MemoryConsolidator, MemoryStore
 from nanobot.session.manager import Session, SessionManager
 from nanobot.observability.langsmith import get_langsmith_tracer
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
+from nanobot.command.router import command_allows_parallel_dispatch
 from nanobot.utils.helpers import get_data_path
 
 if TYPE_CHECKING:
@@ -2668,6 +2669,20 @@ Respond with ONLY valid JSON, no markdown fences."""
             metadata=metadata or {},
         )
 
+        if command_allows_parallel_dispatch(content):
+            kwargs: dict[str, Any] = {
+                "session_key": session_key,
+            }
+            if on_progress is not None:
+                kwargs["on_progress"] = on_progress
+            try:
+                return await self._process_message(msg, **kwargs)
+            except TypeError as exc:
+                if "on_progress" not in str(exc) or "on_progress" not in kwargs:
+                    raise
+                kwargs.pop("on_progress", None)
+                return await self._process_message(msg, **kwargs)
+
         async with self._process_lock:
             kwargs: dict[str, Any] = {
                 "session_key": session_key,
@@ -2688,15 +2703,22 @@ Respond with ONLY valid JSON, no markdown fences."""
         if task is not None:
             self._active_tasks.setdefault(msg.session_key, []).append(task)
         try:
-            lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
-            if self._concurrency_gate is None:
-                async with lock:
-                    async with self._process_lock:
+            if command_allows_parallel_dispatch(msg.content):
+                if self._concurrency_gate is None:
+                    response = await self._process_message(msg)
+                else:
+                    async with self._concurrency_gate:
                         response = await self._process_message(msg)
             else:
-                async with lock, self._concurrency_gate:
-                    async with self._process_lock:
-                        response = await self._process_message(msg)
+                lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
+                if self._concurrency_gate is None:
+                    async with lock:
+                        async with self._process_lock:
+                            response = await self._process_message(msg)
+                else:
+                    async with lock, self._concurrency_gate:
+                        async with self._process_lock:
+                            response = await self._process_message(msg)
             if response:
                 await self.bus.publish_outbound(response)
         except asyncio.CancelledError:
