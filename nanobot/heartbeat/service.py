@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 from loguru import logger
+from nanobot.utils import evaluator
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
@@ -83,7 +85,8 @@ class HeartbeatService:
 
     async def _decide(self, content: str) -> tuple[str, str]:
         """Phase 1: ask LLM to decide skip/run via virtual tool call."""
-        response = await self.provider.chat(
+        now_label = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
+        response = await self.provider.chat_with_retry(
             messages=[
                 {
                     "role": "system",
@@ -92,6 +95,7 @@ class HeartbeatService:
                 {
                     "role": "user",
                     "content": (
+                        f"Current Time: {now_label}\n\n"
                         "Review the following HEARTBEAT.md and decide whether there are active tasks.\n\n"
                         f"{content}"
                     ),
@@ -159,6 +163,15 @@ class HeartbeatService:
             if self.on_execute:
                 response = await self.on_execute(tasks)
                 if response and self.on_notify:
+                    should_notify = await evaluator.evaluate_response(
+                        response,
+                        tasks,
+                        self.provider,
+                        self.model,
+                    )
+                    if not should_notify:
+                        logger.info("Heartbeat: suppressed by evaluator")
+                        return
                     logger.info("Heartbeat: completed, delivering response")
                     await self.on_notify(response)
         except Exception:
@@ -173,4 +186,3 @@ class HeartbeatService:
         if action != "run" or not self.on_execute:
             return None
         return await self.on_execute(tasks)
-

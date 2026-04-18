@@ -505,8 +505,8 @@ class TestNewCommandArchival:
         return loop
 
     @pytest.mark.asyncio
-    async def test_new_clears_session_immediately_even_if_archive_fails(self, tmp_path: Path) -> None:
-        """/new clears session immediately; archive_messages retries until raw dump."""
+    async def test_new_leaves_session_unchanged_if_archive_fails(self, tmp_path: Path) -> None:
+        """/new keeps the current session when archive-first consolidation fails."""
         from nanobot.bus.events import InboundMessage
 
         loop = self._make_loop(tmp_path)
@@ -516,26 +516,16 @@ class TestNewCommandArchival:
             session.add_message("assistant", f"resp{i}")
         loop.sessions.save(session)
 
-        call_count = 0
-
-        async def _failing_consolidate(_messages) -> bool:
-            nonlocal call_count
-            call_count += 1
-            return False
-
-        loop.memory_consolidator.consolidate_messages = _failing_consolidate  # type: ignore[method-assign]
+        loop._run_serialized_consolidation = AsyncMock(return_value=False)  # type: ignore[method-assign]
 
         new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
         response = await loop._process_message(new_msg)
 
         assert response is not None
-        assert "new session started" in response.content.lower()
+        assert "Failed to archive current session. New session was not created." in response.content
 
         session_after = loop.sessions.get_or_create("cli:test")
-        assert len(session_after.messages) == 0
-
-        await loop.close_mcp()
-        assert call_count == 3  # retried up to raw-archive threshold
+        assert len(session_after.messages) == 10
 
     @pytest.mark.asyncio
     async def test_new_archives_only_unconsolidated_messages(self, tmp_path: Path) -> None:
@@ -550,49 +540,54 @@ class TestNewCommandArchival:
         loop.sessions.save(session)
 
         archived_count = -1
+        archive_all_flag = False
 
-        async def _fake_consolidate(messages) -> bool:
-            nonlocal archived_count
-            archived_count = len(messages)
+        async def _fake_consolidate(temp_session, *, archive_all: bool = False) -> bool:
+            nonlocal archived_count, archive_all_flag
+            archived_count = len(temp_session.messages)
+            archive_all_flag = archive_all
             return True
 
-        loop.memory_consolidator.consolidate_messages = _fake_consolidate  # type: ignore[method-assign]
+        loop._run_serialized_consolidation = AsyncMock(side_effect=_fake_consolidate)  # type: ignore[method-assign]
 
         new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
         response = await loop._process_message(new_msg)
 
         assert response is not None
         assert "new session started" in response.content.lower()
-
-        await loop.close_mcp()
         assert archived_count == 3
+        assert archive_all_flag is True
 
     @pytest.mark.asyncio
-    async def test_new_clears_session_and_responds(self, tmp_path: Path) -> None:
+    async def test_new_creates_fresh_session_after_successful_archive(self, tmp_path: Path) -> None:
         from nanobot.bus.events import InboundMessage
 
         loop = self._make_loop(tmp_path)
-        session = loop.sessions.get_or_create("cli:test")
+        conversation_key = "cli:test"
+        session = loop.sessions.get_or_create(conversation_key)
         for i in range(3):
             session.add_message("user", f"msg{i}")
             session.add_message("assistant", f"resp{i}")
         loop.sessions.save(session)
+        before_snapshot = loop.sessions.list_conversation_sessions(conversation_key)
 
-        async def _ok_consolidate(_messages) -> bool:
-            return True
-
-        loop.memory_consolidator.consolidate_messages = _ok_consolidate  # type: ignore[method-assign]
+        loop._run_serialized_consolidation = AsyncMock(return_value=True)  # type: ignore[method-assign]
 
         new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
         response = await loop._process_message(new_msg)
 
         assert response is not None
         assert "new session started" in response.content.lower()
-        assert loop.sessions.get_or_create("cli:test").messages == []
+        after_snapshot = loop.sessions.list_conversation_sessions(conversation_key)
+        assert after_snapshot["active_session_id"] != before_snapshot["active_session_id"]
+        active_session = loop.sessions.get_active_session(conversation_key)
+        assert active_session.messages == []
+        old_session = loop.sessions.get_or_create(conversation_key)
+        assert len(old_session.messages) == 6
 
     @pytest.mark.asyncio
-    async def test_close_mcp_drains_background_tasks(self, tmp_path: Path) -> None:
-        """close_mcp waits for background tasks to complete."""
+    async def test_new_waits_for_inflight_consolidations(self, tmp_path: Path) -> None:
+        """Archive-first /new waits for earlier consolidation tasks before continuing."""
         from nanobot.bus.events import InboundMessage
 
         loop = self._make_loop(tmp_path)
@@ -602,18 +597,29 @@ class TestNewCommandArchival:
             session.add_message("assistant", f"resp{i}")
         loop.sessions.save(session)
 
-        archived = asyncio.Event()
+        gate = asyncio.Event()
+        archived_after_wait = asyncio.Event()
 
-        async def _slow_consolidate(_messages) -> bool:
-            await asyncio.sleep(0.1)
-            archived.set()
+        async def _inflight_task() -> bool:
+            await gate.wait()
             return True
 
-        loop.memory_consolidator.consolidate_messages = _slow_consolidate  # type: ignore[method-assign]
+        async def _fake_consolidate(*_args, **_kwargs) -> bool:
+            assert gate.is_set()
+            archived_after_wait.set()
+            return True
+
+        loop._consolidation_tasks[session.key] = asyncio.create_task(_inflight_task())
+        loop._run_serialized_consolidation = AsyncMock(side_effect=_fake_consolidate)  # type: ignore[method-assign]
 
         new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
-        await loop._process_message(new_msg)
+        task = asyncio.create_task(loop._process_message(new_msg))
 
-        assert not archived.is_set()
-        await loop.close_mcp()
-        assert archived.is_set()
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        gate.set()
+        response = await task
+        assert response is not None
+        assert "new session started" in response.content.lower()
+        assert archived_after_wait.is_set()

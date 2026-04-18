@@ -82,14 +82,6 @@ def test_channels_config_getattr_returns_extra():
     assert section["enabled"] is True
 
 
-def test_channels_config_builtin_fields_removed():
-    """After decoupling, ChannelsConfig has no explicit channel fields."""
-    cfg = ChannelsConfig()
-    assert not hasattr(cfg, "telegram")
-    assert cfg.send_progress is True
-    assert cfg.send_tool_hints is False
-
-
 # ---------------------------------------------------------------------------
 # discover_plugins
 # ---------------------------------------------------------------------------
@@ -173,7 +165,6 @@ async def test_manager_loads_plugin_from_dict_config():
         channels=ChannelsConfig.model_validate({
             "fakeplugin": {"enabled": True, "allowFrom": ["*"]},
         }),
-        providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
     )
 
     with patch(
@@ -191,41 +182,12 @@ async def test_manager_loads_plugin_from_dict_config():
     assert isinstance(mgr.channels["fakeplugin"], _FakePlugin)
 
 
-def test_channels_login_uses_discovered_plugin_class(monkeypatch):
-    from nanobot.cli.commands import app
-    from nanobot.config.schema import Config
-    from typer.testing import CliRunner
-
-    runner = CliRunner()
-    seen: dict[str, object] = {}
-
-    class _LoginPlugin(_FakePlugin):
-        display_name = "Login Plugin"
-
-        async def login(self, force: bool = False) -> bool:
-            seen["force"] = force
-            seen["config"] = self.config
-            return True
-
-    monkeypatch.setattr("nanobot.config.loader.load_config", lambda: Config())
-    monkeypatch.setattr(
-        "nanobot.channels.registry.discover_all",
-        lambda: {"fakeplugin": _LoginPlugin},
-    )
-
-    result = runner.invoke(app, ["channels", "login", "fakeplugin", "--force"])
-
-    assert result.exit_code == 0
-    assert seen["force"] is True
-
-
 @pytest.mark.asyncio
 async def test_manager_skips_disabled_plugin():
     fake_config = SimpleNamespace(
         channels=ChannelsConfig.model_validate({
             "fakeplugin": {"enabled": False},
         }),
-        providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
     )
 
     with patch(

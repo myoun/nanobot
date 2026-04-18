@@ -1374,25 +1374,21 @@ def codex_login():
 @provider_app.command("login")
 def provider_login(
     provider: str = typer.Argument(
-        ..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"
+        ..., help="OAuth provider (supported: 'openai-codex')"
     ),
 ):
     """Authenticate with an OAuth provider."""
-    from nanobot.providers.registry import PROVIDERS
-
     key = provider.replace("-", "_")
-    spec = next((s for s in PROVIDERS if s.name == key and s.is_oauth), None)
-    if not spec:
-        names = ", ".join(s.name.replace("_", "-") for s in PROVIDERS if s.is_oauth)
-        console.print(f"[red]Unknown OAuth provider: {provider}[/red]  Supported: {names}")
+    if key != "openai_codex":
+        console.print(f"[red]Unknown OAuth provider: {provider}[/red]  Supported: openai-codex")
         raise typer.Exit(1)
 
-    handler = _LOGIN_HANDLERS.get(spec.name)
+    handler = _LOGIN_HANDLERS.get("openai_codex")
     if not handler:
-        console.print(f"[red]Login not implemented for {spec.label}[/red]")
+        console.print("[red]Login not implemented for OpenAI Codex[/red]")
         raise typer.Exit(1)
 
-    console.print(f"{__logo__} OAuth Login - {spec.label}\n")
+    console.print(f"{__logo__} OAuth Login - OpenAI Codex\n")
     handler()
 
 
@@ -1420,29 +1416,6 @@ def _login_openai_codex() -> None:
         )
     except ImportError:
         console.print("[red]oauth_cli_kit not installed. Run: pip install oauth-cli-kit[/red]")
-        raise typer.Exit(1)
-
-
-@_register_login("github_copilot")
-def _login_github_copilot() -> None:
-    import asyncio
-
-    console.print("[cyan]Starting GitHub Copilot device flow...[/cyan]\n")
-
-    async def _trigger():
-        from litellm import acompletion
-
-        await acompletion(
-            model="github_copilot/gpt-4o",
-            messages=[{"role": "user", "content": "hi"}],
-            max_tokens=1,
-        )
-
-    try:
-        asyncio.run(_trigger())
-        console.print("[green]✓ Authenticated with GitHub Copilot[/green]")
-    except Exception as e:
-        console.print(f"[red]Authentication error: {e}[/red]")
         raise typer.Exit(1)
 
 

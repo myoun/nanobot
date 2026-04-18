@@ -19,12 +19,3 @@ __pycache__/
 poetry.lock
 .pytest_cache/
 botpy.log
-tests/
-!tests/
-tests/*
-!tests/test_dynamic_tool_adapter.py
-!tests/test_codex_app_server_client.py
-!tests/test_agent_loop_app_server.py
-!tests/test_session_file_artifacts.py
-!tests/test_session_search_index.py
-!tests/test_cron_service.py

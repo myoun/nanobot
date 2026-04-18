@@ -1,7 +1,9 @@
 """Base LLM provider interface."""
 
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+import inspect
 import json
 from typing import Any
 
@@ -114,7 +116,134 @@ class LLMProvider(ABC):
         except Exception:
             payload = str(response)
         logger.debug(f"LLM response{model_tag}: {payload}")
-    
+
+    @staticmethod
+    def _is_transient_error(response: LLMResponse) -> bool:
+        if response.finish_reason != "error":
+            return False
+        content = (response.content or "").lower()
+        transient_markers = (
+            "429",
+            "rate limit",
+            "rate-limit",
+            "timeout",
+            "temporarily unavailable",
+            "temporary",
+            "try again",
+        )
+        return any(marker in content for marker in transient_markers)
+
+    @staticmethod
+    def _strip_images_for_retry(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+        stripped_any = False
+        sanitized: list[dict[str, Any]] = []
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                sanitized.append(dict(message))
+                continue
+
+            new_blocks: list[dict[str, Any]] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") != "image_url":
+                    new_blocks.append(dict(block))
+                    continue
+                meta = block.get("_meta")
+                placeholder = "[image omitted]"
+                if isinstance(meta, dict):
+                    path = meta.get("path")
+                    if isinstance(path, str) and path:
+                        placeholder = f"[image: {path}]"
+                new_blocks.append({"type": "text", "text": placeholder})
+                stripped_any = True
+
+            sanitized.append({**message, "content": new_blocks})
+
+        return sanitized, stripped_any
+
+    def _chat_kwargs_for_signature(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Return only kwargs accepted by the concrete ``chat()`` implementation."""
+        try:
+            signature = inspect.signature(self.chat)
+        except (TypeError, ValueError):
+            return kwargs
+
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+            return kwargs
+
+        allowed = {
+            name
+            for name, param in signature.parameters.items()
+            if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        }
+        return {key: value for key, value in kwargs.items() if key in allowed}
+
+    async def chat_with_retry(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        reasoning_effort: str | None = None,
+    ) -> LLMResponse:
+        """Run ``chat()`` with generation defaults and a small retry policy."""
+        resolved_max_tokens = max_tokens if max_tokens is not None else self.generation.max_tokens
+        resolved_temperature = (
+            temperature if temperature is not None else self.generation.temperature
+        )
+        resolved_reasoning = (
+            reasoning_effort
+            if reasoning_effort is not None
+            else self.generation.reasoning_effort
+        )
+
+        call_kwargs = {
+            "messages": messages,
+            "tools": tools,
+            "model": model,
+            "max_tokens": resolved_max_tokens,
+            "temperature": resolved_temperature,
+            "reasoning_effort": resolved_reasoning,
+        }
+
+        delays = (1, 2, 4)
+        last_response: LLMResponse | None = None
+
+        for idx in range(len(delays) + 1):
+            try:
+                response = await self.chat(**self._chat_kwargs_for_signature(call_kwargs))
+            except asyncio.CancelledError:
+                raise
+
+            last_response = response
+            if not self._is_transient_error(response):
+                break
+            if idx >= len(delays):
+                return response
+            await asyncio.sleep(delays[idx])
+
+        if last_response is None:
+            return LLMResponse(content="No response", finish_reason="error")
+
+        if last_response.finish_reason != "error":
+            return last_response
+
+        retry_messages, stripped_any = self._strip_images_for_retry(messages)
+        if not stripped_any:
+            return last_response
+
+        retry_kwargs = {**call_kwargs, "messages": retry_messages}
+        try:
+            return await self.chat(**self._chat_kwargs_for_signature(retry_kwargs))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return LLMResponse(content=str(exc), finish_reason="error")
+
     @abstractmethod
     async def chat(
         self,

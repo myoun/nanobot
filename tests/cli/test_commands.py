@@ -83,10 +83,11 @@ def test_onboard_existing_config_refresh(mock_paths):
     config_file.write_text('{"existing": true}')
 
     result = runner.invoke(app, ["onboard"], input="n\n")
+    normalized = _normalize_output(result.stdout)
 
     assert result.exit_code == 0
-    assert "Config already exists" in result.stdout
-    assert "existing values preserved" in result.stdout
+    assert "Config already exists" in normalized
+    assert "existing values preserved" in normalized
     assert workspace_dir.exists()
     assert (workspace_dir / "AGENTS.md").exists()
 
@@ -122,6 +123,11 @@ def _strip_ansi(text):
     """Remove ANSI escape codes from text."""
     ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
     return ansi_escape.sub('', text)
+
+
+def _normalize_output(text: str) -> str:
+    """Normalize terminal output for robust substring assertions."""
+    return " ".join(_strip_ansi(text).split())
 
 
 def test_onboard_help_shows_workspace_and_config_options():
@@ -779,7 +785,7 @@ def test_gateway_uses_configured_port_when_cli_flag_is_missing(monkeypatch, tmp_
     result = runner.invoke(app, ["gateway", "--config", str(config_file)])
 
     assert isinstance(result.exception, _StopGatewayError)
-    assert "port 18791" in result.stdout
+    assert "port 18791" in _normalize_output(result.stdout)
 
 
 def test_gateway_cli_port_overrides_configured_port(monkeypatch, tmp_path: Path) -> None:
@@ -801,7 +807,7 @@ def test_gateway_cli_port_overrides_configured_port(monkeypatch, tmp_path: Path)
     result = runner.invoke(app, ["gateway", "--config", str(config_file), "--port", "18792"])
 
     assert isinstance(result.exception, _StopGatewayError)
-    assert "port 18792" in result.stdout
+    assert "port 18792" in _normalize_output(result.stdout)
 
 
 def test_gateway_gracefully_stops_and_exits_after_restart_request(monkeypatch, tmp_path: Path) -> None:

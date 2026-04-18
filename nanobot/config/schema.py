@@ -219,6 +219,7 @@ class ChannelsConfig(Base):
     slack: SlackConfig = Field(default_factory=SlackConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
     web: WebConfig = Field(default_factory=WebConfig)
+    transcription_api_key: str = ""
     send_progress: bool = True
     send_tool_hints: bool = True
 
@@ -240,38 +241,6 @@ class AgentsConfig(Base):
     """Agent configuration."""
 
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
-
-
-class ProviderConfig(Base):
-    """LLM provider configuration."""
-
-    api_key: str = ""
-    api_base: str | None = None
-    extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
-
-
-class ProvidersConfig(Base):
-    """Configuration for LLM providers."""
-
-    custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
-    anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
-    openai: ProviderConfig = Field(default_factory=ProviderConfig)
-    openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
-    deepseek: ProviderConfig = Field(default_factory=ProviderConfig)
-    groq: ProviderConfig = Field(default_factory=ProviderConfig)
-    zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
-    dashscope: ProviderConfig = Field(default_factory=ProviderConfig)  # 阿里云通义千问
-    volcengine: ProviderConfig = Field(default_factory=ProviderConfig)
-    vllm: ProviderConfig = Field(default_factory=ProviderConfig)
-    gemini: ProviderConfig = Field(default_factory=ProviderConfig)
-    moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
-    minimax: ProviderConfig = Field(default_factory=ProviderConfig)
-    aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
-    siliconflow: ProviderConfig = Field(
-        default_factory=ProviderConfig
-    )  # SiliconFlow (硅基流动) API gateway
-    openai_codex: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenAI Codex (OAuth)
-    github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth)
 
 
 class HeartbeatConfig(Base):
@@ -364,8 +333,6 @@ class Config(BaseSettings):
 
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
-    # Legacy compatibility only. We no longer write multi-provider config back out.
-    providers: ProvidersConfig = Field(default_factory=ProvidersConfig, exclude=True)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
@@ -375,70 +342,5 @@ class Config(BaseSettings):
     def workspace_path(self) -> Path:
         """Get expanded workspace path."""
         return Path(self.agents.defaults.workspace).expanduser()
-
-    def _match_provider(
-        self, model: str | None = None
-    ) -> tuple["ProviderConfig | None", str | None]:
-        """Match provider config and its registry name. Returns (config, spec_name)."""
-        from nanobot.providers.registry import PROVIDERS, find_by_explicit_prefix
-
-        model_name = model or self.agents.defaults.model
-        model_lower = model_name.lower()
-
-        # Explicit model prefixes (provider/model) win over generic keywords.
-        explicit_spec = find_by_explicit_prefix(model_name, include_gateway_local=True)
-        if explicit_spec:
-            p = getattr(self.providers, explicit_spec.name, None)
-            if p and (explicit_spec.is_oauth or p.api_key):
-                return p, explicit_spec.name
-
-        # Match by keyword (order follows PROVIDERS registry) when no explicit prefix.
-        if not explicit_spec:
-            for spec in PROVIDERS:
-                p = getattr(self.providers, spec.name, None)
-                if p and any(kw in model_lower for kw in spec.keywords):
-                    if spec.is_oauth or p.api_key:
-                        return p, spec.name
-
-        # Fallback: gateways first, then others (follows registry order)
-        # OAuth providers are NOT valid fallbacks — they require explicit model selection
-        for spec in PROVIDERS:
-            if spec.is_oauth:
-                continue
-            p = getattr(self.providers, spec.name, None)
-            if p and p.api_key:
-                return p, spec.name
-        return None, None
-
-    def get_provider(self, model: str | None = None) -> ProviderConfig | None:
-        """Get matched provider config (api_key, api_base, extra_headers). Falls back to first available."""
-        p, _ = self._match_provider(model)
-        return p
-
-    def get_provider_name(self, model: str | None = None) -> str | None:
-        """Get the registry name of the matched provider (e.g. "deepseek", "openrouter")."""
-        _, name = self._match_provider(model)
-        return name
-
-    def get_api_key(self, model: str | None = None) -> str | None:
-        """Get API key for the given model. Falls back to first available key."""
-        p = self.get_provider(model)
-        return p.api_key if p else None
-
-    def get_api_base(self, model: str | None = None) -> str | None:
-        """Get API base URL for the given model. Applies default URLs for known gateways."""
-        from nanobot.providers.registry import find_by_name
-
-        p, name = self._match_provider(model)
-        if p and p.api_base:
-            return p.api_base
-        # Only gateways get a default api_base here. Standard providers
-        # (like Moonshot) set their base URL via env vars in _setup_env
-        # to avoid polluting the global litellm.api_base.
-        if name:
-            spec = find_by_name(name)
-            if spec and spec.is_gateway and spec.default_api_base:
-                return spec.default_api_base
-        return None
 
     model_config = ConfigDict(env_prefix="NANOBOT_", env_nested_delimiter="__")
